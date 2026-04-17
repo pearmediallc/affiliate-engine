@@ -417,3 +417,51 @@ async def get_usage_logs(
             "offset": offset,
         },
     )
+
+
+@router.get("/model-config")
+async def get_model_config(admin=Depends(require_admin), db: Session = Depends(get_db)):
+    """Get current AI model priority configuration"""
+    from ..config import settings
+    return APIResponse(
+        success=True,
+        message="Model configuration",
+        data={
+            "image_generation": {
+                "primary": settings.image_provider,
+                "models": {
+                    "gemini": {"model": settings.gemini_image_model, "status": "available" if settings.gemini_api_key else "no_key"},
+                    "openai": {"model": "dall-e-3", "status": "available" if settings.openai_api_key else "no_key"},
+                    "fal": {"model": "flux-dev", "status": "available" if settings.fal_api_key else "no_key"},
+                },
+            },
+            "text_ai": {
+                "model": settings.gemini_model,
+            },
+            "image_model": settings.gemini_image_model,
+            "hook_analyzer": "gemini-2.5-flash",
+        },
+    )
+
+
+@router.put("/model-config")
+async def update_model_config(
+    request: dict,
+    admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Update AI model priority configuration (runtime only, resets on restart)"""
+    from ..config import settings
+
+    if "primary_provider" in request:
+        settings.image_provider = request["primary_provider"]
+    if "gemini_image_model" in request:
+        settings.gemini_image_model = request["gemini_image_model"]
+    if "gemini_model" in request:
+        settings.gemini_model = request["gemini_model"]
+
+    return APIResponse(
+        success=True,
+        message="Model configuration updated (runtime only)",
+        data={"primary_provider": settings.image_provider, "image_model": settings.gemini_image_model},
+    )

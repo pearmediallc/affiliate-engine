@@ -12,7 +12,7 @@ function getImageSrc(url: string | null | undefined): string | null {
   return url;
 }
 
-type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning';
+type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning' | 'models';
 
 // ---------------------------------------------------------------------------
 // Shared styles
@@ -603,6 +603,154 @@ function LearningTab() {
 }
 
 // ---------------------------------------------------------------------------
+// Models Tab
+// ---------------------------------------------------------------------------
+
+function ModelsTab() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [config, setConfig] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [primaryProvider, setPrimaryProvider] = useState('gemini');
+  const [geminiImageModel, setGeminiImageModel] = useState('imagen-4.0-generate-001');
+
+  const fetchConfig = useCallback(() => {
+    setLoading(true);
+    axios
+      .get(`${API_BASE}/admin/model-config`)
+      .then((r) => {
+        const d = r.data?.data ?? r.data;
+        setConfig(d);
+        setPrimaryProvider(d?.image_generation?.primary ?? 'gemini');
+        setGeminiImageModel(d?.image_model ?? 'imagen-4.0-generate-001');
+      })
+      .catch(() => setConfig(null))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { fetchConfig(); }, [fetchConfig]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setMessage(null);
+    try {
+      await axios.put(`${API_BASE}/admin/model-config`, {
+        primary_provider: primaryProvider,
+        gemini_image_model: geminiImageModel,
+      });
+      setMessage({ text: 'Model configuration saved (runtime only, resets on restart)', type: 'success' });
+      fetchConfig();
+    } catch {
+      setMessage({ text: 'Failed to save model configuration', type: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <div style={styles.spinner}>Loading model config...</div>;
+  if (!config) return <div style={styles.empty}>Failed to load model configuration.</div>;
+
+  const providers = ['gemini', 'openai', 'fal'] as const;
+  const models = config?.image_generation?.models ?? {};
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {/* Provider Priority */}
+      <div style={styles.card}>
+        <h3 style={styles.subHeading}>Image Generation Providers</h3>
+        <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: '16px' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+              <th style={styles.th}>Provider</th>
+              <th style={styles.th}>Model</th>
+              <th style={styles.th}>API Key</th>
+              <th style={styles.th}>Priority</th>
+            </tr>
+          </thead>
+          <tbody>
+            {providers.map((p, idx) => {
+              const info = models[p] ?? {};
+              const isPrimary = p === primaryProvider;
+              return (
+                <tr key={p} style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: idx % 2 === 1 ? 'rgba(255,255,255,0.03)' : 'transparent' }}>
+                  <td style={styles.td}>
+                    <span style={{ fontWeight: isPrimary ? 600 : 400, color: isPrimary ? '#2997ff' : '#e8e8ed' }}>
+                      {p.charAt(0).toUpperCase() + p.slice(1)}
+                    </span>
+                  </td>
+                  <td style={styles.td}>{info.model ?? '--'}</td>
+                  <td style={styles.td}>
+                    <span style={styles.badge(info.status === 'available' ? 'green' : 'red')}>
+                      {info.status === 'available' ? 'Configured' : 'Missing'}
+                    </span>
+                  </td>
+                  <td style={styles.td}>
+                    {isPrimary ? (
+                      <span style={styles.badge('blue')}>Primary</span>
+                    ) : (
+                      <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.4)' }}>--</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Configuration Controls */}
+      <div style={styles.card}>
+        <h3 style={styles.subHeading}>Configuration</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <label style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', minWidth: '160px' }}>Primary Provider</label>
+            <select style={styles.select} value={primaryProvider} onChange={(e) => setPrimaryProvider(e.target.value)}>
+              {providers.map((p) => (
+                <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <label style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', minWidth: '160px' }}>Gemini Image Model</label>
+            <select style={styles.select} value={geminiImageModel} onChange={(e) => setGeminiImageModel(e.target.value)}>
+              <option value="imagen-4.0-generate-001">imagen-4.0-generate-001</option>
+              <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
+            </select>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '20px' }}>
+          <button style={styles.btnPrimary} onClick={handleSave} disabled={saving}>
+            {saving ? 'Saving...' : 'Save'}
+          </button>
+          {message && (
+            <span style={{ fontSize: '13px', color: message.type === 'success' ? '#30d158' : '#ff6b6b' }}>
+              {message.text}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Read-only Info */}
+      <div style={styles.card}>
+        <h3 style={styles.subHeading}>Other AI Models</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', minWidth: '160px' }}>Text AI Model</span>
+            <span style={{ fontSize: '13px', color: '#e8e8ed' }}>{config?.text_ai?.model ?? '--'}</span>
+          </div>
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', minWidth: '160px' }}>Hook Analyzer</span>
+            <span style={{ fontSize: '13px', color: '#e8e8ed' }}>{config?.hook_analyzer ?? '--'}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // AdminPanel (main)
 // ---------------------------------------------------------------------------
 
@@ -615,6 +763,7 @@ export default function AdminPanel() {
     { id: 'feedback', label: 'Feedback' },
     { id: 'suggestions', label: 'AI Suggestions' },
     { id: 'learning', label: 'Learning' },
+    { id: 'models', label: 'Models' },
   ];
 
   return (
@@ -635,6 +784,7 @@ export default function AdminPanel() {
         {activeTab === 'feedback' && <FeedbackTab />}
         {activeTab === 'suggestions' && <SuggestionsTab />}
         {activeTab === 'learning' && <LearningTab />}
+        {activeTab === 'models' && <ModelsTab />}
       </div>
     </div>
   );

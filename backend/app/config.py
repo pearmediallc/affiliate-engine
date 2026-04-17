@@ -45,7 +45,8 @@ class Settings(BaseSettings):
 
     # API
     api_prefix: str = "/api/v1"
-    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:8000", "https://app.yourdomain.com"]
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:8000"]
+    cors_allow_all: bool = True  # In production, set CORS_ORIGINS env var and set this to False
 
     class Config:
         env_file = ".env"
