@@ -13,7 +13,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# Python build artifacts (not frontend/lib which is our code)
+/lib/
 lib64/
 parts/
 sdist/
