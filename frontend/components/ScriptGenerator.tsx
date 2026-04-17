@@ -1,8 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+import { API_BASE_URL } from '@/lib/api';
 
 interface GeneratedScript {
   product: string;
@@ -53,8 +52,8 @@ export default function ScriptGenerator() {
     const loadData = async () => {
       try {
         const [frameworksRes, triggersRes] = await Promise.all([
-          fetch(`${API_URL}/scripts/frameworks`),
-          fetch(`${API_URL}/scripts/triggers`),
+          fetch(`${API_BASE_URL}/scripts/frameworks`),
+          fetch(`${API_BASE_URL}/scripts/triggers`),
         ]);
 
         const frameworksData = await frameworksRes.json();
@@ -80,7 +79,7 @@ export default function ScriptGenerator() {
       setIsGenerating(true);
       setError('');
 
-      const response = await fetch(`${API_URL}/scripts/generate`, {
+      const response = await fetch(`${API_BASE_URL}/scripts/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

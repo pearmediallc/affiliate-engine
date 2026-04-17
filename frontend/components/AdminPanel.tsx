@@ -2,9 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
-
-const API_BASE = 'http://localhost:8000/api/v1';
-const API_HOST = 'http://localhost:8000';
+import { API_BASE_URL, API_HOST } from '@/lib/api';
 
 function getImageSrc(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -180,7 +178,7 @@ function OverviewTab() {
   useEffect(() => {
     setLoading(true);
     axios
-      .get(`${API_BASE}/admin/dashboard`)
+      .get(`${API_BASE_URL}/admin/dashboard`)
       .then((r) => setStats(r.data.data ?? r.data))
       .catch(() => setStats(null))
       .finally(() => setLoading(false));
@@ -220,7 +218,7 @@ function UsersTab() {
   const fetchUsers = useCallback(() => {
     setLoading(true);
     axios
-      .get(`${API_BASE}/auth/users`)
+      .get(`${API_BASE_URL}/auth/users`)
       .then((r) => {
         const d = r.data?.data;
         setUsers(Array.isArray(d) ? d : d?.users ?? []);
@@ -233,7 +231,7 @@ function UsersTab() {
 
   const handleRoleChange = async (userId: string, newRole: string) => {
     try {
-      await axios.put(`${API_BASE}/auth/users/${userId}/role`, { role: newRole });
+      await axios.put(`${API_BASE_URL}/auth/users/${userId}/role`, { role: newRole });
       setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, role: newRole } : u)));
     } catch {
       // silent
@@ -242,7 +240,7 @@ function UsersTab() {
 
   const handleDeactivate = async (userId: string, currentlyActive: boolean) => {
     try {
-      await axios.put(`${API_BASE}/auth/users/${userId}/deactivate`);
+      await axios.put(`${API_BASE_URL}/auth/users/${userId}/deactivate`);
       setUsers((prev) =>
         prev.map((u) => (u.id === userId ? { ...u, is_active: !currentlyActive } : u)),
       );
@@ -328,7 +326,7 @@ function FeedbackTab() {
     const params: Record<string, string | number> = { rating: 'negative', page, page_size: 20 };
     if (vertical) params.vertical = vertical;
     axios
-      .get(`${API_BASE}/admin/feedback`, { params })
+      .get(`${API_BASE_URL}/admin/feedback`, { params })
       .then((r) => {
         const d = r.data?.data ?? r.data;
         const feedbackList = Array.isArray(d) ? d : d?.items ?? d?.feedback ?? [];
@@ -437,7 +435,7 @@ function SuggestionsTab() {
     const params: Record<string, string> = { status: 'pending' };
     if (vertical) params.vertical = vertical;
     axios
-      .get(`${API_BASE}/admin/ai-suggestions`, { params })
+      .get(`${API_BASE_URL}/admin/ai-suggestions`, { params })
       .then((r) => {
         const d = r.data?.data;
         setItems(Array.isArray(d) ? d : d?.suggestions ?? d?.items ?? []);
@@ -451,7 +449,7 @@ function SuggestionsTab() {
   const handleAction = async (id: string, action: 'approve' | 'reject') => {
     setActionLoading(id);
     try {
-      await axios.post(`${API_BASE}/admin/ai-suggestions/${id}/${action}`);
+      await axios.post(`${API_BASE_URL}/admin/ai-suggestions/${id}/${action}`);
       setItems((prev) => prev.filter((s) => s.id !== id));
     } catch {
       // silent
@@ -534,7 +532,7 @@ function LearningTab() {
   const fetchStats = useCallback(() => {
     setLoading(true);
     axios
-      .get(`${API_BASE}/admin/learning/${vertical}`)
+      .get(`${API_BASE_URL}/admin/learning/${vertical}`)
       .then((r) => setStats(r.data.data ?? r.data))
       .catch(() => setStats(null))
       .finally(() => setLoading(false));
@@ -545,7 +543,7 @@ function LearningTab() {
   const handleAnalyze = async () => {
     setAnalyzing(true);
     try {
-      await axios.post(`${API_BASE}/admin/ai-suggestions/analyze/${vertical}`);
+      await axios.post(`${API_BASE_URL}/admin/ai-suggestions/analyze/${vertical}`);
       fetchStats();
     } catch {
       // silent
@@ -618,7 +616,7 @@ function ModelsTab() {
   const fetchConfig = useCallback(() => {
     setLoading(true);
     axios
-      .get(`${API_BASE}/admin/model-config`)
+      .get(`${API_BASE_URL}/admin/model-config`)
       .then((r) => {
         const d = r.data?.data ?? r.data;
         setConfig(d);
@@ -635,7 +633,7 @@ function ModelsTab() {
     setSaving(true);
     setMessage(null);
     try {
-      await axios.put(`${API_BASE}/admin/model-config`, {
+      await axios.put(`${API_BASE_URL}/admin/model-config`, {
         primary_provider: primaryProvider,
         gemini_image_model: geminiImageModel,
       });

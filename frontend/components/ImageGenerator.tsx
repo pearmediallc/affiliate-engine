@@ -2,8 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+import { API_BASE_URL } from '@/lib/api';
 
 const VERTICAL_CONTEXTS = {
   home_insurance: "Family safety, property protection, financial security for homeowners",

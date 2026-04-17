@@ -2,11 +2,8 @@
 
 import Image from 'next/image';
 import { useState } from 'react';
-import { downloadImage } from '@/lib/api';
+import { downloadImage, API_BASE_URL, API_HOST } from '@/lib/api';
 import axios from 'axios';
-
-const API_HOST = 'http://localhost:8000';
-const API_BASE = 'http://localhost:8000/api/v1';
 
 const ISSUE_TAGS = [
   'Spelling Errors',
@@ -43,7 +40,7 @@ function FeedbackWidget({ imageId }: { imageId: string }) {
     if (!rating) return;
     setSubmitting(true);
     try {
-      await axios.post(`${API_BASE}/feedback/submit`, {
+      await axios.post(`${API_BASE_URL}/feedback/submit`, {
         image_id: imageId,
         rating,
         issues: selectedIssues,
