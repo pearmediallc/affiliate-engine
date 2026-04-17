@@ -3,7 +3,14 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import axios from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || (typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? 'https://affiliate-engine-pl4p.onrender.com/api/v1' : 'http://localhost:8000/api/v1');
+function getApiUrl() {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
+    return 'https://affiliate-engine-pl4p.onrender.com/api/v1';
+  }
+  return 'http://localhost:8000/api/v1';
+}
+const API_URL = getApiUrl();
 
 interface User {
   id: string;

@@ -1,12 +1,18 @@
 import axios from 'axios';
 
-const PROD_API = 'https://affiliate-engine-pl4p.onrender.com/api/v1';
-const LOCAL_API = 'http://localhost:8000/api/v1';
-const isProd = typeof window !== 'undefined' && window.location.hostname !== 'localhost';
+const PROD_HOST = 'https://affiliate-engine-pl4p.onrender.com';
+const LOCAL_HOST = 'http://localhost:8000';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || (isProd ? PROD_API : LOCAL_API);
+function detectHost() {
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
+    return PROD_HOST;
+  }
+  return LOCAL_HOST;
+}
+
+export const API_HOST = process.env.NEXT_PUBLIC_API_HOST || detectHost();
+const API_URL = process.env.NEXT_PUBLIC_API_URL || `${API_HOST}/api/v1`;
 export const API_BASE_URL = API_URL;
-export const API_HOST = isProd ? 'https://affiliate-engine-pl4p.onrender.com' : 'http://localhost:8000';
 const CLIENT_ID = 'demo-client';
 
 const apiClient = axios.create({
