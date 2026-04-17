@@ -1,0 +1,345 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* SF Pro font - use system fonts as fallback */
+@import url('https://fonts.cdnfonts.com/css/sf-pro-display');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #0a0a0c;
+  color: #e8e8ed;
+  letter-spacing: -0.374px;
+  line-height: 1.47;
+  font-size: 17px;
+}
+
+a {
+  color: #2997ff;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  outline: none;
+  font-family: inherit;
+}
+
+input, textarea, select {
+  font-family: inherit;
+  color: #e8e8ed;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* ============================================
+   DARK THEME OVERRIDES FOR ALL TAILWIND CLASSES
+   ============================================ */
+
+@layer base {
+
+  /* --- Backgrounds: convert all light backgrounds to dark glass --- */
+  .bg-white,
+  .bg-gray-50,
+  .bg-gray-100 {
+    background: rgba(20, 20, 22, 0.65) !important;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    color: #e8e8ed !important;
+  }
+
+  .bg-blue-50, .bg-blue-100,
+  .bg-green-50, .bg-green-100,
+  .bg-amber-50, .bg-amber-100,
+  .bg-purple-50, .bg-purple-100,
+  .bg-red-50, .bg-red-100,
+  .bg-yellow-50, .bg-yellow-100,
+  .bg-indigo-50, .bg-indigo-100 {
+    background: rgba(255, 255, 255, 0.04) !important;
+    color: #e8e8ed !important;
+  }
+
+  /* --- Text colors: all grays and darks become light --- */
+  .text-gray-900, .text-gray-800 {
+    color: #f0f0f5 !important;
+  }
+  .text-gray-700 {
+    color: #d1d1d6 !important;
+  }
+  .text-gray-600 {
+    color: #a1a1a6 !important;
+  }
+  .text-gray-500 {
+    color: rgba(255, 255, 255, 0.45) !important;
+  }
+  .text-gray-400 {
+    color: rgba(255, 255, 255, 0.35) !important;
+  }
+
+  /* Colored text — brighten for dark backgrounds */
+  .text-blue-600, .text-blue-700, .text-blue-800 {
+    color: #2997ff !important;
+  }
+  .text-green-600, .text-green-700, .text-green-800 {
+    color: #30d158 !important;
+  }
+  .text-red-600, .text-red-700, .text-red-800 {
+    color: #ff6b6b !important;
+  }
+  .text-amber-600, .text-amber-700, .text-amber-800 {
+    color: #ffd60a !important;
+  }
+  .text-purple-600, .text-purple-700, .text-purple-800 {
+    color: #bf5af2 !important;
+  }
+
+  /* --- Borders: all light borders become subtle white --- */
+  .border-gray-200, .border-gray-300, .border-gray-100 {
+    border-color: rgba(255, 255, 255, 0.1) !important;
+  }
+  .border-blue-200, .border-blue-300,
+  .border-green-200, .border-green-300,
+  .border-amber-200, .border-amber-300,
+  .border-purple-200, .border-purple-300,
+  .border-red-200, .border-red-300 {
+    border-color: rgba(255, 255, 255, 0.08) !important;
+  }
+
+  /* --- Gradient backgrounds used in Dashboard wrapper --- */
+  .from-blue-50, .from-blue-100 {
+    --tw-gradient-from: rgba(20, 20, 22, 0.65) !important;
+  }
+  .to-indigo-100, .to-indigo-200 {
+    --tw-gradient-to: rgba(30, 30, 34, 0.65) !important;
+  }
+  .bg-gradient-to-br {
+    background: rgba(20, 20, 22, 0.5) !important;
+  }
+
+  /* --- Shadows: soften for dark --- */
+  .shadow-sm, .shadow-md, .shadow {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4) !important;
+  }
+  .shadow-lg {
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5) !important;
+  }
+
+  /* --- Ring colors for focus states --- */
+  .focus\:ring-blue-500:focus,
+  .focus\:ring-2:focus {
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.3) !important;
+  }
+  .focus\:border-blue-500:focus {
+    border-color: #0071e3 !important;
+  }
+
+  /* --- Colored button backgrounds: adapt for dark --- */
+  .bg-blue-600 {
+    background-color: #0071e3 !important;
+    color: #fff !important;
+  }
+  .bg-blue-600:hover, .hover\:bg-blue-700:hover {
+    background-color: #0077ed !important;
+  }
+  .bg-green-600 {
+    background-color: #30d158 !important;
+    color: #fff !important;
+  }
+  .bg-green-600:hover, .hover\:bg-green-700:hover {
+    background-color: #28c74e !important;
+  }
+  .bg-red-600 {
+    background-color: #ff453a !important;
+    color: #fff !important;
+  }
+  .bg-gray-200, .bg-gray-300 {
+    background: rgba(255, 255, 255, 0.1) !important;
+    color: #e8e8ed !important;
+  }
+  .bg-gray-400 {
+    background: rgba(255, 255, 255, 0.15) !important;
+    color: #e8e8ed !important;
+  }
+  .hover\:bg-gray-200:hover, .hover\:bg-gray-300:hover, .hover\:bg-gray-100:hover {
+    background: rgba(255, 255, 255, 0.15) !important;
+  }
+
+  /* Badge-style colored backgrounds */
+  .bg-blue-100 {
+    background: rgba(41, 151, 255, 0.15) !important;
+    color: #2997ff !important;
+  }
+  .bg-green-100 {
+    background: rgba(48, 209, 88, 0.15) !important;
+    color: #30d158 !important;
+  }
+  .bg-purple-100 {
+    background: rgba(191, 90, 242, 0.15) !important;
+    color: #bf5af2 !important;
+  }
+  .bg-amber-100, .bg-yellow-100 {
+    background: rgba(255, 214, 10, 0.15) !important;
+    color: #ffd60a !important;
+  }
+  .bg-red-100 {
+    background: rgba(255, 69, 58, 0.15) !important;
+    color: #ff6b6b !important;
+  }
+
+  /* --- Form elements --- */
+  select option {
+    background: #1c1c1e;
+    color: #e8e8ed;
+  }
+}
+
+@layer components {
+  /* Cards — dark frosted glass */
+  .card {
+    @apply rounded-lg p-6;
+    background: rgba(20, 20, 22, 0.65);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e8e8ed;
+  }
+  .card:hover {
+    background: rgba(28, 28, 30, 0.75);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  /* Primary button — Apple Blue */
+  .btn {
+    @apply px-4 py-2 rounded-lg font-normal transition-all duration-200;
+    font-size: 17px;
+    letter-spacing: normal;
+  }
+  .btn-primary {
+    @apply btn text-white;
+    background-color: #0071e3;
+  }
+  .btn-primary:hover {
+    background-color: #0077ed;
+  }
+  .btn-primary:active {
+    background-color: #006edb;
+  }
+  .btn-primary:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+  }
+
+  /* Secondary button — glass */
+  .btn-secondary {
+    @apply btn;
+    background: rgba(255, 255, 255, 0.1);
+    color: #e8e8ed;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+  }
+  .btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.18);
+  }
+
+  /* Pill button */
+  .btn-pill {
+    @apply px-5 py-2 font-normal transition-all duration-200;
+    border-radius: 980px;
+    font-size: 14px;
+    border: 1px solid #2997ff;
+    color: #2997ff;
+    background: transparent;
+  }
+  .btn-pill:hover {
+    background: rgba(41, 151, 255, 0.1);
+  }
+
+  /* Input — dark glass */
+  .input {
+    @apply w-full px-4 py-2 transition-all duration-200;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 11px;
+    font-size: 17px;
+    color: #e8e8ed;
+    outline: none;
+  }
+  .input:focus {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: #0071e3;
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.25);
+  }
+  .input::placeholder {
+    color: rgba(255, 255, 255, 0.3);
+  }
+
+  /* Headings */
+  .heading-hero {
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 56px;
+    font-weight: 600;
+    line-height: 1.07;
+    letter-spacing: -0.28px;
+    color: #ffffff;
+  }
+  .heading-section {
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 40px;
+    font-weight: 600;
+    line-height: 1.10;
+    color: #ffffff;
+  }
+  .heading-tile {
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1.14;
+    letter-spacing: 0.196px;
+    color: #ffffff;
+  }
+  .heading-card {
+    font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 21px;
+    font-weight: 600;
+    line-height: 1.19;
+    letter-spacing: 0.231px;
+    color: #f0f0f5;
+  }
+  .text-caption {
+    font-size: 14px;
+    letter-spacing: -0.224px;
+    line-height: 1.29;
+    color: rgba(255, 255, 255, 0.5);
+  }
+  .text-micro {
+    font-size: 12px;
+    letter-spacing: -0.12px;
+    line-height: 1.33;
+    color: rgba(255, 255, 255, 0.4);
+  }
+}

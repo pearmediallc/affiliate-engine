@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: affiliate-engine-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./affiliate_images.db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - FAL_API_KEY=${FAL_API_KEY}
+      - IMAGE_PROVIDER=gemini
+      - DEBUG=False
+    volumes:
+      - ./backend:/app
+      - ./backend/affiliate_images.db:/app/affiliate_images.db
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - affiliate-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: affiliate-engine-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - affiliate-network
+    depends_on:
+      - backend
+
+networks:
+  affiliate-network:
+    driver: bridge
