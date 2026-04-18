@@ -99,9 +99,9 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
       }
     }
 
-    // If using Gemma variations with an image, convert to base64
+    // Convert reference image to base64 (works in ALL modes)
     let imageBase64: string | null = null;
-    if (useGemmaVariations && referenceFile) {
+    if (referenceFile) {
       try {
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
@@ -273,11 +273,31 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
                 placeholder="Describe the style or concept you want variations of..."
                 style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', color: '#f0f0f0', fontSize: '14px', height: '70px', resize: 'none', outline: 'none' }}
               />
-              <input type="file" accept="image/*" onChange={(e) => setReferenceFile(e.target.files?.[0] || null)}
-                style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)' }}
-              />
             </div>
           )}
+
+          {/* Reference Image — available in ALL modes */}
+          <div style={{ marginTop: '16px', padding: '14px', background: 'rgba(255,255,255,0.03)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <p style={{ fontSize: '12px', fontWeight: 600, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+              Reference Image (Optional)
+            </p>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <input type="file" accept="image/*" onChange={(e) => setReferenceFile(e.target.files?.[0] || null)}
+                style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', flex: 1 }}
+              />
+              {referenceFile && (
+                <button type="button" onClick={() => setReferenceFile(null)}
+                  style={{ fontSize: '12px', color: '#ff6b6b', background: 'none', border: 'none', cursor: 'pointer' }}>
+                  Remove
+                </button>
+              )}
+            </div>
+            {referenceFile && (
+              <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginTop: '6px' }}>
+                AI will analyze this image and use it as style reference
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Settings row — compact horizontal */}

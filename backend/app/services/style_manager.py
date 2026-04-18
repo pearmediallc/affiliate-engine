@@ -12,18 +12,21 @@ class StyleManager:
     # Style definitions with their unique characteristics
     STYLES = {
         "professional_photography": {
-            "description": "High-quality professional photography, realistic, corporate aesthetic",
+            "description": "High-quality professional photography, realistic, editorial aesthetic",
             "prompt_directive": """
-VISUAL STYLE DIRECTIVE: Professional Photography
-- Ultra-realistic photographic style
-- High-quality professional photography
-- Sharp focus, excellent lighting
-- Real materials and textures
-- Professional product/lifestyle photography
-- Stock photo quality or better
-- NO cartoons, NO illustrations, NO plastic appearance
-- NO artificial or fake-looking elements
-- Detailed, sharp, professional"""
+VISUAL STYLE DIRECTIVE: Professional Editorial Photography
+- Shot on Canon EOS R5 with 85mm f/1.4 lens, natural shallow depth-of-field
+- Natural film grain (ISO 400-800), NOT digitally clean
+- Mixed color temperature lighting (warm practicals + cool ambient)
+- Subtle lens vignette and natural chromatic aberration
+- Real skin texture with pores, not airbrushed or plastic
+- Ambient occlusion shadows, NOT flat studio lighting
+- Editorial magazine photography, NOT stock photo
+- Natural color grading with slight desaturation, muted highlights
+- Imperfect real-world elements: slight wrinkles in fabric, natural hair movement
+- Environmental context with bokeh background, NOT solid color backdrop
+- NO HDR over-processing, NO artificial sharpening, NO plastic skin
+- Captured moment feeling, NOT posed mannequin look"""
         },
         "modern_illustrated": {
             "description": "Clean, modern illustrated style with vector aesthetic",
@@ -67,18 +70,19 @@ VISUAL STYLE DIRECTIVE: Minimalist
 - Uncluttered, elegant"""
         },
         "cinematic": {
-            "description": "Cinematic blockbuster movie visual style",
+            "description": "Cinematic film look with dramatic color grading",
             "prompt_directive": """
-VISUAL STYLE DIRECTIVE: Cinematic
-- Blockbuster cinematic movie visual style
-- Professional cinematography quality
-- Dramatic lighting and shadows
-- Dynamic camera angle/perspective
-- Epic scale and grandeur
-- Color-graded cinema look
-- Professional motion picture quality
-- Intense, dramatic atmosphere
-- Hollywood production design"""
+VISUAL STYLE DIRECTIVE: Cinematic Film
+- Anamorphic lens look with 2.39:1 framing feel, horizontal lens flares
+- Teal and orange color grading (blockbuster palette)
+- Deep shadows with crushed blacks, lifted in post
+- Dramatic side-lighting or rim-lighting, motivated light sources
+- Film grain (35mm Kodak Vision3 500T look), NOT digitally clean
+- Shallow depth-of-field with creamy bokeh
+- Atmospheric haze, dust particles in light beams
+- Dynamic camera angle suggesting movement (dolly, crane)
+- Production design with practical set dressing
+- Color-graded NOT color-corrected — mood over accuracy"""
         },
         "3d_render": {
             "description": "3D rendered computer graphics style",
@@ -156,10 +160,19 @@ VISUAL STYLE DIRECTIVE: Anime
 
         style_directive = StyleManager.get_style_directive(style)
 
-        # Combine base prompt with style directive
+        # Anti-plastic realism directive applied to ALL styles
+        realism = """
+CRITICAL REALISM RULES (apply to ALL styles):
+- NO plastic, waxy, or airbrushed skin — show real texture
+- NO over-saturated HDR look — keep natural dynamic range
+- NO perfectly symmetrical compositions — slight asymmetry feels real
+- NO stock-photo-smile poses — capture natural, candid moments
+- Any TEXT in the image must be spelled EXACTLY as specified in the prompt, character-by-character. Double-check every letter."""
+
         augmented = f"""{base_prompt}
 
-{style_directive}"""
+{style_directive}
+{realism}"""
 
         return augmented
 

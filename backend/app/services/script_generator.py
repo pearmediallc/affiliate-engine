@@ -3,6 +3,7 @@ import logging
 from typing import Optional
 import google.generativeai as genai
 from ..config import settings
+from .knowledge_service import KnowledgeService
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,11 @@ Format as clear, easy-to-read text that can be used for:
 - Social media caption
 - Landing page copy
 - Ad text with image overlay instructions"""
+
+        # Inject affiliate marketing knowledge
+        knowledge_context = KnowledgeService.get_context_for_script_generation()
+        if knowledge_context:
+            prompt = f"{knowledge_context}\n\n{prompt}"
 
         try:
             response = self.model.generate_content(prompt)

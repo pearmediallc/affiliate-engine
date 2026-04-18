@@ -104,7 +104,7 @@ Requirements:
 - Each variation should be distinct but aligned with the same core message
 - All should maintain professional quality standards
 - Each should work for 1200x628px horizontal format
-- No text overlays
+- If the original prompt includes specific text/headlines to display, preserve them EXACTLY character-by-character in each variation. Spell every word correctly.
 - Focus on different psychological angles (trust, family, safety, relief, achievement, etc.)
 
 Return only the {count} variations, one per line, numbered 1-{count}."""
@@ -201,7 +201,7 @@ Requirements for each prompt:
 2. Include visual composition details (lighting, colors, mood)
 3. Specify image format: 1200x628px horizontal
 4. Professional, high-quality stock photo style
-5. No text overlays in the image
+5. If text overlays are desired, specify the EXACT text character-by-character with placement (top/center/bottom) and style (bold, color). Spell every word correctly.
 6. Each variation should explore different aspects of the reference
 7. Variations should differ in: composition, perspective, emotion, styling
 

@@ -23,7 +23,7 @@ Scene showing a protective parent watching happy children play in a safe, fenced
 - Happy, carefree mood
 - High quality stock photo
 - 1200x628px horizontal ratio
-- No text overlays
+- Any text overlays must be spelled exactly as specified, character-by-character
 - Warm, inviting lighting
 - Professional photography quality""",
             "width": 1200,
@@ -48,7 +48,7 @@ Beautiful suburban house showcasing security and protection.
 - Shield or protective element ready for overlay
 - Professional real estate photography quality
 - 1200x628px format
-- No text in image
+- Any text in image must be spelled exactly as specified
 - Well-lit, attractive composition
 - High-end residential neighborhood feel""",
             "width": 1200,
@@ -99,7 +99,7 @@ Young couple standing in front of their beautiful new home.
 - Upscale neighborhood
 - Modern, clean aesthetic
 - 1200x628px format
-- No text overlays
+- Any text overlays must be spelled exactly as specified, character-by-character
 - Stock photography quality
 - Represents new beginning and security""",
             "width": 1200,
@@ -152,7 +152,7 @@ Mature, responsible gun owner at safe, legal shooting range environment.
 - Professional, responsible aesthetic
 - Legal, regulated environment visible
 - 1200x628px landscape format
-- No text overlays
+- Any text overlays must be spelled exactly as specified, character-by-character
 - High quality professional photography
 - Emphasizes safety and legal responsibility""",
             "width": 1200,
