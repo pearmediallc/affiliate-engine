@@ -390,7 +390,7 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
                   fontSize: '28px', fontWeight: 700, color: 'rgba(255,255,255,0.8)',
                 }}>
                   {(avatar.avatar_name || '?')[0].toUpperCase()}
-                )}
+                </div>
                 <p style={{ fontSize: '11px', color: '#e8e8ed', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{avatar.avatar_name}</p>
               </div>
             ))}
