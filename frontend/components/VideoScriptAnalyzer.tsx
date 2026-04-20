@@ -102,43 +102,43 @@ export default function VideoScriptAnalyzer() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h2 className="text-2xl font-bold text-gray-900">📜 Video Transcript Analyzer</h2>
-        <p className="text-gray-600 mt-2">
+        <h2 style={{ fontSize: '24px', fontWeight: 700, color: '#e8e8ed' }}>Video Transcript Analyzer</h2>
+        <p style={{ color: 'rgba(255,255,255,0.6)', marginTop: '8px', fontSize: '14px' }}>
           Upload a video or paste a link to auto-generate transcript, then analyze copywriting frameworks, psychology, and conversion mechanics
         </p>
       </div>
 
       {/* Input Section */}
-      <div className="bg-white rounded-lg shadow p-6 space-y-4">
+      <div className="card" style={{ padding: '24px' }}>
 
         <form onSubmit={handleAnalyze} className="space-y-4">
 
           {/* Video URL Input */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              📹 Video/Audio URL
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+              Video/Audio URL
             </label>
             <input
               type="url"
               value={videoUrl}
               onChange={(e) => setVideoUrl(e.target.value)}
               placeholder="YouTube, TikTok, Instagram, or direct video/audio link"
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '14px', outline: 'none' }}
               disabled={!!videoFile}
             />
           </div>
 
           {/* OR Divider */}
-          <div className="flex items-center gap-3">
-            <div className="flex-1 border-t border-gray-200"></div>
-            <span className="text-xs text-gray-500 font-medium">OR</span>
-            <div className="flex-1 border-t border-gray-200"></div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ flex: 1, borderTop: '1px solid rgba(255,255,255,0.1)' }}></div>
+            <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', fontWeight: 500 }}>OR</span>
+            <div style={{ flex: 1, borderTop: '1px solid rgba(255,255,255,0.1)' }}></div>
           </div>
 
           {/* File Upload */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              📁 Upload Video/Audio File
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+              Upload Video/Audio File
             </label>
             <input
               type="file"
@@ -148,26 +148,26 @@ export default function VideoScriptAnalyzer() {
                 setVideoFile(file);
                 if (file) setVideoUrl('');
               }}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg text-sm file:mr-4 file:py-1 file:px-3 file:rounded-full file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+              style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '14px' }}
             />
             {videoFile && (
-              <div className="flex items-center gap-2 mt-2">
-                <span className="text-xs text-green-600">Selected: {videoFile.name} ({(videoFile.size / 1024 / 1024).toFixed(1)}MB)</span>
-                <button type="button" onClick={() => setVideoFile(null)} className="text-xs text-red-500 underline">Remove</button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px' }}>
+                <span style={{ fontSize: '12px', color: '#30d158' }}>Selected: {videoFile.name} ({(videoFile.size / 1024 / 1024).toFixed(1)}MB)</span>
+                <button type="button" onClick={() => setVideoFile(null)} style={{ fontSize: '12px', color: '#ff6b6b', background: 'none', border: 'none', textDecoration: 'underline', cursor: 'pointer' }}>Remove</button>
               </div>
             )}
-            <p className="text-xs text-gray-500 mt-1">
-              Supports: MP3, MP4, WAV, M4A, FLAC, WEBM (max 25MB)
+            <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginTop: '6px' }}>
+              Supports: MP3, MP4, WAV, M4A, FLAC, WEBM (max 100MB)
             </p>
           </div>
 
           {/* Transcription Provider */}
-          <div className="flex items-center gap-4">
-            <label className="text-sm font-medium text-gray-700">Transcription Engine:</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <label style={{ fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)' }}>Transcription Engine:</label>
             <select
               value={transcriptionProvider}
               onChange={(e) => setTranscriptionProvider(e.target.value)}
-              className="px-3 py-1 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              style={{ padding: '8px 12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '13px', outline: 'none' }}
             >
               <option value="openai">OpenAI Whisper</option>
               <option value="deepgram">Deepgram</option>
@@ -197,21 +197,21 @@ export default function VideoScriptAnalyzer() {
 
           {/* Transcript Display/Edit */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              📝 Transcript {transcript ? '(edit if needed)' : '(auto-generated or paste manually)'}
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+              Transcript {transcript ? '(edit if needed)' : '(auto-generated or paste manually)'}
             </label>
             <textarea
               value={transcript}
               onChange={(e) => setTranscript(e.target.value)}
               placeholder="Transcript will appear here after auto-transcription, or paste manually..."
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 h-40 resize-none font-mono text-sm"
+              style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '14px', outline: 'none', resize: 'none', height: '160px', fontFamily: 'monospace' }}
             />
           </div>
 
           {/* Error Message */}
           {error && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-              <p className="text-red-800 text-sm">{error}</p>
+            <div style={{ background: 'rgba(255,59,48,0.1)', border: '1px solid rgba(255,59,48,0.3)', borderRadius: '10px', padding: '16px' }}>
+              <p style={{ color: '#ff6b6b', fontSize: '13px', margin: 0 }}>{error}</p>
             </div>
           )}
 
@@ -239,67 +239,67 @@ export default function VideoScriptAnalyzer() {
 
       {/* Analysis Results */}
       {analysisResult && (
-        <div className="bg-white rounded-lg shadow p-6 space-y-6">
-          <div className="border-b pb-4">
-            <h3 className="text-lg font-bold text-gray-900">📊 Transcript Analysis Results</h3>
-            <div className="mt-3 grid grid-cols-2 gap-4">
+        <div className="card" style={{ padding: '24px' }}>
+          <div style={{ borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '16px' }}>
+            <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#e8e8ed' }}>Transcript Analysis Results</h3>
+            <div style={{ marginTop: '12px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
               <div>
-                <p className="text-xs text-gray-600">Platform</p>
-                <p className="text-sm font-semibold text-gray-900">{analysisResult.platform}</p>
+                <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)' }}>Platform</p>
+                <p style={{ fontSize: '14px', fontWeight: 600, color: '#e8e8ed' }}>{analysisResult.platform}</p>
               </div>
               <div>
-                <p className="text-xs text-gray-600">Analysis Model</p>
-                <p className="text-sm font-semibold text-gray-900">{analysisResult.analysis_model}</p>
+                <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)' }}>Analysis Model</p>
+                <p style={{ fontSize: '14px', fontWeight: 600, color: '#e8e8ed' }}>{analysisResult.analysis_model}</p>
               </div>
             </div>
           </div>
 
-          <div>
-            <h4 className="font-semibold text-gray-900 mb-3">🔍 Detailed Transcript Analysis</h4>
-            <div className="bg-gray-50 rounded-lg p-4 text-sm text-gray-800 whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto border border-gray-200">
+          <div style={{ marginTop: '24px' }}>
+            <h4 style={{ fontWeight: 600, color: '#e8e8ed', marginBottom: '12px' }}>Detailed Transcript Analysis</h4>
+            <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '16px', fontSize: '14px', color: 'rgba(255,255,255,0.8)', whiteSpace: 'pre-wrap', lineHeight: 1.6, maxHeight: '384px', overflowY: 'auto', border: '1px solid rgba(255,255,255,0.08)' }}>
               {analysisResult.detailed_analysis}
             </div>
           </div>
 
           {analysisResult.transcript_snippet && (
-            <div className="border-t pt-4">
-              <h4 className="font-semibold text-gray-900 mb-3">📋 Transcript Analyzed</h4>
-              <div className="bg-gray-50 rounded-lg p-4 text-sm text-gray-800 max-h-32 overflow-y-auto border border-gray-200 font-mono">
+            <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '16px', marginTop: '24px' }}>
+              <h4 style={{ fontWeight: 600, color: '#e8e8ed', marginBottom: '12px' }}>Transcript Analyzed</h4>
+              <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '16px', fontSize: '14px', color: 'rgba(255,255,255,0.8)', maxHeight: '128px', overflowY: 'auto', border: '1px solid rgba(255,255,255,0.08)', fontFamily: 'monospace' }}>
                 {analysisResult.transcript_snippet}
               </div>
             </div>
           )}
 
-          <div className="flex gap-2 border-t pt-4">
+          <div style={{ display: 'flex', gap: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '16px', marginTop: '24px' }}>
             <button
               onClick={() => {
                 navigator.clipboard.writeText(analysisResult.detailed_analysis);
                 alert('Analysis copied to clipboard!');
               }}
-              className="flex-1 py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-sm transition-colors"
+              style={{ flex: 1, padding: '10px 16px', background: '#0071e3', color: '#fff', borderRadius: '10px', border: 'none', fontWeight: 500, fontSize: '14px', cursor: 'pointer' }}
             >
-              📋 Copy Analysis
+              Copy Analysis
             </button>
             <button
               onClick={() => setAnalysisResult(null)}
-              className="flex-1 py-2 px-4 bg-gray-200 hover:bg-gray-300 text-gray-900 rounded-lg font-medium text-sm transition-colors"
+              style={{ flex: 1, padding: '10px 16px', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', borderRadius: '10px', border: 'none', fontWeight: 500, fontSize: '14px', cursor: 'pointer' }}
             >
-              ➕ Analyze Another
+              Analyze Another
             </button>
           </div>
         </div>
       )}
 
       {/* Tips Section */}
-      <div className="bg-purple-50 border border-purple-200 rounded-lg p-6 space-y-3">
-        <h4 className="font-semibold text-purple-900">💡 Transcript Analysis Features</h4>
-        <ul className="text-sm text-purple-800 space-y-2">
-          <li>• <strong>Auto-Transcription</strong> - Upload video/audio or paste URL, we transcribe with Whisper/Deepgram</li>
-          <li>• <strong>Framework Identification</strong> - Detect PAS, AIDA, BAB, StoryBrand, SLAP patterns</li>
-          <li>• <strong>Psychology Analysis</strong> - Identify urgency, scarcity, social proof, authority triggers</li>
-          <li>• <strong>Conversion Mechanics</strong> - Understand problem to desire to action flow</li>
-          <li>• <strong>Replication Guide</strong> - Step-by-step breakdown to create similar hooks</li>
-          <li>• <strong>Vertical Applicability</strong> - Which affiliate verticals could use this approach</li>
+      <div className="card" style={{ padding: '24px', border: '1px solid rgba(175,130,255,0.2)' }}>
+        <h4 style={{ fontWeight: 600, color: '#bf9aff', marginBottom: '12px' }}>Transcript Analysis Features</h4>
+        <ul style={{ fontSize: '14px', color: 'rgba(255,255,255,0.7)', listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <li>&#8226; <strong>Auto-Transcription</strong> - Upload video/audio or paste URL, we transcribe with Whisper/Deepgram</li>
+          <li>&#8226; <strong>Framework Identification</strong> - Detect PAS, AIDA, BAB, StoryBrand, SLAP patterns</li>
+          <li>&#8226; <strong>Psychology Analysis</strong> - Identify urgency, scarcity, social proof, authority triggers</li>
+          <li>&#8226; <strong>Conversion Mechanics</strong> - Understand problem to desire to action flow</li>
+          <li>&#8226; <strong>Replication Guide</strong> - Step-by-step breakdown to create similar hooks</li>
+          <li>&#8226; <strong>Vertical Applicability</strong> - Which affiliate verticals could use this approach</li>
         </ul>
       </div>
     </div>

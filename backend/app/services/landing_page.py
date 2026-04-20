@@ -95,6 +95,15 @@ REQUIREMENTS:
 8. All text must be compelling copywriting, not placeholder text
 9. CSS animations for CTA buttons (subtle pulse or glow effect)
 10. Zero external dependencies — the HTML file must work completely standalone
+11. Include a HERO IMAGE section using a relevant free stock image from Unsplash (use <img src="https://images.unsplash.com/photo-XXXX?w=1200&h=600&fit=crop"> with a REAL Unsplash photo ID relevant to the vertical)
+12. Use CSS background gradients and overlays on the hero section for dramatic effect
+13. CTA buttons must have hover animations (scale + glow effect) and use contrasting bright colors (not the same as the background)
+14. Include at least 2 different CTA button styles — one for the hero, one for the final section
+15. Add a sticky header bar with a CTA button that appears on scroll
+16. Use CSS counters or animated number sections for statistics ("500+ Happy Customers", "$2M+ Saved")
+17. Add a FAQ section with expandable accordions using vanilla JS
+18. The design must look like a premium SaaS landing page, NOT a generic text page
+19. Use box-shadow, border-radius, and subtle gradients on every card/section for depth
 
 Output ONLY the complete HTML code. No explanations.
 """
@@ -157,7 +166,20 @@ BENCHMARKS:
 - Good ROAS: >2x
 """
 
-        content_source = f"LANDING PAGE URL: {lp_url}" if lp_url else f"LANDING PAGE HTML:\n{lp_html[:3000]}"
+        if lp_url:
+            try:
+                import requests as req
+                page_response = req.get(lp_url, timeout=15, headers={
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                })
+                fetched_html = page_response.text[:5000]  # First 5000 chars
+                content_source = f"LANDING PAGE URL: {lp_url}\n\nFETCHED HTML CONTENT:\n{fetched_html}"
+            except Exception as fetch_err:
+                content_source = f"LANDING PAGE URL: {lp_url}\n(Could not fetch page: {fetch_err})"
+        elif lp_html:
+            content_source = f"LANDING PAGE HTML:\n{lp_html[:5000]}"
+        else:
+            raise ValueError("Provide either lp_url or lp_html")
 
         prompt = f"""You are a conversion rate optimization expert. Analyze this landing page.
 

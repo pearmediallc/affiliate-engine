@@ -10,6 +10,7 @@ from ..middleware.auth import get_optional_user, log_usage
 import logging
 import tempfile
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,32 @@ async def transcribe_audio_file(
     - Confidence score (if available)
     """
     try:
-        # Validate file size (25MB max)
+        # Validate file size (100MB max)
         content = await file.read()
         file_size = len(content)
-        if file_size > 25 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large (max 25MB)")
+        if file_size > 100 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large (max 100MB)")
 
         # Save file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file.filename.split('.')[-1]}") as temp_file:
             temp_file.write(content)
             temp_path = temp_file.name
+
+        # If file is over 25MB, compress it with ffmpeg
+        if file_size > 25 * 1024 * 1024:
+            compressed_path = temp_path + "_compressed.mp3"
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", temp_path,
+                    "-b:a", "64k", "-ar", "16000", "-ac", "1",
+                    compressed_path
+                ], capture_output=True, timeout=60)
+                if os.path.isfile(compressed_path):
+                    os.unlink(temp_path)
+                    temp_path = compressed_path
+                    logger.info(f"Compressed audio from {file_size} to {os.path.getsize(temp_path)} bytes")
+            except Exception as compress_err:
+                logger.warning(f"Compression failed: {compress_err}")
 
         try:
             # Transcribe

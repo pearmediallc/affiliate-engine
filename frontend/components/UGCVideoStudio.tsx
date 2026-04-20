@@ -283,18 +283,26 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
     setScript(initialScript);
   }, [initialScript]);
 
-  const loadAvatars = async () => {
+  const loadAvatars = useCallback(async () => {
     setIsLoadingAvatars(true);
     setError('');
     try {
       const res = await axios.get(`${API_BASE_URL}/tiktok/avatars`);
-      setAvatars(res.data.avatars || res.data.data?.avatars || []);
+      const data = res.data?.data || res.data;
+      console.log('Avatar API response:', JSON.stringify(data).substring(0, 500));
+      const avatarList = data?.digital_avatar_list || data?.list || data?.avatars || [];
+      setAvatars(avatarList);
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'Failed to load avatars');
+      console.error('Avatar load error:', err);
     } finally {
       setIsLoadingAvatars(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadAvatars();
+  }, [loadAvatars]);
 
   const handleCreate = async () => {
     if (!selectedAvatar || !script.trim()) return;
@@ -352,7 +360,7 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
         </div>
         {avatars.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: '12px' }}>
-            {avatars.map(avatar => (
+            {avatars.filter(avatar => avatar.avatar_id).map(avatar => (
               <div key={avatar.avatar_id} onClick={() => setSelectedAvatar(avatar.avatar_id)}
                 style={{
                   padding: '8px', borderRadius: '12px', cursor: 'pointer', textAlign: 'center',
