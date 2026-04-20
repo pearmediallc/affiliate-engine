@@ -39,7 +39,16 @@ export const generateImages = async (
   referenceImageBase64?: string,
   referenceText?: string,
   vertical: string = 'home_insurance',
-  style: string = 'professional_photography'
+  style: string = 'professional_photography',
+  textMode: string = 'none',
+  postProcess: string = 'editorial',
+  headlineText?: string,
+  subheadingText?: string,
+  ctaText?: string,
+  cinemaCamera?: string,
+  cinemaLens?: string,
+  cinemaFocalLength?: string,
+  cinemaAperture?: string,
 ) => {
   const response = await apiClient.post(`/images/generate?client_id=${CLIENT_ID}`, {
     vertical: vertical,
@@ -52,6 +61,15 @@ export const generateImages = async (
     reference_text: referenceText || context,
     reference_image_base64: referenceImageBase64,
     style: style,
+    text_mode: textMode,
+    post_process: postProcess,
+    headline_text: headlineText || undefined,
+    subheading_text: subheadingText || undefined,
+    cta_text: ctaText || undefined,
+    cinema_camera: cinemaCamera || undefined,
+    cinema_lens: cinemaLens || undefined,
+    cinema_focal_length: cinemaFocalLength || undefined,
+    cinema_aperture: cinemaAperture || undefined,
   });
   return response.data;
 };

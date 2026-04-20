@@ -138,7 +138,7 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
       referenceImageBase64: imageBase64,
     };
 
-    // Call with all params including image data
+    // Call with all params including image data + new features
     onGenerate(
       selectedTemplate,
       useGemmaVariations ? referenceInput : (useCustomPrompt ? customPrompt : verticalContext),
@@ -149,7 +149,12 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
       imageBase64,
       referenceInput,
       undefined, // vertical will come from Dashboard
-      selectedStyle
+      selectedStyle,
+      textMode,
+      postProcess,
+      headlineText || undefined,
+      subheadingText || undefined,
+      ctaText || undefined,
     );
   };
 

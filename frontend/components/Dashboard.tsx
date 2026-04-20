@@ -133,7 +133,12 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
     referenceImageBase64?: string,
     referenceText?: string,
     verticalOverride?: string,
-    style: string = 'professional_photography'
+    style: string = 'professional_photography',
+    textMode: string = 'none',
+    postProcess: string = 'editorial',
+    headlineText?: string,
+    subheadingText?: string,
+    ctaText?: string,
   ) => {
     try {
       setIsGenerating(true);
@@ -148,7 +153,12 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
         referenceImageBase64,
         referenceText,
         verticalOverride || vertical,
-        style
+        style,
+        textMode,
+        postProcess,
+        headlineText,
+        subheadingText,
+        ctaText,
       );
 
       if (result.data && result.data.images) {
