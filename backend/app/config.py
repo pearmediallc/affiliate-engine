@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     google_api_key: Optional[str] = None  # Google Cloud API key
     fal_api_key: Optional[str] = None  # FAL.ai API key for image generation
+    ideogram_api_key: Optional[str] = None  # Ideogram API key for text-heavy image generation
     deepgram_api_key: Optional[str] = None  # Deepgram API key for transcription
+    tiktok_access_token: Optional[str] = None
+    tiktok_advertiser_id: Optional[str] = None
 
     # Image Generation
     image_provider: str = "gemini"  # Primary: Gemini 3.1 Flash Image, Fallback: OpenAI DALL-E 3, Then FAL.ai

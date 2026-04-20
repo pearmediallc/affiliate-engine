@@ -34,6 +34,11 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
   const [useAffiliateAngles, setUseAffiliateAngles] = useState(true);
   const [selectedAngle, setSelectedAngle] = useState('benefit');
   const [selectedStyle, setSelectedStyle] = useState('professional_photography');
+  const [textMode, setTextMode] = useState('none');
+  const [postProcess, setPostProcess] = useState('editorial');
+  const [headlineText, setHeadlineText] = useState('');
+  const [subheadingText, setSubheadingText] = useState('');
+  const [ctaText, setCtaText] = useState('');
 
   // Prompt Assistant state
   const [assistantDescription, setAssistantDescription] = useState('');
@@ -300,6 +305,36 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
           </div>
         </div>
 
+        {/* Text Overlay — shown when textMode is not 'none' */}
+        {textMode !== 'none' && (
+          <div className="card" style={{ padding: '20px' }}>
+            <p style={{ fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '12px' }}>Text Overlay</p>
+            <div className="space-y-3">
+              <div>
+                <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '4px', display: 'block' }}>Headline</label>
+                <input type="text" value={headlineText} onChange={e => setHeadlineText(e.target.value)}
+                  placeholder="Main headline text..."
+                  style={{ width: '100%', padding: '10px 14px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', color: '#f0f0f0', fontSize: '14px', outline: 'none' }}
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '4px', display: 'block' }}>Subheading</label>
+                <input type="text" value={subheadingText} onChange={e => setSubheadingText(e.target.value)}
+                  placeholder="Supporting text..."
+                  style={{ width: '100%', padding: '10px 14px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', color: '#f0f0f0', fontSize: '14px', outline: 'none' }}
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '4px', display: 'block' }}>CTA Button</label>
+                <input type="text" value={ctaText} onChange={e => setCtaText(e.target.value)}
+                  placeholder="e.g. CHECK ELIGIBILITY"
+                  style={{ width: '100%', padding: '10px 14px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', color: '#f0f0f0', fontSize: '14px', outline: 'none' }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Settings row — compact horizontal */}
         <div className="card" style={{ padding: '16px 20px' }}>
           <div style={{ display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -337,6 +372,25 @@ export default function ImageGenerator({ templates, onGenerate, isLoading, verti
                 />
                 <span style={{ fontSize: '14px', fontWeight: 600, color: '#2997ff', minWidth: '24px', textAlign: 'center' }}>{numVariations}</span>
               </div>
+            </div>
+            {/* Text Mode */}
+            <div style={{ flex: '1 1 140px' }}>
+              <p style={{ fontSize: '11px', fontWeight: 600, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>Text Mode</p>
+              <select value={textMode} onChange={(e) => setTextMode(e.target.value)} className="input" style={{ fontSize: '13px', padding: '8px 12px' }}>
+                <option value="none">No Text</option>
+                <option value="ai">AI Text</option>
+                <option value="overlay">Overlay</option>
+              </select>
+            </div>
+            {/* Post-Process */}
+            <div style={{ flex: '1 1 140px' }}>
+              <p style={{ fontSize: '11px', fontWeight: 600, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>Post-Process</p>
+              <select value={postProcess} onChange={(e) => setPostProcess(e.target.value)} className="input" style={{ fontSize: '13px', padding: '8px 12px' }}>
+                <option value="editorial">Editorial</option>
+                <option value="film">Film</option>
+                <option value="vintage">Vintage</option>
+                <option value="raw">Raw</option>
+              </select>
             </div>
           </div>
         </div>

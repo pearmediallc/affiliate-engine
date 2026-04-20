@@ -73,6 +73,8 @@ class ImageGeneratorService:
                 actual_provider = "gemini"
             elif "dall-e" in model_name:
                 actual_provider = "openai"
+            elif "ideogram" in model_name:
+                actual_provider = "ideogram"
             elif "flux" in model_name:
                 actual_provider = "fal"
             else:
@@ -123,6 +125,15 @@ class ImageGeneratorService:
         """
         logger.info(f"Image generation chain: Gemini PRIMARY → OpenAI SECONDARY → FAL TERTIARY")
 
+        # Smart routing: check if a specific provider is best for this prompt
+        route = self._smart_route(prompt)
+        if route == "ideogram":
+            try:
+                logger.info("Smart route: Using Ideogram (text-heavy content detected)")
+                return await self._generate_with_ideogram(prompt)
+            except Exception as e:
+                logger.warning(f"Ideogram smart route failed: {e}, falling back to default chain")
+
         # STEP 1: Try Gemini (PRIMARY) - Always attempt first regardless of provider setting
         if GOOGLE_GENAI_AVAILABLE and settings.gemini_api_key:
             try:
@@ -152,6 +163,74 @@ class ImageGeneratorService:
         except Exception as fal_e:
             logger.error(f"Step 3 FAILED: FAL error: {str(fal_e)}")
             raise Exception("All image generation providers failed")
+
+    def _smart_route(self, prompt: str, has_text_overlay: bool = False) -> str:
+        """Determine the best provider based on prompt content"""
+        prompt_lower = prompt.lower()
+
+        # If user wants text in the image, prefer Ideogram (90-95% text accuracy)
+        if has_text_overlay or any(kw in prompt_lower for kw in ['"', 'text overlay', 'headline', 'cta button', 'banner text', 'sign that says']):
+            if settings.ideogram_api_key:
+                return "ideogram"
+
+        # Default chain
+        return "default"
+
+    async def _generate_with_ideogram(self, prompt: str) -> dict:
+        """Generate image using Ideogram 3.0 - best for text-heavy images"""
+        if not settings.ideogram_api_key:
+            raise ValueError("IDEOGRAM_API_KEY not set")
+
+        try:
+            headers = {
+                "Api-Key": settings.ideogram_api_key,
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "image_request": {
+                    "prompt": prompt,
+                    "model": "V_3",
+                    "aspect_ratio": "ASPECT_16_9",
+                    "magic_prompt_option": "AUTO",
+                }
+            }
+
+            response = requests.post(
+                "https://api.ideogram.ai/generate",
+                json=payload,
+                headers=headers,
+                timeout=120,
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Ideogram API error: {response.status_code} - {response.text[:200]}")
+
+            data = response.json()
+
+            if data.get("data") and len(data["data"]) > 0:
+                image_url = data["data"][0].get("url")
+                if image_url:
+                    # Download and save to disk
+                    img_response = requests.get(image_url, timeout=30)
+                    if img_response.status_code == 200:
+                        filename = f"{uuid.uuid4().hex[:12]}.png"
+                        filepath = os.path.join(IMAGES_DIR, filename)
+                        with open(filepath, "wb") as f:
+                            f.write(img_response.content)
+
+                        logger.info(f"Image generated with Ideogram 3.0, saved: {filepath}")
+                        return {
+                            "url": f"/api/v1/images/serve/{filename}",
+                            "path": filepath,
+                            "model": "ideogram-v3",
+                            "seed": uuid.uuid4().hex[:8],
+                        }
+
+            raise Exception("Ideogram returned no image data")
+        except Exception as e:
+            logger.error(f"Ideogram generation failed: {str(e)}")
+            raise
 
     async def _generate_with_openai(self, prompt: str) -> dict:
         """

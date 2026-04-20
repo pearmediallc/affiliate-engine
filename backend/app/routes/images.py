@@ -9,6 +9,9 @@ from ..services import ImageGeneratorService, PromptOptimizerService, VerticalTe
 from ..services.affiliate_prompt_engineer import AffiliatePromptEngineer
 from ..services.learning_service import LearningService
 from ..services.image_generator import IMAGES_DIR
+from ..services.text_overlay import TextOverlayService
+from ..services.post_processor import PostProcessor
+from ..services.cinema_system import CinemaSystem
 from ..config import settings
 from ..middleware.auth import get_optional_user, log_usage
 import uuid
@@ -82,6 +85,26 @@ async def generate_prompt(
     except Exception as e:
         logger.error(f"Prompt generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Prompt generation failed: {str(e)}")
+
+
+@router.get("/cinema-options")
+async def get_cinema_options():
+    """Get available cinema camera equipment options"""
+    return APIResponse(
+        success=True,
+        message="Cinema options",
+        data=CinemaSystem.get_all_options(),
+    )
+
+
+@router.get("/post-process-presets")
+async def get_post_process_presets():
+    """Get available post-processing presets"""
+    return APIResponse(
+        success=True,
+        message="Post-processing presets",
+        data=PostProcessor.get_available_presets(),
+    )
 
 
 @router.post("/generate", response_model=APIResponse)
@@ -208,7 +231,33 @@ async def generate_images(
 
                 # Augment prompt with style directive
                 style = request.style if hasattr(request, 'style') and request.style else "professional_photography"
-                augmented_prompt = StyleManager.augment_prompt(prompt, style)
+
+                # Cinema camera system: override style directive with cinema equipment
+                if style == "cinematic" and request.cinema_camera:
+                    cinema_directive = CinemaSystem.build_directive(
+                        camera=request.cinema_camera or "fullframe_cine",
+                        lens=request.cinema_lens or "modern_prime",
+                        focal_length=request.cinema_focal_length or "35",
+                        aperture=request.cinema_aperture or "4",
+                    )
+                    augmented_prompt = f"{prompt}\n\n{cinema_directive}"
+                else:
+                    augmented_prompt = StyleManager.augment_prompt(prompt, style)
+
+                # Text overlay: if AI text mode, inject text instructions into prompt
+                if request.text_mode == "ai":
+                    text_parts = []
+                    if request.headline_text:
+                        text_parts.append(f'Display the text "{request.headline_text}" in large bold white letters at the top of the image.')
+                    if request.subheading_text:
+                        text_parts.append(f'Below that, display "{request.subheading_text}" in medium white text.')
+                    if request.cta_text:
+                        text_parts.append(f'At the bottom, show a rounded button with the text "{request.cta_text}" in bold.')
+                    if text_parts:
+                        augmented_prompt += "\n\nTEXT OVERLAY INSTRUCTIONS (spell every character exactly as shown):\n" + "\n".join(text_parts)
+                elif request.text_mode == "overlay":
+                    # For overlay mode, tell the model NOT to add text
+                    augmented_prompt += "\n\nDo NOT include any text, words, or typography in this image. Generate only the visual/photographic elements."
 
                 image = await image_generator.generate_image(
                     client_id=client_id,
@@ -218,6 +267,27 @@ async def generate_images(
                     state=request.state,
                     db=db,
                 )
+
+                # Post-processing: apply film-look effects
+                if image.image_path and request.post_process != "raw":
+                    try:
+                        PostProcessor.process(image.image_path, preset=request.post_process)
+                    except Exception as pp_err:
+                        logger.warning(f"Post-processing failed: {pp_err}")
+
+                # Text overlay mode: composite text using Pillow
+                if request.text_mode == "overlay" and image.image_path:
+                    if request.headline_text or request.subheading_text or request.cta_text:
+                        try:
+                            TextOverlayService.overlay_text(
+                                image_path=image.image_path,
+                                headline=request.headline_text,
+                                subheading=request.subheading_text,
+                                cta_text=request.cta_text,
+                            )
+                        except Exception as to_err:
+                            logger.warning(f"Text overlay failed: {to_err}")
+
                 images.append(ImageResponse.model_validate(image))
             except Exception as e:
                 logger.error(f"Failed to generate image {i+1}: {str(e)}", exc_info=True)

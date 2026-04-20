@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from . import health, templates, images, analytics, speech, scripts, video_analysis, transcription, video_download, feedback, auth, admin
+from . import health, templates, images, analytics, speech, scripts, video_analysis, transcription, video_download, feedback, auth, admin, tiktok
 
 def create_router() -> APIRouter:
     """Create API router with all routes"""
@@ -18,5 +18,6 @@ def create_router() -> APIRouter:
     router.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
     router.include_router(auth.router, prefix="/auth", tags=["auth"])
     router.include_router(admin.router, prefix="/admin", tags=["admin"])
+    router.include_router(tiktok.router, prefix="/tiktok", tags=["tiktok"])
 
     return router

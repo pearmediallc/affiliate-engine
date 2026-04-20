@@ -27,6 +27,21 @@ class ImageGenerateRequest(BaseModel):
         description="Image style: professional_photography, modern_illustrated, ghibli, minimalist, cinematic, 3d_render, watercolor, anime"
     )
 
+    # Text overlay
+    text_mode: str = Field(default="none", description="Text mode: none, ai, overlay")
+    headline_text: Optional[str] = Field(default=None, description="Headline text for overlay")
+    subheading_text: Optional[str] = Field(default=None, description="Subheading text for overlay")
+    cta_text: Optional[str] = Field(default=None, description="CTA button text for overlay")
+
+    # Post-processing
+    post_process: str = Field(default="editorial", description="Post-processing preset: raw, editorial, film, vintage")
+
+    # Cinema controls (when style=cinematic)
+    cinema_camera: Optional[str] = Field(default=None, description="Cinema camera selection")
+    cinema_lens: Optional[str] = Field(default=None, description="Cinema lens selection")
+    cinema_focal_length: Optional[str] = Field(default=None, description="Focal length in mm")
+    cinema_aperture: Optional[str] = Field(default=None, description="Aperture f-stop")
+
     class Config:
         json_schema_extra = {
             "example": {

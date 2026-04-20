@@ -11,6 +11,7 @@ import VideoHookAnalyzer from './VideoHookAnalyzer';
 import VideoScriptAnalyzer from './VideoScriptAnalyzer';
 import VideoDownloader from './VideoDownloader';
 import AdminPanel from './AdminPanel';
+import UGCVideoStudio from './UGCVideoStudio';
 import { useAuth } from '@/lib/auth';
 
 interface Template {
@@ -57,6 +58,11 @@ const navGroups = [
           <line x1="8" y1="23" x2="16" y2="23" />
         </svg>
       )},
+      { id: 'ugc-videos', label: 'UGC Videos', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M10 8l6 4-6 4V8z" />
+        </svg>
+      )},
     ],
   },
   {
@@ -101,6 +107,7 @@ const pageMeta: Record<string, { title: string; description: string }> = {
   gallery: { title: 'Gallery', description: 'Browse and manage your generated images' },
   scripts: { title: 'Script Generator', description: 'Generate persuasive ad scripts for your campaigns' },
   'script-to-audio': { title: 'Script to Audio', description: 'Convert scripts into professional voiceovers' },
+  'ugc-videos': { title: 'UGC Videos', description: 'Create TikTok-style UGC videos with AI avatars' },
   'video-hook': { title: 'Hook Analyzer', description: 'Analyze video hooks for engagement patterns' },
   'video-script': { title: 'Transcript Analyzer', description: 'Extract insights from video transcripts' },
   'video-downloader': { title: 'Video Downloader', description: 'Download videos for analysis and reference' },
@@ -434,6 +441,10 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
 
             {activeTab === 'video-downloader' && (
               <VideoDownloader />
+            )}
+
+            {activeTab === 'ugc-videos' && (
+              <UGCVideoStudio />
             )}
 
             {activeTab === 'admin' && hasPermission('admin_panel') && (
