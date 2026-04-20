@@ -295,7 +295,10 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       const avatarList = rawList.map((a: any) => ({
         avatar_id: a.avatar_id || a.id || '',
         avatar_name: a.avatar_name || a.name || a.display_name || `Avatar ${a.avatar_id || a.id || ''}`,
-        preview_image_url: a.avatar_thumbnail || a.preview_image_url || a.image_url || a.cover_image_url || a.thumbnail_url || '',
+        preview_image_url: (() => {
+          const imgUrl = a.avatar_thumbnail || a.preview_image_url || a.image_url || a.cover_image_url || a.thumbnail_url || '';
+          return imgUrl ? `${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(imgUrl)}` : '';
+        })(),
         preview_video_url: a.avatar_preview_url || a.preview_video_url || a.demo_video_url || a.video_url || '',
       }));
       console.log('Parsed avatars sample:', JSON.stringify(avatarList[0]).substring(0, 300));

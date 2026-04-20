@@ -1,5 +1,6 @@
 """TikTok Symphony routes - script generation + avatar video creation"""
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session
@@ -8,6 +9,8 @@ from ..schemas import APIResponse
 from ..middleware.auth import get_optional_user, log_usage
 from ..services.tiktok_symphony import TikTokSymphonyService
 import logging
+import requests as http_req
+import io
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -111,3 +114,20 @@ async def video_info(video_ids: str = Query(...)):
         return APIResponse(success=True, message="Video info", data=result.get("data", result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/proxy-image")
+async def proxy_image(url: str = Query(...)):
+    """Proxy external images (TikTok CDN) to avoid CORS/CSP blocking"""
+    try:
+        r = http_req.get(url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+            'Referer': 'https://www.tiktok.com/',
+        })
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch image")
+
+        content_type = r.headers.get('content-type', 'image/jpeg')
+        return StreamingResponse(io.BytesIO(r.content), media_type=content_type)
+    except http_req.RequestException as e:
+        raise HTTPException(status_code=502, detail=str(e))
