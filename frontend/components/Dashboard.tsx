@@ -12,6 +12,7 @@ import VideoScriptAnalyzer from './VideoScriptAnalyzer';
 import VideoDownloader from './VideoDownloader';
 import AdminPanel from './AdminPanel';
 import UGCVideoStudio from './UGCVideoStudio';
+import MarketingHub from './MarketingHub';
 import TalkingHead from './TalkingHead';
 import VideoCreator from './VideoCreator';
 import { useAuth } from '@/lib/auth';
@@ -78,6 +79,16 @@ const navGroups = [
     ],
   },
   {
+    label: 'MARKETING',
+    items: [
+      { id: 'marketing', label: 'Marketing Hub', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+        </svg>
+      )},
+    ],
+  },
+  {
     label: 'ANALYSIS',
     items: [
       { id: 'video-hook', label: 'Hook Analyzer', icon: (
@@ -126,6 +137,7 @@ const pageMeta: Record<string, { title: string; description: string }> = {
   'video-script': { title: 'Transcript Analyzer', description: 'Extract insights from video transcripts' },
   'video-downloader': { title: 'Video Downloader', description: 'Download videos for analysis and reference' },
   analytics: { title: 'Analytics', description: 'Track performance across your campaigns' },
+  'marketing': { title: 'Marketing Hub', description: 'Angles, ad copy, landing pages, program research, and performance tracking' },
   admin: { title: 'Admin Panel', description: 'Manage users, review feedback, and approve AI suggestions' },
 };
 
@@ -474,6 +486,8 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
             {activeTab === 'talking-head' && <TalkingHead />}
 
             {activeTab === 'video-creator' && <VideoCreator />}
+
+            {activeTab === 'marketing' && <MarketingHub />}
 
             {activeTab === 'admin' && hasPermission('admin_panel') && (
               <AdminPanel />

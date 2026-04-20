@@ -51,6 +51,56 @@ COPYWRITING_FRAMEWORKS = {
 [BRIDGE] "Here's how to get from before to after..."
 [ACTION] One simple step to transform"""
     },
+    "BLOG_SEO": {
+        "name": "SEO Blog Post",
+        "description": "SEO-optimized blog post (1500+ words) with H2/H3 structure, keyword integration, internal linking suggestions",
+        "template": """[TITLE] SEO-optimized H1 with primary keyword
+[INTRO] Hook + problem statement + what the reader will learn (150 words)
+[H2: Section 1] Key topic with keyword variations
+[H2: Section 2] Supporting evidence, examples, data
+[H2: Section 3] Practical advice / how-to steps
+[H2: FAQ] 3-5 common questions with concise answers
+[CONCLUSION] Summary + CTA with affiliate link placement
+[INTERNAL LINKS] Suggested anchor text and topic clusters"""
+    },
+    "COMPARISON": {
+        "name": "Product Comparison",
+        "description": "Product comparison article (Product A vs B) with pros/cons table",
+        "template": """[TITLE] Product A vs Product B: Which Is Better in [Year]?
+[INTRO] Why this comparison matters, who it's for
+[OVERVIEW TABLE] Side-by-side specs/features/pricing
+[H2: Product A Deep Dive] Features, pros, cons, best for
+[H2: Product B Deep Dive] Features, pros, cons, best for
+[H2: Head-to-Head] Category-by-category comparison
+[H2: Verdict] Clear winner recommendation with reasoning
+[CTA] Affiliate links for both products"""
+    },
+    "LISTICLE": {
+        "name": "Listicle",
+        "description": "Listicle format (Top N...) with numbered items and affiliate links",
+        "template": """[TITLE] Top N [Category] in [Year] (Tested & Reviewed)
+[INTRO] Selection criteria, how we tested, quick picks
+[#1] Best Overall - name, why, key features, price, affiliate link
+[#2] Best Value - name, why, key features, price, affiliate link
+[#3-N] Continue pattern with unique positioning for each
+[COMPARISON TABLE] Quick-reference grid of all picks
+[HOW WE CHOSE] Methodology and criteria transparency
+[CTA] Final recommendation + link"""
+    },
+    "REVIEW": {
+        "name": "Product Review",
+        "description": "In-depth product review with ratings, pros/cons, verdict",
+        "template": """[TITLE] [Product] Review [Year]: Honest Take After [X] Weeks
+[RATING] Overall score X/10
+[INTRO] What it is, who it's for, bottom line
+[H2: What We Like] Detailed pros with examples
+[H2: What Could Be Better] Honest cons
+[H2: Features Breakdown] Key features with ratings
+[H2: Pricing & Value] Cost analysis, plans comparison
+[H2: Alternatives] Brief mention of 2-3 competitors
+[VERDICT] Final recommendation, best for / avoid if
+[CTA] Affiliate link with current deal/discount"""
+    },
 }
 
 # Psychological triggers that increase conversions
@@ -269,6 +319,10 @@ Return the improved script with a brief explanation of changes made."""
                 "StoryBrand": "Make the customer the hero, position yourself as guide",
                 "SLAP": "Stop them mid-scroll with something unexpected",
                 "BAB": "Show contrast between before and after state",
+                "BLOG_SEO": "Front-load keywords in H2s, write 1500+ words, add FAQ schema",
+                "COMPARISON": "Be genuinely balanced, declare a winner, use comparison tables",
+                "LISTICLE": "Lead with best overall, give each item a unique positioning angle",
+                "REVIEW": "Be honest about cons to build trust, include specific use-after details",
             },
             "angle_tips": {
                 "benefit": "Focus on positive outcome, what they'll gain, peace of mind",
