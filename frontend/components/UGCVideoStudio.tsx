@@ -290,7 +290,15 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       const res = await axios.get(`${API_BASE_URL}/tiktok/avatars`);
       const data = res.data?.data || res.data;
       console.log('Avatar API response:', JSON.stringify(data).substring(0, 500));
-      const avatarList = data?.digital_avatar_list || data?.list || data?.avatars || [];
+      const rawList = data?.digital_avatar_list || data?.list || data?.avatars || [];
+      // Normalize field names — TikTok API uses various field names for images
+      const avatarList = rawList.map((a: any) => ({
+        avatar_id: a.avatar_id || a.id || '',
+        avatar_name: a.avatar_name || a.name || a.display_name || `Avatar ${a.avatar_id || a.id || ''}`,
+        preview_image_url: a.avatar_thumbnail || a.preview_image_url || a.image_url || a.cover_image_url || a.thumbnail_url || '',
+        preview_video_url: a.avatar_preview_url || a.preview_video_url || a.demo_video_url || a.video_url || '',
+      }));
+      console.log('Parsed avatars sample:', JSON.stringify(avatarList[0]).substring(0, 300));
       setAvatars(avatarList);
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'Failed to load avatars');
@@ -370,13 +378,18 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
                 }}>
                 {avatar.preview_image_url ? (
                   <img src={avatar.preview_image_url} alt={avatar.avatar_name}
-                    style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: '8px', marginBottom: '6px' }} />
-                ) : (
-                  <div style={{ width: '100%', aspectRatio: '1', background: 'rgba(255,255,255,0.06)', borderRadius: '8px', marginBottom: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="1.5">
-                      <circle cx="12" cy="8" r="4" /><path d="M4 21v-1a6 6 0 0112 0v1" />
-                    </svg>
-                  </div>
+                    style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: '8px', marginBottom: '6px' }}
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; (e.target as HTMLImageElement).nextElementSibling && ((e.target as HTMLImageElement).nextElementSibling as HTMLElement).style.setProperty('display', 'flex'); }} />
+                ) : null}
+                {/* Fallback avatar with initial */}
+                <div style={{
+                  width: '100%', aspectRatio: '1', borderRadius: '8px', marginBottom: '6px',
+                  display: avatar.preview_image_url ? 'none' : 'flex',
+                  alignItems: 'center', justifyContent: 'center',
+                  background: `hsl(${(avatar.avatar_name || '').charCodeAt(0) * 7 % 360}, 50%, 35%)`,
+                  fontSize: '28px', fontWeight: 700, color: 'rgba(255,255,255,0.8)',
+                }}>
+                  {(avatar.avatar_name || '?')[0].toUpperCase()}
                 )}
                 <p style={{ fontSize: '11px', color: '#e8e8ed', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{avatar.avatar_name}</p>
               </div>

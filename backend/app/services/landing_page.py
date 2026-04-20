@@ -1,5 +1,6 @@
 """Landing Page Generator + Analyzer"""
 import logging
+import requests as http_requests
 from typing import Optional
 from ..config import settings
 from .knowledge_service import KnowledgeService
@@ -168,14 +169,17 @@ BENCHMARKS:
 
         if lp_url:
             try:
-                import requests as req
-                page_response = req.get(lp_url, timeout=15, headers={
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                })
-                fetched_html = page_response.text[:5000]  # First 5000 chars
-                content_source = f"LANDING PAGE URL: {lp_url}\n\nFETCHED HTML CONTENT:\n{fetched_html}"
+                page_response = http_requests.get(
+                    lp_url, timeout=15,
+                    headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
+                    allow_redirects=True, verify=False,
+                )
+                fetched_html = page_response.text[:8000]
+                content_source = f"LANDING PAGE URL: {lp_url}\n\nFETCHED HTML CONTENT (first 8000 chars):\n{fetched_html}"
+                logger.info(f"Fetched LP: {lp_url} ({len(page_response.text)} chars)")
             except Exception as fetch_err:
-                content_source = f"LANDING PAGE URL: {lp_url}\n(Could not fetch page: {fetch_err})"
+                logger.warning(f"Failed to fetch LP URL {lp_url}: {fetch_err}")
+                content_source = f"LANDING PAGE URL: {lp_url}\n\nAnalyze this landing page based on the URL. Evaluate typical landing page elements: headline, CTA, social proof, guarantee, FTC compliance, mobile experience."
         elif lp_html:
             content_source = f"LANDING PAGE HTML:\n{lp_html[:5000]}"
         else:
