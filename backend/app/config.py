@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     deepgram_api_key: Optional[str] = None  # Deepgram API key for transcription
     tiktok_access_token: Optional[str] = None
     tiktok_advertiser_id: Optional[str] = None
+    replicate_api_token: Optional[str] = None  # Replicate API for lip-sync, upscaling, etc.
 
     # Image Generation
     image_provider: str = "gemini"  # Primary: Gemini 3.1 Flash Image, Fallback: OpenAI DALL-E 3, Then FAL.ai

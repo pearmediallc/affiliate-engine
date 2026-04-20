@@ -1,0 +1,27 @@
+{
+  "image_generation": [
+    {"id": "imagen-4.0", "name": "Google Imagen 4.0", "provider": "google", "tier": "premium", "text_accuracy": "good", "photorealism": "excellent", "requires_key": "GEMINI_API_KEY"},
+    {"id": "ideogram-v3", "name": "Ideogram 3.0", "provider": "ideogram", "tier": "premium", "text_accuracy": "best", "photorealism": "good", "requires_key": "IDEOGRAM_API_KEY"},
+    {"id": "dall-e-3", "name": "DALL-E 3", "provider": "openai", "tier": "standard", "text_accuracy": "good", "photorealism": "good", "requires_key": "OPENAI_API_KEY"},
+    {"id": "flux-dev", "name": "FLUX Dev", "provider": "fal", "tier": "standard", "text_accuracy": "moderate", "photorealism": "best", "requires_key": "FAL_API_KEY"},
+    {"id": "flux-2-pro", "name": "FLUX 2 Pro", "provider": "fal", "tier": "premium", "text_accuracy": "good", "photorealism": "best", "requires_key": "FAL_API_KEY"},
+    {"id": "flux-schnell", "name": "FLUX Schnell", "provider": "fal", "tier": "fast", "text_accuracy": "low", "photorealism": "good", "requires_key": "FAL_API_KEY"}
+  ],
+  "video_generation": [
+    {"id": "veo-3.1", "name": "Google Veo 3.1", "provider": "google", "tier": "premium", "duration": "4-8s", "resolution": "720p-1080p", "audio": true, "requires_key": "GEMINI_API_KEY"},
+    {"id": "veo-3.1-fast", "name": "Veo 3.1 Fast", "provider": "google", "tier": "fast", "duration": "4-8s", "resolution": "720p", "audio": true, "requires_key": "GEMINI_API_KEY"},
+    {"id": "kling-v3", "name": "Kling V3", "provider": "kling", "tier": "standard", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "KLING_API_KEY"},
+    {"id": "seedance-v2", "name": "Seedance V2", "provider": "bytedance", "tier": "premium", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "SEEDANCE_API_KEY"},
+    {"id": "runway-gen4", "name": "Runway Gen-4", "provider": "runway", "tier": "premium", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "RUNWAY_API_KEY"},
+    {"id": "ltx-2", "name": "LTX 2", "provider": "ltx", "tier": "standard", "duration": "6-20s", "resolution": "720p", "audio": false, "requires_key": "LTX_API_KEY"}
+  ],
+  "lip_sync": [
+    {"id": "sadtalker", "name": "SadTalker", "provider": "replicate", "tier": "standard", "input": "image+audio", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "wav2lip", "name": "Wav2Lip", "provider": "replicate", "tier": "standard", "input": "video+audio", "requires_key": "REPLICATE_API_TOKEN"}
+  ],
+  "image_tools": [
+    {"id": "upscale", "name": "AI Upscaler", "provider": "replicate", "tier": "standard", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "bg-remove", "name": "Background Remover", "provider": "replicate", "tier": "standard", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "face-swap", "name": "Face Swap", "provider": "replicate", "tier": "standard", "requires_key": "REPLICATE_API_TOKEN"}
+  ]
+}

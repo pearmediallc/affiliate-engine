@@ -465,3 +465,17 @@ async def update_model_config(
         message="Model configuration updated (runtime only)",
         data={"primary_provider": settings.image_provider, "image_model": settings.gemini_image_model},
     )
+
+
+@router.get("/models/registry")
+async def get_model_registry(admin=Depends(require_admin)):
+    """Get the full model registry with availability status"""
+    from ..services.model_registry import ModelRegistryService
+    return APIResponse(
+        success=True,
+        message="Model registry",
+        data={
+            "registry": ModelRegistryService.get_all(),
+            "summary": ModelRegistryService.get_available_count(),
+        },
+    )

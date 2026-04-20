@@ -12,6 +12,8 @@ import VideoScriptAnalyzer from './VideoScriptAnalyzer';
 import VideoDownloader from './VideoDownloader';
 import AdminPanel from './AdminPanel';
 import UGCVideoStudio from './UGCVideoStudio';
+import TalkingHead from './TalkingHead';
+import VideoCreator from './VideoCreator';
 import { useAuth } from '@/lib/auth';
 
 interface Template {
@@ -63,6 +65,16 @@ const navGroups = [
           <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M10 8l6 4-6 4V8z" />
         </svg>
       )},
+      { id: 'talking-head', label: 'Talking Head', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" /><circle cx="12" cy="7" r="4" />
+        </svg>
+      )},
+      { id: 'video-creator', label: 'Video Creator', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M23 7l-7 5 7 5V7z" /><rect x="1" y="5" width="15" height="14" rx="2" />
+        </svg>
+      )},
     ],
   },
   {
@@ -108,6 +120,8 @@ const pageMeta: Record<string, { title: string; description: string }> = {
   scripts: { title: 'Script Generator', description: 'Generate persuasive ad scripts for your campaigns' },
   'script-to-audio': { title: 'Script to Audio', description: 'Convert scripts into professional voiceovers' },
   'ugc-videos': { title: 'UGC Videos', description: 'Create TikTok-style UGC videos with AI avatars' },
+  'talking-head': { title: 'Talking Head', description: 'Generate talking-head videos from a portrait and audio' },
+  'video-creator': { title: 'Video Creator', description: 'Create production-quality videos with Veo 3.1' },
   'video-hook': { title: 'Hook Analyzer', description: 'Analyze video hooks for engagement patterns' },
   'video-script': { title: 'Transcript Analyzer', description: 'Extract insights from video transcripts' },
   'video-downloader': { title: 'Video Downloader', description: 'Download videos for analysis and reference' },
@@ -456,6 +470,10 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
             {activeTab === 'ugc-videos' && (
               <UGCVideoStudio />
             )}
+
+            {activeTab === 'talking-head' && <TalkingHead />}
+
+            {activeTab === 'video-creator' && <VideoCreator />}
 
             {activeTab === 'admin' && hasPermission('admin_panel') && (
               <AdminPanel />
