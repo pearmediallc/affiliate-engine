@@ -13,6 +13,7 @@ import VideoDownloader from './VideoDownloader';
 import AdminPanel from './AdminPanel';
 import UGCVideoStudio from './UGCVideoStudio';
 import MarketingHub from './MarketingHub';
+import LandingPageStudio from './LandingPageStudio';
 import TalkingHead from './TalkingHead';
 import VideoCreator from './VideoCreator';
 import { useAuth } from '@/lib/auth';
@@ -86,6 +87,14 @@ const navGroups = [
           <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
         </svg>
       )},
+      { id: 'landing-page', label: 'Landing Pages', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+          <path d="M14 2v6h6" />
+          <line x1="16" y1="13" x2="8" y2="13" />
+          <line x1="16" y1="17" x2="8" y2="17" />
+        </svg>
+      )},
     ],
   },
   {
@@ -138,6 +147,7 @@ const pageMeta: Record<string, { title: string; description: string }> = {
   'video-downloader': { title: 'Video Downloader', description: 'Download videos for analysis and reference' },
   analytics: { title: 'Analytics', description: 'Track performance across your campaigns' },
   'marketing': { title: 'Marketing Hub', description: 'Angles, ad copy, landing pages, program research, and performance tracking' },
+  'landing-page': { title: 'Landing Pages', description: 'Generate and analyze high-converting landing pages' },
   admin: { title: 'Admin Panel', description: 'Manage users, review feedback, and approve AI suggestions' },
 };
 
@@ -488,6 +498,8 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
             {activeTab === 'video-creator' && <VideoCreator />}
 
             {activeTab === 'marketing' && <MarketingHub />}
+
+            {activeTab === 'landing-page' && <LandingPageStudio />}
 
             {activeTab === 'admin' && hasPermission('admin_panel') && (
               <AdminPanel />

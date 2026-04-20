@@ -12,16 +12,17 @@ class LandingPageService:
 
     @staticmethod
     async def generate_landing_page(
-        product_name: str,
-        product_description: str = "",
-        product_url: str = "",
-        commission: str = "",
+        vertical: str = "home_insurance",
+        transcript: str = "",
+        offer_url: str = "",
         target_audience: str = "",
         bonuses: list = None,
+        product_name: str = "",
+        product_description: str = "",
+        commission: str = "",
         page_type: str = "single",
-        style: str = "modern",
     ) -> dict:
-        """Generate a complete HTML landing page using Hormozi Grand Slam framework"""
+        """Generate a complete HTML landing page that bridges an ad to an offer"""
         from google import genai
 
         if not settings.gemini_api_key:
@@ -36,17 +37,46 @@ class LandingPageService:
         if bonuses:
             bonuses_text = "BONUSES TO INCLUDE:\n" + "\n".join(f"- {b}" for b in bonuses)
 
+        transcript_block = ""
+        if transcript:
+            transcript_block = f"""
+AD TRANSCRIPT (analyze this to understand the angle being used):
+{transcript}
+
+INSTRUCTIONS FOR TRANSCRIPT:
+- Identify the emotional hook, angle, and promise used in the ad
+- The landing page MUST continue the same narrative and tone
+- Bridge the ad's claims to the offer — the visitor should feel continuity
+"""
+
+        offer_url_block = ""
+        if offer_url:
+            offer_url_block = f"""
+OFFER PAGE URL: {offer_url}
+- Match the offer page's theme and messaging if possible
+- All CTA buttons should link to this URL
+"""
+
         prompt = f"""You are an expert landing page designer and conversion optimizer.
 
-Create a COMPLETE, self-contained HTML landing page for this affiliate product.
+Create a COMPLETE, self-contained HTML landing page for this affiliate offer.
 
-PRODUCT: {product_name}
-DESCRIPTION: {product_description}
-AFFILIATE URL: {product_url or '#'}
+VERTICAL: {vertical}
+PRODUCT NAME: {product_name or '(derive from vertical)'}
+OFFER URL: {offer_url or '#'}
 COMMISSION: {commission}
 TARGET AUDIENCE: {target_audience or 'General consumers'}
 PAGE TYPE: {page_type}
 {bonuses_text}
+{transcript_block}
+{offer_url_block}
+
+VERTICAL-SPECIFIC INSTRUCTIONS:
+- Use the vertical "{vertical}" to set the right tone, terminology, and design language
+- Insurance verticals: professional, trust-focused, compliance-heavy
+- Health verticals: benefit-driven, before/after framing, urgency
+- Finance verticals: authority, savings-focused, calculator-style proof
+- Opportunity verticals: aspirational, social proof heavy, income claims with disclaimers
 
 OFFER FRAMEWORK (use Hormozi Grand Slam):
 {offer_frameworks[:2000] if offer_frameworks else 'Value = Dream Outcome x Perceived Likelihood / Time Delay / Effort'}
@@ -79,7 +109,7 @@ Output ONLY the complete HTML code. No explanations.
             html = html.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
         return {
-            "product": product_name,
+            "product": product_name or vertical,
             "page_type": page_type,
             "html": html,
         }

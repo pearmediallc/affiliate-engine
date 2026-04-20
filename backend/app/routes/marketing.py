@@ -34,11 +34,13 @@ class AdCopyRequest(BaseModel):
     variations: int = 3
 
 class LandingPageRequest(BaseModel):
-    product_name: str
+    vertical: str = "home_insurance"
+    product_name: str = ""
     product_description: str = ""
-    product_url: str = ""
-    commission: str = ""
+    transcript: str = ""  # The ad creative transcript the user is running
+    offer_url: str = ""   # The actual offer/product page URL
     target_audience: str = ""
+    commission: str = ""
     bonuses: List[str] = []
     page_type: str = "single"
 
@@ -99,12 +101,14 @@ async def generate_ad_copy(request: AdCopyRequest, user=Depends(get_optional_use
 async def generate_landing_page(request: LandingPageRequest, user=Depends(get_optional_user), db: Session = Depends(get_db)):
     try:
         result = await LandingPageService.generate_landing_page(
-            product_name=request.product_name,
-            product_description=request.product_description,
-            product_url=request.product_url,
-            commission=request.commission,
+            vertical=request.vertical,
+            transcript=request.transcript,
+            offer_url=request.offer_url,
             target_audience=request.target_audience,
             bonuses=request.bonuses,
+            product_name=request.product_name,
+            product_description=request.product_description,
+            commission=request.commission,
             page_type=request.page_type,
         )
         if user:

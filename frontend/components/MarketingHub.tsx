@@ -2,6 +2,7 @@
 import { useState } from 'react';
 import axios from 'axios';
 import { API_BASE_URL } from '@/lib/api';
+import { VERTICALS, verticalOptions } from '@/lib/verticals';
 
 type SubTab = 'angles' | 'ad-copy' | 'landing-page' | 'program-finder' | 'performance' | 'hook-library';
 
@@ -146,7 +147,7 @@ function AngleGeneratorTab({ onUseAngle }: { onUseAngle: (angle: Angle) => void 
   const [productName, setProductName] = useState('');
   const [description, setDescription] = useState('');
   const [targetAudience, setTargetAudience] = useState('');
-  const [vertical, setVertical] = useState('health');
+  const [vertical, setVertical] = useState('home_insurance');
   const [angles, setAngles] = useState<Angle[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -157,7 +158,7 @@ function AngleGeneratorTab({ onUseAngle }: { onUseAngle: (angle: Angle) => void 
     try {
       const res = await axios.post(`${API_BASE_URL}/marketing/angles/generate`, {
         product_name: productName,
-        description,
+        product_description: description,
         target_audience: targetAudience,
         vertical,
       });
@@ -190,12 +191,11 @@ function AngleGeneratorTab({ onUseAngle }: { onUseAngle: (angle: Angle) => void 
         <div>
           <label style={labelStyle}>Vertical</label>
           <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
-            <option value="health">Health</option>
-            <option value="finance">Finance</option>
-            <option value="insurance">Insurance</option>
-            <option value="ecommerce">E-Commerce</option>
-            <option value="saas">SaaS</option>
-            <option value="education">Education</option>
+            {Object.entries(verticalOptions()).map(([group, verts]) => (
+              <optgroup key={group} label={group}>
+                {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+              </optgroup>
+            ))}
           </select>
         </div>
         <button style={{ ...primaryBtnStyle, opacity: loading ? 0.6 : 1 }} onClick={generate} disabled={loading}>
@@ -227,6 +227,7 @@ function AngleGeneratorTab({ onUseAngle }: { onUseAngle: (angle: Angle) => void 
 
 // ─── Ad Copy ────────────────────────────────────────────────────────
 function AdCopyTab({ selectedAngle }: { selectedAngle: Angle | null }) {
+  const [vertical, setVertical] = useState('home_insurance');
   const [productName, setProductName] = useState('');
   const [description, setDescription] = useState('');
   const [angle, setAngle] = useState(selectedAngle?.angle_name || '');
@@ -249,12 +250,13 @@ function AdCopyTab({ selectedAngle }: { selectedAngle: Angle | null }) {
     try {
       const res = await axios.post(`${API_BASE_URL}/marketing/ad-copy/generate`, {
         product_name: productName,
-        description,
+        product_description: description,
         angle,
         target_audience: targetAudience,
         platforms,
         hook_text: hookText || undefined,
         transcript: transcript || undefined,
+        vertical,
       });
       setResults(res.data.variations || res.data.data?.variations || res.data || []);
     } catch (err: unknown) {
@@ -273,6 +275,16 @@ function AdCopyTab({ selectedAngle }: { selectedAngle: Angle | null }) {
 
   return (
     <div>
+      <div style={{ marginBottom: '16px' }}>
+        <label style={labelStyle}>Vertical</label>
+        <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
+          {Object.entries(verticalOptions()).map(([group, verts]) => (
+            <optgroup key={group} label={group}>
+              {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+            </optgroup>
+          ))}
+        </select>
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
         <div>
           <label style={labelStyle}>Product Name</label>
@@ -356,11 +368,11 @@ function LandingPageTab() {
   const [mode, setMode] = useState<'generate' | 'analyze'>('generate');
 
   // Generate state
-  const [productName, setProductName] = useState('');
-  const [description, setDescription] = useState('');
-  const [url, setUrl] = useState('');
-  const [commission, setCommission] = useState('');
+  const [vertical, setVertical] = useState('home_insurance');
+  const [transcript, setTranscript] = useState('');
+  const [offerUrl, setOfferUrl] = useState('');
   const [targetAudience, setTargetAudience] = useState('');
+  const [productName, setProductName] = useState('');
   const [bonuses, setBonuses] = useState<string[]>(['']);
   const [pageType, setPageType] = useState('single');
   const [generatedHtml, setGeneratedHtml] = useState('');
@@ -389,11 +401,11 @@ function LandingPageTab() {
     setGenError('');
     try {
       const res = await axios.post(`${API_BASE_URL}/marketing/landing-page/generate`, {
-        product_name: productName,
-        description,
-        url,
-        commission,
+        vertical,
+        transcript,
+        offer_url: offerUrl,
         target_audience: targetAudience,
+        product_name: productName,
         bonuses: bonuses.filter(b => b.trim()),
         page_type: pageType,
       });
@@ -464,26 +476,14 @@ function LandingPageTab() {
         <>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
             <div>
-              <label style={labelStyle}>Product Name</label>
-              <input style={inputStyle} value={productName} onChange={e => setProductName(e.target.value)} placeholder="Product name" />
-            </div>
-            <div>
-              <label style={labelStyle}>Target Audience</label>
-              <input style={inputStyle} value={targetAudience} onChange={e => setTargetAudience(e.target.value)} placeholder="Target audience" />
-            </div>
-          </div>
-          <div style={{ marginBottom: '16px' }}>
-            <label style={labelStyle}>Description</label>
-            <textarea style={{ ...inputStyle, minHeight: '60px', resize: 'vertical' }} value={description} onChange={e => setDescription(e.target.value)} placeholder="Product description" />
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '16px' }}>
-            <div>
-              <label style={labelStyle}>Affiliate URL</label>
-              <input style={inputStyle} value={url} onChange={e => setUrl(e.target.value)} placeholder="https://..." />
-            </div>
-            <div>
-              <label style={labelStyle}>Commission</label>
-              <input style={inputStyle} value={commission} onChange={e => setCommission(e.target.value)} placeholder="e.g. $50 per sale" />
+              <label style={labelStyle}>Vertical (required)</label>
+              <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
+                {Object.entries(verticalOptions()).map(([group, verts]) => (
+                  <optgroup key={group} label={group}>
+                    {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </optgroup>
+                ))}
+              </select>
             </div>
             <div>
               <label style={labelStyle}>Page Type</label>
@@ -492,6 +492,24 @@ function LandingPageTab() {
                 <option value="comparison">Comparison</option>
               </select>
             </div>
+          </div>
+          <div style={{ marginBottom: '16px' }}>
+            <label style={labelStyle}>Ad Transcript</label>
+            <textarea style={{ ...inputStyle, minHeight: '100px', resize: 'vertical' }} value={transcript} onChange={e => setTranscript(e.target.value)} placeholder="Paste your running ad's script/transcript" />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+            <div>
+              <label style={labelStyle}>Offer URL</label>
+              <input style={inputStyle} value={offerUrl} onChange={e => setOfferUrl(e.target.value)} placeholder="The offer page URL your traffic goes to" />
+            </div>
+            <div>
+              <label style={labelStyle}>Target Audience</label>
+              <input style={inputStyle} value={targetAudience} onChange={e => setTargetAudience(e.target.value)} placeholder="Target audience" />
+            </div>
+          </div>
+          <div style={{ marginBottom: '16px' }}>
+            <label style={labelStyle}>Product Name (optional, auto-derived from vertical if empty)</label>
+            <input style={inputStyle} value={productName} onChange={e => setProductName(e.target.value)} placeholder="Leave blank to derive from vertical" />
           </div>
           <div style={{ marginBottom: '16px' }}>
             <label style={labelStyle}>Bonuses</label>
@@ -589,6 +607,7 @@ function LandingPageTab() {
 
 // ─── Program Finder ─────────────────────────────────────────────────
 function ProgramFinderTab() {
+  const [vertical, setVertical] = useState('home_insurance');
   const [query, setQuery] = useState('');
   const [rewardType, setRewardType] = useState('');
   const [tags, setTags] = useState('');
@@ -604,6 +623,7 @@ function ProgramFinderTab() {
     try {
       const params = new URLSearchParams();
       if (query) params.set('q', query);
+      if (vertical) params.set('vertical', vertical);
       if (rewardType) params.set('reward_type', rewardType);
       if (tags) params.set('tags', tags);
       if (minCookieDays > 0) params.set('min_cookie_days', String(minCookieDays));
@@ -620,6 +640,16 @@ function ProgramFinderTab() {
 
   return (
     <div>
+      <div style={{ marginBottom: '16px' }}>
+        <label style={labelStyle}>Vertical</label>
+        <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
+          {Object.entries(verticalOptions()).map(([group, verts]) => (
+            <optgroup key={group} label={group}>
+              {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+            </optgroup>
+          ))}
+        </select>
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '16px', marginBottom: '16px' }}>
         <div>
           <label style={labelStyle}>Search</label>
@@ -700,7 +730,7 @@ function ProgramFinderTab() {
 // ─── Performance ────────────────────────────────────────────────────
 function PerformanceTab() {
   const [campaignName, setCampaignName] = useState('');
-  const [vertical, setVertical] = useState('health');
+  const [vertical, setVertical] = useState('home_insurance');
   const [spend, setSpend] = useState('');
   const [impressions, setImpressions] = useState('');
   const [clicks, setClicks] = useState('');
@@ -712,6 +742,8 @@ function PerformanceTab() {
   const [loading, setLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState('');
+  const [csvRows, setCsvRows] = useState<Record<string, string>[]>([]);
+  const [csvUploading, setCsvUploading] = useState(false);
 
   const record = async () => {
     setLoading(true);
@@ -778,11 +810,11 @@ function PerformanceTab() {
         <div>
           <label style={labelStyle}>Vertical</label>
           <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
-            <option value="health">Health</option>
-            <option value="finance">Finance</option>
-            <option value="insurance">Insurance</option>
-            <option value="ecommerce">E-Commerce</option>
-            <option value="saas">SaaS</option>
+            {Object.entries(verticalOptions()).map(([group, verts]) => (
+              <optgroup key={group} label={group}>
+                {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+              </optgroup>
+            ))}
           </select>
         </div>
       </div>
@@ -814,9 +846,100 @@ function PerformanceTab() {
           <input style={inputStyle} type="number" value={revenue} onChange={e => setRevenue(e.target.value)} placeholder="0" />
         </div>
       </div>
-      <button style={{ ...primaryBtnStyle, opacity: loading ? 0.6 : 1, marginBottom: '24px' }} onClick={record} disabled={loading}>
-        {loading ? 'Recording...' : 'Record Metrics'}
-      </button>
+      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '24px' }}>
+        <button style={{ ...primaryBtnStyle, opacity: loading ? 0.6 : 1 }} onClick={record} disabled={loading}>
+          {loading ? 'Recording...' : 'Record Metrics'}
+        </button>
+        <label style={{ ...secondaryBtnStyle, display: 'inline-block' }}>
+          Upload CSV
+          <input
+            type="file"
+            accept=".csv"
+            style={{ display: 'none' }}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = evt => {
+                const text = evt.target?.result as string;
+                const lines = text.trim().split('\n');
+                if (lines.length < 2) return;
+                const headers = lines[0].split(',').map(h => h.trim());
+                const rows = lines.slice(1).map(line => {
+                  const vals = line.split(',').map(v => v.trim());
+                  const row: Record<string, string> = {};
+                  headers.forEach((h, i) => { row[h] = vals[i] || ''; });
+                  return row;
+                });
+                setCsvRows(rows);
+              };
+              reader.readAsText(file);
+              e.target.value = '';
+            }}
+          />
+        </label>
+      </div>
+
+      {csvRows.length > 0 && (
+        <div style={{ marginBottom: '24px' }}>
+          <h4 style={{ color: '#fff', fontSize: '15px', fontWeight: 600, margin: '0 0 12px' }}>CSV Preview ({csvRows.length} rows)</h4>
+          <div style={{ overflowX: 'auto', marginBottom: '12px' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr>
+                  {Object.keys(csvRows[0]).map(h => (
+                    <th key={h} style={{ ...labelStyle, textAlign: 'left', padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {csvRows.map((row, i) => (
+                  <tr key={i} style={{ background: i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.03)' }}>
+                    {Object.values(row).map((v, j) => (
+                      <td key={j} style={{ color: '#e8e8ed', fontSize: '13px', padding: '8px 10px' }}>{v}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              style={{ ...primaryBtnStyle, opacity: csvUploading ? 0.6 : 1 }}
+              disabled={csvUploading}
+              onClick={async () => {
+                setCsvUploading(true);
+                setError('');
+                try {
+                  for (const row of csvRows) {
+                    await axios.post(`${API_BASE_URL}/research/performance/record`, {
+                      campaign_name: row.campaign_name || '',
+                      vertical,
+                      spend: parseFloat(row.spend) || 0,
+                      impressions: parseInt(row.impressions) || 0,
+                      clicks: parseInt(row.clicks) || 0,
+                      lp_views: parseInt(row.lp_views) || 0,
+                      conversions: parseInt(row.conversions) || 0,
+                      revenue: parseFloat(row.revenue) || 0,
+                    });
+                  }
+                  setCsvRows([]);
+                  loadHistory();
+                } catch (err: unknown) {
+                  const msg = err instanceof Error ? err.message : 'Failed to upload CSV rows';
+                  setError(msg);
+                } finally {
+                  setCsvUploading(false);
+                }
+              }}
+            >
+              {csvUploading ? 'Submitting...' : `Submit ${csvRows.length} Rows`}
+            </button>
+            <button style={secondaryBtnStyle} onClick={() => setCsvRows([])}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       {error && <p style={{ color: '#ff453a', fontSize: '14px', marginBottom: '16px' }}>{error}</p>}
       {kpis && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', marginBottom: '32px' }}>
@@ -885,7 +1008,7 @@ function HookLibraryTab() {
 
   // Add hook form
   const [newHookText, setNewHookText] = useState('');
-  const [newVertical, setNewVertical] = useState('health');
+  const [newVertical, setNewVertical] = useState('home_insurance');
   const [newPlatform, setNewPlatform] = useState('YouTube');
   const [newTrigger, setNewTrigger] = useState('');
   const [newScore, setNewScore] = useState('7');
@@ -932,11 +1055,11 @@ function HookLibraryTab() {
           <label style={labelStyle}>Vertical</label>
           <select style={inputStyle} value={vertical} onChange={e => setVertical(e.target.value)}>
             <option value="">All</option>
-            <option value="health">Health</option>
-            <option value="finance">Finance</option>
-            <option value="insurance">Insurance</option>
-            <option value="ecommerce">E-Commerce</option>
-            <option value="saas">SaaS</option>
+            {Object.entries(verticalOptions()).map(([group, verts]) => (
+              <optgroup key={group} label={group}>
+                {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+              </optgroup>
+            ))}
           </select>
         </div>
         <div>
@@ -967,10 +1090,11 @@ function HookLibraryTab() {
             <div>
               <label style={labelStyle}>Vertical</label>
               <select style={inputStyle} value={newVertical} onChange={e => setNewVertical(e.target.value)}>
-                <option value="health">Health</option>
-                <option value="finance">Finance</option>
-                <option value="insurance">Insurance</option>
-                <option value="ecommerce">E-Commerce</option>
+                {Object.entries(verticalOptions()).map(([group, verts]) => (
+                  <optgroup key={group} label={group}>
+                    {verts.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </optgroup>
+                ))}
               </select>
             </div>
             <div>

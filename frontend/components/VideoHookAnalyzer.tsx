@@ -4,6 +4,10 @@ import { useState } from 'react';
 import axios from 'axios';
 import { API_BASE_URL } from '@/lib/api';
 
+const EMOTIONAL_TRIGGERS = [
+  'fear', 'curiosity', 'authority', 'social_proof', 'urgency', 'aspiration', 'pain',
+] as const;
+
 export default function VideoHookAnalyzer() {
   const [videoUrl, setVideoUrl] = useState('');
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -11,6 +15,14 @@ export default function VideoHookAnalyzer() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<any>(null);
   const [error, setError] = useState('');
+
+  // Save hook state
+  const [hookText, setHookText] = useState('');
+  const [hookTrigger, setHookTrigger] = useState<string>('curiosity');
+  const [hookScore, setHookScore] = useState(7);
+  const [hookVertical, setHookVertical] = useState('home_insurance');
+  const [isSavingHook, setIsSavingHook] = useState(false);
+  const [hookSaved, setHookSaved] = useState(false);
 
   const handleAnalyzeHook = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -23,6 +35,8 @@ export default function VideoHookAnalyzer() {
     setIsAnalyzing(true);
     setError('');
     setAnalysisResult(null);
+    setHookSaved(false);
+    setHookText('');
 
     try {
       let response;
@@ -220,6 +234,108 @@ export default function VideoHookAnalyzer() {
             >
               ➕ Analyze Another
             </button>
+          </div>
+
+          {/* Save to Hook Library */}
+          <div className="border-t pt-6">
+            <h4 className="font-semibold text-gray-900 mb-3">Save to Hook Library</h4>
+            {hookSaved ? (
+              <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                <p className="text-green-800 text-sm font-medium">Hook saved to library</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Hook Text</label>
+                  <input
+                    type="text"
+                    value={hookText}
+                    onChange={e => setHookText(e.target.value)}
+                    placeholder="Enter the key hook line from the analysis"
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Emotional Trigger</label>
+                    <select
+                      value={hookTrigger}
+                      onChange={e => setHookTrigger(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    >
+                      {EMOTIONAL_TRIGGERS.map(t => (
+                        <option key={t} value={t}>{t.replace('_', ' ')}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Score (1-10)</label>
+                    <input
+                      type="range"
+                      min="1"
+                      max="10"
+                      value={hookScore}
+                      onChange={e => setHookScore(parseInt(e.target.value))}
+                      className="w-full h-2 bg-gray-200 rounded-lg cursor-pointer mt-2"
+                    />
+                    <span className="text-xs text-gray-500 mt-1 block text-center">{hookScore}</span>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Vertical</label>
+                    <select
+                      value={hookVertical}
+                      onChange={e => setHookVertical(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    >
+                      <option value="home_insurance">Home Insurance</option>
+                      <option value="health_insurance">Health Insurance</option>
+                      <option value="life_insurance">Life Insurance</option>
+                      <option value="auto_insurance">Auto Insurance</option>
+                      <option value="medicare">Medicare</option>
+                      <option value="nutra">Weight Loss</option>
+                      <option value="blood_sugar">Blood Sugar</option>
+                      <option value="cbd">CBD/Hemp</option>
+                      <option value="ed">ED Enhancement</option>
+                      <option value="refinance">Mortgage Refinance</option>
+                      <option value="home_improvement">Home Improvement</option>
+                      <option value="wifi">WiFi/Routers</option>
+                      <option value="bizop">Work-From-Home</option>
+                      <option value="concealed_carry">Concealed Carry</option>
+                    </select>
+                  </div>
+                </div>
+                <button
+                  onClick={async () => {
+                    if (!hookText.trim()) return;
+                    setIsSavingHook(true);
+                    try {
+                      await axios.post(`${API_BASE_URL}/research/hooks/add`, null, {
+                        params: {
+                          hook_text: hookText,
+                          vertical: hookVertical,
+                          platform: analysisResult?.platform || 'unknown',
+                          emotional_trigger: hookTrigger,
+                          effectiveness_score: hookScore,
+                        },
+                      });
+                      setHookSaved(true);
+                    } catch (err) {
+                      console.error('Failed to save hook:', err);
+                    } finally {
+                      setIsSavingHook(false);
+                    }
+                  }}
+                  disabled={isSavingHook || !hookText.trim()}
+                  className={`py-2 px-4 rounded-lg font-medium text-white text-sm transition-all ${
+                    isSavingHook || !hookText.trim()
+                      ? 'bg-gray-400 cursor-not-allowed'
+                      : 'bg-green-600 hover:bg-green-700 active:scale-95'
+                  }`}
+                >
+                  {isSavingHook ? 'Saving...' : 'Save Hook'}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
