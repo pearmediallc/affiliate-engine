@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from . import health, templates, images, analytics, speech, scripts, video_analysis, transcription, video_download, feedback, auth, admin, tiktok, lip_sync, video_creation, video_enhance, marketing, research
+from . import health, templates, images, analytics, speech, scripts, video_analysis, transcription, video_download, feedback, auth, admin, tiktok, lip_sync, video_creation, video_enhance, marketing, research, jobs
 
 def create_router() -> APIRouter:
     """Create API router with all routes"""
@@ -24,5 +24,6 @@ def create_router() -> APIRouter:
     router.include_router(video_enhance.router, prefix="/video-enhance", tags=["video-enhance"])
     router.include_router(marketing.router, prefix="/marketing", tags=["marketing"])
     router.include_router(research.router, prefix="/research", tags=["research"])
+    router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 
     return router

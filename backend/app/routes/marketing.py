@@ -66,6 +66,15 @@ async def generate_angles(request: AngleRequest, user=Depends(get_optional_user)
         )
         if user:
             log_usage("angle_generation", user.id, db, cost_usd=0.01)
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="angle_generation",
+                    input_data={"product_name": request.product_name, "target_audience": request.target_audience},
+                    result_data=result, vertical=request.vertical, provider="gemini",
+                )
+            except Exception:
+                pass
         return APIResponse(success=True, message=f"Generated {len(result.get('angles', []))} angles", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -92,6 +101,15 @@ async def generate_ad_copy(request: AdCopyRequest, user=Depends(get_optional_use
         )
         if user:
             log_usage("ad_copy_generation", user.id, db, cost_usd=0.01)
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="ad_copy",
+                    input_data={"product_name": request.product_name, "angle": request.angle, "platforms": request.platforms},
+                    result_data=result, vertical=request.vertical, provider="gemini",
+                )
+            except Exception:
+                pass
         return APIResponse(success=True, message="Ad copy generated", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -113,6 +131,15 @@ async def generate_landing_page(request: LandingPageRequest, user=Depends(get_op
         )
         if user:
             log_usage("landing_page_generation", user.id, db, cost_usd=0.02)
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="landing_page",
+                    input_data={"product_name": request.product_name, "vertical": request.vertical, "page_type": request.page_type},
+                    result_data=result, vertical=request.vertical, provider="gemini", cost_usd=0.02,
+                )
+            except Exception:
+                pass
         return APIResponse(success=True, message="Landing page generated", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -137,6 +164,15 @@ async def analyze_landing_page(request: LPAnalyzeRequest, user=Depends(get_optio
         )
         if user:
             log_usage("lp_analysis", user.id, db, cost_usd=0.01)
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="lp_analysis",
+                    input_data={"lp_url": request.lp_url},
+                    result_data=result, provider="gemini",
+                )
+            except Exception:
+                pass
         return APIResponse(success=True, message="Landing page analyzed", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

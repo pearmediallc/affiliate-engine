@@ -10,7 +10,7 @@ function getImageSrc(url: string | null | undefined): string | null {
   return url;
 }
 
-type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning' | 'models';
+type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning' | 'models' | 'generations';
 
 // ---------------------------------------------------------------------------
 // Shared styles
@@ -749,6 +749,261 @@ function ModelsTab() {
 }
 
 // ---------------------------------------------------------------------------
+// Generations Tab
+// ---------------------------------------------------------------------------
+
+const GEN_JOB_TYPE_LABELS: Record<string, string> = {
+  image_generation: 'Image',
+  ugc_video: 'UGC Video',
+  talking_head: 'Talking Head',
+  veo_video: 'Video',
+  script_generation: 'Script',
+  ad_copy: 'Ad Copy',
+  landing_page: 'Landing Page',
+  lp_analysis: 'LP Analysis',
+  angle_generation: 'Angles',
+};
+
+const GEN_STATUS_COLORS: Record<string, string> = {
+  processing: 'yellow',
+  completed: 'green',
+  failed: 'red',
+  pending: 'gray',
+};
+
+function GenerationsTab() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [jobs, setJobs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState({ user_id: '', job_type: '', status: '', vertical: '' });
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [feedbackJobId, setFeedbackJobId] = useState('');
+  const [feedbackRating, setFeedbackRating] = useState('');
+  const [feedbackComment, setFeedbackComment] = useState('');
+
+  const fetchJobs = useCallback(() => {
+    setLoading(true);
+    const params: Record<string, string | number> = { page, page_size: 30 };
+    if (filters.user_id) params.user_id = filters.user_id;
+    if (filters.job_type) params.job_type = filters.job_type;
+    if (filters.status) params.status = filters.status;
+    if (filters.vertical) params.vertical = filters.vertical;
+
+    axios.get(`${API_BASE_URL}/jobs/admin/all`, { params })
+      .then(r => {
+        const d = r.data?.data || {};
+        setJobs(d.jobs || []);
+        setTotalPages(d.total_pages || 1);
+      })
+      .catch(() => setJobs([]))
+      .finally(() => setLoading(false));
+  }, [filters, page]);
+
+  useEffect(() => { fetchJobs(); }, [fetchJobs]);
+
+  const submitFeedback = async (jobId: string) => {
+    if (!feedbackRating) return;
+    try {
+      await axios.post(`${API_BASE_URL}/jobs/admin/${jobId}/feedback`, {
+        rating: feedbackRating,
+        comment: feedbackComment,
+      });
+      setFeedbackJobId('');
+      setFeedbackRating('');
+      setFeedbackComment('');
+      fetchJobs();
+    } catch {
+      // silent
+    }
+  };
+
+  const updateFilter = (key: string, value: string) => {
+    setFilters(prev => ({ ...prev, [key]: value }));
+    setPage(1);
+  };
+
+  const jobTypes = ['image_generation', 'ugc_video', 'talking_head', 'veo_video', 'script_generation', 'ad_copy', 'landing_page', 'lp_analysis', 'angle_generation'];
+  const statuses = ['pending', 'processing', 'completed', 'failed'];
+  const verticals = ['supplements', 'skincare', 'fitness', 'tech', 'fashion', 'food', 'home', 'pets', 'home_insurance'];
+
+  return (
+    <div>
+      {/* Filters */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>Type</label>
+          <select style={styles.select} value={filters.job_type} onChange={e => updateFilter('job_type', e.target.value)}>
+            <option value="">All</option>
+            {jobTypes.map(t => <option key={t} value={t}>{GEN_JOB_TYPE_LABELS[t] || t}</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>Status</label>
+          <select style={styles.select} value={filters.status} onChange={e => updateFilter('status', e.target.value)}>
+            <option value="">All</option>
+            {statuses.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>Vertical</label>
+          <select style={styles.select} value={filters.vertical} onChange={e => updateFilter('vertical', e.target.value)}>
+            <option value="">All</option>
+            {verticals.map(v => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <label style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>User ID</label>
+          <input
+            type="text"
+            placeholder="Filter by user ID..."
+            value={filters.user_id}
+            onChange={e => updateFilter('user_id', e.target.value)}
+            style={{
+              background: 'rgba(255,255,255,0.08)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: '6px',
+              padding: '6px 10px',
+              fontSize: '13px',
+              color: '#e8e8ed',
+              width: '180px',
+            }}
+          />
+        </div>
+      </div>
+
+      {/* Table */}
+      <div style={styles.card}>
+        {loading ? (
+          <div style={styles.spinner}>Loading generations...</div>
+        ) : jobs.length === 0 ? (
+          <div style={styles.empty}>No jobs found.</div>
+        ) : (
+          <>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                    <th style={styles.th}>User</th>
+                    <th style={styles.th}>Type</th>
+                    <th style={styles.th}>Status</th>
+                    <th style={styles.th}>Provider</th>
+                    <th style={styles.th}>Vertical</th>
+                    <th style={styles.th}>Cost</th>
+                    <th style={styles.th}>Created</th>
+                    <th style={styles.th}>Result</th>
+                    <th style={styles.th}>Feedback</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {jobs.map((job, idx) => (
+                    <tr key={job.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: idx % 2 === 1 ? 'rgba(255,255,255,0.03)' : 'transparent' }}>
+                      <td style={{ ...styles.td, maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={job.user_id || job.user_email}>
+                        {job.user_email || (job.user_id ? job.user_id.slice(0, 8) + '...' : '--')}
+                      </td>
+                      <td style={styles.td}>{GEN_JOB_TYPE_LABELS[job.job_type] || job.job_type}</td>
+                      <td style={styles.td}>
+                        <span style={styles.badge(GEN_STATUS_COLORS[job.status] || 'gray')}>{job.status}</span>
+                      </td>
+                      <td style={styles.td}>{job.provider || '--'}</td>
+                      <td style={styles.td}>{job.vertical || '--'}</td>
+                      <td style={styles.td}>{job.cost_usd != null ? `$${Number(job.cost_usd).toFixed(3)}` : '--'}</td>
+                      <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>{new Date(job.created_at).toLocaleString()}</td>
+                      <td style={styles.td}>
+                        {job.status === 'completed' && job.result_url ? (
+                          <a
+                            href={job.result_url.startsWith('/') ? `${API_HOST}${job.result_url}` : job.result_url}
+                            target="_blank" rel="noopener"
+                            style={{ fontSize: '12px', color: '#2997ff' }}
+                          >
+                            View
+                          </a>
+                        ) : '--'}
+                      </td>
+                      <td style={styles.td}>
+                        {job.admin_feedback ? (
+                          <span style={styles.badge(job.admin_feedback.rating === 'positive' ? 'green' : job.admin_feedback.rating === 'negative' ? 'red' : 'gray')}>
+                            {job.admin_feedback.rating}
+                          </span>
+                        ) : feedbackJobId === job.id ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', minWidth: '180px' }}>
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              <button
+                                onClick={() => setFeedbackRating('positive')}
+                                style={{
+                                  ...styles.btnSecondary,
+                                  padding: '4px 10px',
+                                  fontSize: '12px',
+                                  background: feedbackRating === 'positive' ? 'rgba(48,209,88,0.2)' : undefined,
+                                  borderColor: feedbackRating === 'positive' ? '#30d158' : undefined,
+                                  color: feedbackRating === 'positive' ? '#30d158' : undefined,
+                                }}
+                              >
+                                Good
+                              </button>
+                              <button
+                                onClick={() => setFeedbackRating('negative')}
+                                style={{
+                                  ...styles.btnSecondary,
+                                  padding: '4px 10px',
+                                  fontSize: '12px',
+                                  background: feedbackRating === 'negative' ? 'rgba(255,69,58,0.2)' : undefined,
+                                  borderColor: feedbackRating === 'negative' ? '#ff6b6b' : undefined,
+                                  color: feedbackRating === 'negative' ? '#ff6b6b' : undefined,
+                                }}
+                              >
+                                Bad
+                              </button>
+                            </div>
+                            <input
+                              type="text"
+                              placeholder="Comment..."
+                              value={feedbackComment}
+                              onChange={e => setFeedbackComment(e.target.value)}
+                              style={{
+                                background: 'rgba(255,255,255,0.08)',
+                                border: '1px solid rgba(255,255,255,0.12)',
+                                borderRadius: '4px',
+                                padding: '4px 8px',
+                                fontSize: '12px',
+                                color: '#e8e8ed',
+                              }}
+                            />
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              <button onClick={() => submitFeedback(job.id)} style={{ ...styles.btnPrimary, padding: '4px 10px', fontSize: '11px' }}>Submit</button>
+                              <button onClick={() => { setFeedbackJobId(''); setFeedbackRating(''); setFeedbackComment(''); }} style={{ ...styles.btnSecondary, padding: '4px 10px', fontSize: '11px' }}>Cancel</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => { setFeedbackJobId(job.id); setFeedbackRating(''); setFeedbackComment(''); }}
+                            style={{ ...styles.btnSecondary, padding: '4px 10px', fontSize: '11px' }}
+                          >
+                            Feedback
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {totalPages > 1 && (
+              <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '16px' }}>
+                <button style={styles.btnSecondary} disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Previous</button>
+                <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.48)', lineHeight: '32px' }}>Page {page} of {totalPages}</span>
+                <button style={styles.btnSecondary} disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Next</button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // AdminPanel (main)
 // ---------------------------------------------------------------------------
 
@@ -762,6 +1017,7 @@ export default function AdminPanel() {
     { id: 'suggestions', label: 'AI Suggestions' },
     { id: 'learning', label: 'Learning' },
     { id: 'models', label: 'Models' },
+    { id: 'generations', label: 'Generations' },
   ];
 
   return (
@@ -783,6 +1039,7 @@ export default function AdminPanel() {
         {activeTab === 'suggestions' && <SuggestionsTab />}
         {activeTab === 'learning' && <LearningTab />}
         {activeTab === 'models' && <ModelsTab />}
+        {activeTab === 'generations' && <GenerationsTab />}
       </div>
     </div>
   );

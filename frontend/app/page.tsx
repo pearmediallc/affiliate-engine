@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Dashboard from '@/components/Dashboard';
+import JobsPanel from '@/components/JobsPanel';
 import { fetchTemplates, fetchAnalytics } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import LoginPage from '@/components/LoginPage';
@@ -62,12 +63,15 @@ export default function Home() {
   }
 
   return (
-    <Dashboard
-      templates={templates}
-      analytics={analytics}
-      error={error}
-      vertical={vertical}
-      onVerticalChange={setVertical}
-    />
+    <>
+      <Dashboard
+        templates={templates}
+        analytics={analytics}
+        error={error}
+        vertical={vertical}
+        onVerticalChange={setVertical}
+      />
+      <JobsPanel />
+    </>
   );
 }

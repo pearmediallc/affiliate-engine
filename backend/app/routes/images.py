@@ -322,6 +322,20 @@ async def generate_images(
             except Exception as learn_err:
                 logger.warning(f"Failed to record learning: {learn_err}")
 
+        # Save as job for persistence
+        if user:
+            try:
+                from ..services.job_service import JobService
+                for img in images:
+                    JobService.save_sync_result(
+                        db=db, user_id=user.id, job_type="image_generation",
+                        input_data={"prompt": img.prompt_used[:500], "style": request.style, "text_mode": request.text_mode},
+                        result_data={"image_id": img.id, "image_url": img.image_url, "provider": img.generation_provider, "model": img.generation_model},
+                        result_url=img.image_url or "", cost_usd=img.cost_usd, vertical=request.vertical, provider=img.generation_provider or "gemini",
+                    )
+            except Exception as je:
+                logger.warning(f"Failed to save image job: {je}")
+
         total_cost = sum(img.cost_usd for img in images)
         if user:
             log_usage("image_generation", user.id, db, cost_usd=total_cost)

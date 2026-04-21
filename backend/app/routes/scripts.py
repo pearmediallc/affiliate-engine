@@ -71,6 +71,15 @@ async def generate_script(
                 )
             except Exception:
                 pass
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="script_generation",
+                    input_data={"product": request.product, "framework": request.framework, "angle": request.angle, "vertical": request.vertical},
+                    result_data=result, vertical=request.vertical, provider="gemini", cost_usd=0.02,
+                )
+            except Exception:
+                pass
         return APIResponse(success=True, message="Scripts generated successfully", data=result)
     except Exception as e:
         logger.error(f"Script generation failed: {str(e)}")
