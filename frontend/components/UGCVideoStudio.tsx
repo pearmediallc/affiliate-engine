@@ -276,7 +276,7 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
   const [videoName, setVideoName] = useState('');
   const [isLoadingAvatars, setIsLoadingAvatars] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
-  const [videoResult, setVideoResult] = useState<{ video_url?: string } | null>(null);
+  const [videoResult, setVideoResult] = useState<{ video_url?: string; material_id?: string } | null>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -335,6 +335,7 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
     setIsCreating(true);
     setError('');
     setVideoResult(null);
+
     try {
       const cleanScript = sanitizeScript(script);
       if (cleanScript.length < 10) {
@@ -343,67 +344,114 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
         return;
       }
 
+      console.log('[UGC] Sending create request...');
       const res = await axios.post(`${API_BASE_URL}/tiktok/videos/create`, {
         avatar_id: selectedAvatar,
         script: cleanScript,
         video_name: videoName || undefined,
       });
-      // TikTok returns task IDs as task_id_list in the data
-      const data = res.data.data || res.data;
-      const taskIds = data?.task_id_list || data?.task_ids || [data?.task_id].filter(Boolean);
 
-      console.log('Create video response:', JSON.stringify(data).substring(0, 500));
-      console.log('Task IDs:', taskIds);
+      console.log('[UGC] Full API response:', JSON.stringify(res.data));
 
-      if (taskIds.length > 0 && taskIds[0]) {
-        setError('');
-        // Poll for completion — TikTok takes 2-5 minutes
-        let attempts = 0;
-        const maxAttempts = 60; // 5 minutes at 5s intervals
-        const poll = setInterval(async () => {
-          attempts++;
-          try {
-            const statusRes = await axios.get(`${API_BASE_URL}/tiktok/videos/status?task_ids=${JSON.stringify(taskIds)}`);
-            const statusData = statusRes.data.data || statusRes.data;
-            console.log(`Poll attempt ${attempts}:`, JSON.stringify(statusData).substring(0, 300));
+      // Extract task IDs - try every possible location
+      const topData = res.data;
+      const innerData = topData?.data || {};
 
-            // TikTok uses task_list with status per task
-            const taskList = statusData?.task_list || statusData?.list || [];
-            const task = taskList[0] || statusData;
-            const status = (task?.status || statusData?.status || '').toUpperCase();
+      let taskIds: string[] = [];
 
-            if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'COMPLETE') {
-              clearInterval(poll);
-              const videoInfo = task?.video_info || task?.video || {};
-              setVideoResult({
-                video_url: videoInfo.video_url || videoInfo.url || '',
-                ...videoInfo,
-              });
-              setIsCreating(false);
-            } else if (status === 'FAILED' || status === 'ERROR' || status === 'CANCELLED') {
-              clearInterval(poll);
-              setError(`Video creation failed: ${task?.fail_reason || status}`);
-              setIsCreating(false);
-            } else if (attempts >= maxAttempts) {
-              clearInterval(poll);
-              setError('Video creation timed out. Check "My Videos" tab — it may still be processing on TikTok.');
-              setIsCreating(false);
-            }
-            // else: still PROCESSING, keep polling
-          } catch (pollErr) {
-            console.error('Poll error:', pollErr);
-            if (attempts >= 3) {
-              clearInterval(poll);
-              setError('Lost connection while checking status. The video may still be generating — check "My Videos" tab.');
-              setIsCreating(false);
-            }
-          }
-        }, 5000);
-      } else {
-        setVideoResult(data?.video || data);
-        setIsCreating(false);
+      // Try all known field names
+      if (innerData?.task_id_list && Array.isArray(innerData.task_id_list)) {
+        taskIds = innerData.task_id_list;
+      } else if (innerData?.task_ids && Array.isArray(innerData.task_ids)) {
+        taskIds = innerData.task_ids;
+      } else if (innerData?.task_id) {
+        taskIds = [innerData.task_id];
+      } else if (topData?.task_id_list && Array.isArray(topData.task_id_list)) {
+        taskIds = topData.task_id_list;
+      } else if (topData?.task_id) {
+        taskIds = [topData.task_id];
       }
+
+      // Filter out empty values
+      taskIds = taskIds.filter((id: string) => id && id.length > 0);
+
+      console.log('[UGC] Extracted task IDs:', taskIds);
+
+      if (taskIds.length === 0) {
+        // No task IDs found - show the raw response for debugging
+        setError(`Video task created but no task ID returned. Response: ${JSON.stringify(innerData).substring(0, 200)}`);
+        setIsCreating(false);
+        return;
+      }
+
+      // Start polling with progress tracking
+      setError('');
+      const startTime = Date.now();
+      let attempts = 0;
+      const maxAttempts = 60;
+
+      const updateProgress = () => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+      };
+
+      const pollInterval = setInterval(async () => {
+        attempts++;
+        try {
+          console.log(`[UGC] Poll attempt ${attempts}, elapsed: ${updateProgress()}`);
+
+          const statusRes = await axios.get(
+            `${API_BASE_URL}/tiktok/videos/status?task_ids=${encodeURIComponent(JSON.stringify(taskIds))}`
+          );
+
+          console.log(`[UGC] Status response:`, JSON.stringify(statusRes.data).substring(0, 500));
+
+          const statusData = statusRes.data?.data || statusRes.data;
+
+          // Extract task status - try all formats
+          const taskList = statusData?.task_list || statusData?.list || [];
+          const task = taskList.length > 0 ? taskList[0] : statusData;
+          const rawStatus = task?.status || statusData?.status || '';
+          const status = rawStatus.toUpperCase();
+
+          console.log(`[UGC] Task status: "${rawStatus}" -> "${status}"`);
+
+          if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'COMPLETE') {
+            clearInterval(pollInterval);
+            const videoInfo = task?.video_info || task?.video || task;
+            console.log('[UGC] Video info:', JSON.stringify(videoInfo));
+            setVideoResult({
+              video_url: videoInfo?.video_url || videoInfo?.url || videoInfo?.preview_url || '',
+              material_id: videoInfo?.material_id || '',
+            });
+            setIsCreating(false);
+          } else if (status === 'FAILED' || status === 'ERROR' || status === 'CANCELLED') {
+            clearInterval(pollInterval);
+            const reason = task?.fail_reason || task?.error || 'Unknown reason';
+            setError(`Video creation failed: ${reason}`);
+            setIsCreating(false);
+          } else if (attempts >= maxAttempts) {
+            clearInterval(pollInterval);
+            setError(`Timed out after ${updateProgress()}. The video may still be processing on TikTok - check "My Videos" tab.`);
+            setIsCreating(false);
+          }
+          // else: PROCESSING / PENDING - keep polling
+
+        } catch (pollErr: any) {
+          console.error('[UGC] Poll error:', pollErr);
+          // Don't give up on first error - TikTok can be flaky
+          if (attempts >= 5) {
+            clearInterval(pollInterval);
+            setError(`Connection lost after ${updateProgress()}. The video may still be generating - check "My Videos" tab.`);
+            setIsCreating(false);
+          }
+        }
+      }, 5000);
+
     } catch (err: any) {
+      console.error('[UGC] Create error:', err);
       setError(err.response?.data?.detail || err.message || 'Failed to create video');
       setIsCreating(false);
     }
@@ -477,14 +525,25 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       {/* Create Button */}
       <button type="button" onClick={handleCreate} disabled={isCreating || !selectedAvatar || !script.trim()}
         style={{
-          width: '100%', padding: '16px', borderRadius: '12px', border: 'none',
+          width: '100%', padding: '14px', borderRadius: '10px', border: 'none',
           fontSize: '16px', fontWeight: 500, cursor: 'pointer',
           background: '#0071e3', color: '#fff',
           opacity: (isCreating || !selectedAvatar || !script.trim()) ? 0.5 : 1,
-          transition: 'all 0.2s',
         }}>
         {isCreating ? 'Creating Video...' : 'Create Speaking Video'}
       </button>
+      {isCreating && (
+        <div style={{ marginTop: '12px', padding: '16px', background: 'rgba(0,113,227,0.1)', borderLeft: '3px solid #0071e3', borderRadius: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ width: '16px', height: '16px', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#0071e3', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+            <div>
+              <p style={{ fontSize: '14px', color: '#2997ff', margin: 0, fontWeight: 500 }}>Video is being generated by TikTok...</p>
+              <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', margin: '4px 0 0' }}>This typically takes 2-5 minutes. You can stay on this page or check "My Videos" tab later.</p>
+            </div>
+          </div>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      )}
 
       {error && <p style={{ fontSize: '13px', color: '#ff6b6b', textAlign: 'center' }}>{error}</p>}
 
@@ -518,7 +577,22 @@ function VideosTab() {
     setError('');
     try {
       const res = await axios.get(`${API_BASE_URL}/tiktok/videos/list`);
-      setVideos(res.data.videos || res.data.data?.videos || []);
+      const data = res.data?.data || res.data;
+      console.log('[UGC] Videos list raw data:', JSON.stringify(data).substring(0, 500));
+      const rawList = data?.video_list || data?.list || data?.videos || [];
+      // Normalize field names from TikTok API
+      const normalized = rawList.map((v: any) => ({
+        video_id: v.video_id || v.id || '',
+        video_name: v.file_name || v.video_name || v.name || 'Untitled Video',
+        avatar_name: v.avatar_name || v.avatar_id || '',
+        duration: v.duration || v.video_duration || 0,
+        created_at: v.created_time || v.created_at || v.create_time || '',
+        thumbnail_url: v.cover_url || v.thumbnail_url || v.preview_url || '',
+        video_url: v.video_url || v.preview_url || v.download_url || '',
+        status: v.status || '',
+      }));
+      console.log('[UGC] Normalized videos:', normalized.length);
+      setVideos(normalized);
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'Failed to load videos');
     } finally {
@@ -559,8 +633,9 @@ function VideosTab() {
       {videos.map((video, i) => (
         <div key={video.video_id || i} className="card" style={{ padding: '12px', overflow: 'hidden' }}>
           {video.thumbnail_url ? (
-            <img src={video.thumbnail_url} alt={video.video_name || 'Video'}
-              style={{ width: '100%', aspectRatio: '16/9', objectFit: 'cover', borderRadius: '8px', marginBottom: '10px' }} />
+            <img src={`${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(video.thumbnail_url)}`} alt={video.video_name || 'Video'}
+              style={{ width: '100%', aspectRatio: '16/9', objectFit: 'cover', borderRadius: '8px', marginBottom: '10px' }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
           ) : (
             <div style={{ width: '100%', aspectRatio: '16/9', background: 'rgba(255,255,255,0.04)', borderRadius: '8px', marginBottom: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1.5">
@@ -571,13 +646,14 @@ function VideosTab() {
           <p style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed', margin: '0 0 4px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {video.video_name || 'Untitled Video'}
           </p>
-          <div style={{ display: 'flex', gap: '8px', fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '10px' }}>
+          <div style={{ display: 'flex', gap: '8px', fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '10px', flexWrap: 'wrap' }}>
             {video.avatar_name && <span>{video.avatar_name}</span>}
-            {video.duration && <span>{video.duration}s</span>}
+            {video.duration ? <span>{video.duration}s</span> : null}
+            {video.status && <span style={{ color: video.status.toUpperCase() === 'SUCCESS' ? '#30d158' : video.status.toUpperCase() === 'FAILED' ? '#ff6b6b' : '#ffd60a' }}>{video.status}</span>}
             {video.created_at && <span>{new Date(video.created_at).toLocaleDateString()}</span>}
           </div>
           {video.video_url && (
-            <a href={video.video_url} download
+            <a href={video.video_url} target="_blank" rel="noopener noreferrer"
               style={{ display: 'block', textAlign: 'center', padding: '8px', borderRadius: '8px', background: 'rgba(255,255,255,0.08)', color: '#2997ff', fontSize: '12px', textDecoration: 'none' }}>
               Download
             </a>

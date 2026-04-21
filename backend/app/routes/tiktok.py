@@ -75,24 +75,39 @@ async def get_avatars(page: int = Query(1), page_size: int = Query(50)):
 @router.post("/videos/create")
 async def create_avatar_video(request: AvatarVideoRequest, user=Depends(get_optional_user), db: Session = Depends(get_db)):
     try:
+        print(f"[UGC] Creating video: avatar={request.avatar_id}, script_len={len(request.script)}")
         result = TikTokSymphonyService.create_avatar_video(
             avatar_id=request.avatar_id, script=request.script, video_name=request.video_name,
         )
+        print(f"[UGC] TikTok create response: {result}")
+
+        response_data = result.get("data", result)
+        print(f"[UGC] Extracted data: {response_data}")
+
         if user:
             log_usage("tiktok_video", user.id, db, cost_usd=0.0)
-        return APIResponse(success=True, message="Avatar video task created", data=result.get("data", result))
+        return APIResponse(success=True, message="Avatar video task created", data=response_data)
     except Exception as e:
+        print(f"[UGC] Create error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/videos/status")
 async def video_status(task_ids: str = Query(...)):
     try:
+        print(f"[UGC] Status check - raw task_ids param: {task_ids}")
         import json
         ids = json.loads(task_ids)
+        print(f"[UGC] Parsed task IDs: {ids}")
         result = TikTokSymphonyService.get_avatar_video_status(ids)
-        return APIResponse(success=True, message="Video status", data=result.get("data", result))
+        print(f"[UGC] TikTok status response: {str(result)[:500]}")
+
+        response_data = result.get("data", result)
+        print(f"[UGC] Extracted status data: {str(response_data)[:500]}")
+
+        return APIResponse(success=True, message="Video status", data=response_data)
     except Exception as e:
+        print(f"[UGC] Status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -100,8 +115,11 @@ async def video_status(task_ids: str = Query(...)):
 async def list_videos(page: int = Query(1), page_size: int = Query(20)):
     try:
         result = TikTokSymphonyService.list_avatar_videos(page, page_size)
-        return APIResponse(success=True, message="Videos listed", data=result.get("data", result))
+        print(f"[UGC] List videos response: {str(result)[:500]}")
+        response_data = result.get("data", result)
+        return APIResponse(success=True, message="Videos listed", data=response_data)
     except Exception as e:
+        print(f"[UGC] List error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

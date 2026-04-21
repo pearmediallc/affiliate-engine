@@ -96,25 +96,35 @@ class TikTokSymphonyService:
         if video_name:
             package["video_name"] = video_name
 
+        payload = {"material_packages": [package]}
+        print(f"[UGC-SVC] Sending to TikTok: {payload}")
+
         r = requests.post(
             f"{TIKTOK_BASE}/creative/digital_avatar/video/task/create/",
             headers=_tt_headers(),
-            json={"material_packages": [package]}, timeout=30,
+            json=payload, timeout=30,
         )
         data = r.json()
+        print(f"[UGC-SVC] TikTok raw response: {data}")
+
         if str(data.get("code")) != "0":
-            raise Exception(f"TikTok API error: {data.get('message', 'Unknown')}")
+            raise Exception(f"TikTok API error: {data.get('message', 'Unknown')} (code: {data.get('code')})")
         return data
 
     @staticmethod
     def get_avatar_video_status(task_ids: list) -> dict:
         import json
+        task_ids_str = json.dumps(task_ids)
+        print(f"[UGC-SVC] Checking status for: {task_ids_str}")
+
         r = requests.get(
             f"{TIKTOK_BASE}/creative/digital_avatar/video/task/get/",
             headers={"Access-Token": settings.tiktok_access_token},
-            params={"task_ids": json.dumps(task_ids)}, timeout=30,
+            params={"task_ids": task_ids_str}, timeout=30,
         )
-        return r.json()
+        data = r.json()
+        print(f"[UGC-SVC] Status response: {str(data)[:500]}")
+        return data
 
     @staticmethod
     def list_avatar_videos(page: int = 1, page_size: int = 20, avatar_id: str = None) -> dict:
