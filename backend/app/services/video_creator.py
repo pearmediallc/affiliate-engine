@@ -148,6 +148,49 @@ class VideoCreatorService:
         return result
 
     @staticmethod
+    def extend_video(
+        previous_operation_name: str,
+        prompt: str,
+        resolution: str = "720p",
+    ) -> dict:
+        """
+        Extend a previously-generated Veo video by +7 seconds.
+        Per Veo 3.1 docs: extensions are 720p only and exactly +7s.
+        """
+        from google import genai
+        from google.genai import types
+
+        if not settings.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not configured")
+
+        client = genai.Client(api_key=settings.gemini_api_key)
+
+        # Resolve previous operation to get its Video object
+        prev_op = types.GenerateVideosOperation(name=previous_operation_name)
+        prev_op = client.operations.get(prev_op)
+        if not prev_op.done or not prev_op.response:
+            raise ValueError(f"Previous operation {previous_operation_name} not ready to extend")
+
+        prev_video = prev_op.response.generated_videos[0].video
+
+        logger.info(f"Extending Veo video {previous_operation_name[:40]} with prompt: {prompt[:80]}")
+
+        operation = client.models.generate_videos(
+            model="veo-3.1-generate-preview",
+            video=prev_video,
+            prompt=prompt,
+            config=types.GenerateVideosConfig(resolution="720p"),
+        )
+
+        return {
+            "operation_name": operation.name,
+            "status": "generating",
+            "prompt": prompt[:200],
+            "resolution": "720p",
+            "extended_from": previous_operation_name,
+        }
+
+    @staticmethod
     def get_capabilities() -> dict:
         """Return Veo 3.1 capabilities for the frontend"""
         return {
