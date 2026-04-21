@@ -490,23 +490,41 @@ function LongVideoPanel() {
     }
   };
 
-  // Poll status every 8s while job is running
+  // Poll status every 10s. Stops polling when job reaches a terminal state.
   useEffect(() => {
     if (!jobId) return;
-    let cancelled = false;
+    let cancelledFlag = false;
+    let iv: ReturnType<typeof setInterval> | null = null;
     const tick = async () => {
       try {
         const res = await axios.get(`${API_BASE_URL}/video/long/status/${jobId}`);
-        if (cancelled) return;
-        setSnap(res.data.data);
+        if (cancelledFlag) return;
+        const data = res.data.data;
+        setSnap(data);
+        // Stop polling on terminal states
+        if (data.status === 'completed' || data.status === 'cancelled' || data.status === 'failed') {
+          if (iv) { clearInterval(iv); iv = null; }
+        }
       } catch (e) {}
     };
     tick();
-    const iv = setInterval(tick, 8000);
-    return () => { cancelled = true; clearInterval(iv); };
+    iv = setInterval(tick, 10000);
+    return () => { cancelledFlag = true; if (iv) clearInterval(iv); };
   }, [jobId]);
 
-  const allDone = snap && snap.segments?.every((s: any) => s.status === 'completed' || s.status === 'failed' || s.status === 'skipped_budget');
+  const allDone = snap && snap.segments?.every((s: any) => s.status === 'completed' || s.status === 'failed' || s.status === 'skipped_budget' || s.status === 'cancelled');
+  const isTerminal = snap && (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed');
+
+  const handleCancel = async () => {
+    if (!jobId) return;
+    if (!window.confirm('Cancel this long-video job? Segments already generated will be kept.')) return;
+    try {
+      const res = await axios.post(`${API_BASE_URL}/video/long/cancel/${jobId}`);
+      setSnap(res.data.data);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || 'Cancel failed');
+    }
+  };
 
   const handleStitchNow = async () => {
     if (!jobId) return;
@@ -632,21 +650,32 @@ Close-up on the fisherman's hands untying the rope.`}
 
       {jobId && snap && (
         <div className="card" style={{ padding: '20px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-            <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', gap: '12px' }}>
+            <div style={{ minWidth: 0, flex: 1 }}>
               <p style={{ fontSize: '15px', fontWeight: 600, color: '#fff', margin: 0 }}>
                 {snap.completed_count}/{snap.segment_count} segments ready
+                {snap.status === 'cancelled' && <span style={{ color: '#ff6b6b', fontSize: '13px', marginLeft: '8px' }}>· Cancelled</span>}
+                {snap.status === 'completed' && <span style={{ color: '#30d158', fontSize: '13px', marginLeft: '8px' }}>· Done</span>}
               </p>
               <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.5)', margin: '4px 0 0 0' }}>
                 Cost so far: ${(snap.cost_so_far || 0).toFixed(2)}
                 {snap.skipped_budget_count > 0 && ` · ${snap.skipped_budget_count} skipped (budget)`}
                 {snap.failed_count > 0 && ` · ${snap.failed_count} failed`}
+                {snap.cancelled_count > 0 && ` · ${snap.cancelled_count} cancelled`}
               </p>
             </div>
-            <button type="button" onClick={handleReset}
-              style={{ padding: '8px 14px', borderRadius: '8px', border: 'none', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', fontSize: '13px', cursor: 'pointer' }}>
-              New
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              {!isTerminal && (
+                <button type="button" onClick={handleCancel}
+                  style={{ padding: '8px 14px', borderRadius: '8px', border: '1px solid rgba(255,69,58,0.4)', background: 'rgba(255,69,58,0.12)', color: '#ff6b6b', fontSize: '13px', cursor: 'pointer' }}>
+                  Cancel
+                </button>
+              )}
+              <button type="button" onClick={handleReset}
+                style={{ padding: '8px 14px', borderRadius: '8px', border: 'none', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', fontSize: '13px', cursor: 'pointer' }}>
+                New
+              </button>
+            </div>
           </div>
 
           {/* Progress bar */}
@@ -664,6 +693,7 @@ Close-up on the fisherman's hands untying the rope.`}
               const statusColor = s.status === 'completed' ? '#30d158'
                 : s.status === 'generating' ? '#ffd60a'
                 : s.status === 'failed' ? '#ff6b6b'
+                : s.status === 'cancelled' ? '#ff6b6b'
                 : s.status === 'skipped_budget' ? '#8e8e93'
                 : 'rgba(255,255,255,0.3)';
               const url = s.download_url ? resolveUrl(s.download_url) : '';

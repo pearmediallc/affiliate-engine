@@ -2,12 +2,15 @@
 Long-video engine: chains Veo 3.1 base + extensions + optional ffmpeg stitch.
 
 State machine lives in Job.result_data["segments"] so it survives restarts.
-The /long/status endpoint drives progress forward lazily on each poll.
+The /long/status endpoint reads state (fast); background task advances it.
 """
 import os
 import uuid
 import logging
 import subprocess
+import threading
+from datetime import datetime, timedelta
+from collections import defaultdict
 from typing import Optional
 from sqlalchemy.orm import Session
 from .video_creator import VideoCreatorService, VIDEOS_DIR
@@ -15,6 +18,12 @@ from .job_service import JobService
 from ..models.job import Job
 
 logger = logging.getLogger(__name__)
+
+# Per-job advance lock. Non-blocking: if locked, skip (next poll tries again).
+_advance_locks: dict = defaultdict(threading.Lock)
+
+# A segment stuck in "generating" for >STUCK_TIMEOUT is marked failed.
+STUCK_TIMEOUT = timedelta(minutes=10)
 
 LONG_VIDEOS_DIR = os.path.join(VIDEOS_DIR, "long")
 LONG_STITCHED_DIR = os.path.join(VIDEOS_DIR, "long", "stitched")
@@ -69,6 +78,7 @@ class LongVideoService:
         )
         first["operation_name"] = result["operation_name"]
         first["status"] = "generating"
+        first["started_at"] = datetime.utcnow().isoformat()
 
         job = JobService.create_job(
             db=db, user_id=user_id, job_type="long_video",
@@ -91,6 +101,49 @@ class LongVideoService:
             "error": None,
         })
         return job
+
+    @staticmethod
+    def cancel(db: Session, job: Job) -> dict:
+        """Mark job + any pending/generating segments as cancelled."""
+        result_data = job.result_data or {}
+        segments = result_data.get("segments", [])
+        for s in segments:
+            if s["status"] in ("pending", "generating"):
+                s["status"] = "cancelled"
+        result_data["segments"] = segments
+        result_data["cancelled_at"] = datetime.utcnow().isoformat()
+        JobService.update_job(
+            db=db, job_id=job.id,
+            result_data=result_data, status="cancelled",
+            error_message="Cancelled by user",
+        )
+        return LongVideoService._snapshot(job, result_data)
+
+    @staticmethod
+    def advance_in_background(session_factory, job_id: str) -> None:
+        """
+        Thread-safe advance entry point.
+        Acquires a per-job lock (non-blocking) to prevent concurrent advances.
+        Short-circuits on cancelled/completed/failed jobs.
+        """
+        lock = _advance_locks[job_id]
+        if not lock.acquire(blocking=False):
+            return  # Another advance is already running for this job
+        try:
+            db = session_factory()
+            try:
+                job = JobService.get_job(db, job_id)
+                if not job:
+                    return
+                if job.status in ("cancelled", "completed", "failed"):
+                    return
+                LongVideoService.advance(db, job)
+            except Exception as e:
+                logger.error(f"advance_in_background({job_id}): {e}", exc_info=True)
+            finally:
+                db.close()
+        finally:
+            lock.release()
 
     @staticmethod
     def advance(db: Session, job: Job) -> dict:
@@ -172,6 +225,7 @@ class LongVideoService:
                 )
                 active["operation_name"] = result["operation_name"]
                 active["status"] = "generating"
+                active["started_at"] = datetime.utcnow().isoformat()
                 cost_so_far += next_cost
                 result_data["cost_so_far"] = cost_so_far
                 JobService.update_job(db=db, job_id=job.id, result_data=result_data,
@@ -186,6 +240,25 @@ class LongVideoService:
                 return LongVideoService._snapshot(job, result_data)
 
         # active.status == "generating" -> poll
+
+        # Stuck-detection: if the segment has been generating for too long, fail it.
+        started_at_str = active.get("started_at")
+        if started_at_str:
+            try:
+                started_at = datetime.fromisoformat(started_at_str)
+                if datetime.utcnow() - started_at > STUCK_TIMEOUT:
+                    logger.warning(f"Segment {active_idx} stuck >{STUCK_TIMEOUT} - marking failed")
+                    active["status"] = "failed"
+                    active["error"] = f"Timed out after {STUCK_TIMEOUT}"
+                    result_data["error"] = f"Segment {active_idx} timed out"
+                    JobService.update_job(db=db, job_id=job.id, result_data=result_data)
+                    return LongVideoService._snapshot(job, result_data)
+            except Exception:
+                pass
+        else:
+            # Backfill started_at for segments that didn't record it (pre-upgrade)
+            active["started_at"] = datetime.utcnow().isoformat()
+
         try:
             status = VideoCreatorService.check_status(active["operation_name"])
         except Exception as e:
@@ -269,6 +342,7 @@ class LongVideoService:
         done = sum(1 for s in segments if s["status"] == "completed")
         failed = sum(1 for s in segments if s["status"] == "failed")
         skipped = sum(1 for s in segments if s["status"] == "skipped_budget")
+        cancelled = sum(1 for s in segments if s["status"] == "cancelled")
         return {
             "job_id": job.id,
             "status": job.status,
@@ -276,11 +350,13 @@ class LongVideoService:
             "completed_count": done,
             "failed_count": failed,
             "skipped_budget_count": skipped,
+            "cancelled_count": cancelled,
             "cost_so_far": result_data.get("cost_so_far", 0.0),
             "segments": [
                 {
                     "index": s["index"],
-                    "prompt": s["prompt"],
+                    # Trim long prompts to keep response lightweight
+                    "prompt": (s.get("prompt") or "")[:240] + ("..." if len(s.get("prompt") or "") > 240 else ""),
                     "duration": s["duration"],
                     "kind": s["kind"],
                     "status": s["status"],

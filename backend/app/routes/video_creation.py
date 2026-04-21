@@ -1,5 +1,5 @@
 """Video creation routes - Veo 3.1 text-to-video and image-to-video"""
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -13,6 +13,7 @@ from ..services.script_parser import parse_script, normalize_for_veo
 from ..services.long_video_service import LongVideoService, LONG_VIDEOS_DIR, LONG_STITCHED_DIR
 from ..middleware.auth import get_current_user
 from ..models.job import Job
+from ..database import SessionLocal
 import tempfile
 import os
 import logging
@@ -264,12 +265,14 @@ async def long_video_create(
 @router.get("/long/status/{job_id}")
 async def long_video_status(
     job_id: str,
+    background_tasks: BackgroundTasks,
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Drives the long-video state machine forward by one tick and returns the snapshot.
-    Each call will: poll the active segment, and if it's done, kick off the next.
+    Returns the current state snapshot. Non-blocking: advancement (polling
+    Google, downloading mp4, kicking off next extension) runs in a
+    background task. Idempotent via per-job locking.
     """
     job = JobService.get_job(db, job_id)
     if not job:
@@ -279,8 +282,38 @@ async def long_video_status(
     if job.job_type != "long_video":
         raise HTTPException(status_code=400, detail="Not a long video job")
 
-    snap = LongVideoService.advance(db, job)
+    # Schedule background advance — only for jobs still in progress.
+    # The lock inside advance_in_background prevents concurrent advances.
+    if job.status not in ("cancelled", "completed", "failed"):
+        background_tasks.add_task(
+            LongVideoService.advance_in_background,
+            SessionLocal, job_id,
+        )
+
+    snap = LongVideoService._snapshot(job, job.result_data or {})
     return APIResponse(success=True, message="Long video status", data=snap)
+
+
+@router.post("/long/cancel/{job_id}")
+async def long_video_cancel(
+    job_id: str,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Cancel a running long-video job. Marks pending/generating segments as cancelled."""
+    job = JobService.get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your job")
+    if job.job_type != "long_video":
+        raise HTTPException(status_code=400, detail="Not a long video job")
+    if job.status in ("cancelled", "completed", "failed"):
+        return APIResponse(success=True, message=f"Job already {job.status}",
+                           data=LongVideoService._snapshot(job, job.result_data or {}))
+
+    snap = LongVideoService.cancel(db, job)
+    return APIResponse(success=True, message="Job cancelled", data=snap)
 
 
 @router.get("/long/download/{filename}")
