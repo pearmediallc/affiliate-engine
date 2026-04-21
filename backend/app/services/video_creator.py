@@ -35,14 +35,19 @@ class VideoCreatorService:
 
         client = genai.Client(api_key=settings.gemini_api_key)
 
+        # Normalize duration: accept "8", "8s", 8 -> int
+        try:
+            duration_int = int(str(duration).rstrip("s").strip())
+        except (ValueError, AttributeError):
+            duration_int = 8
+
         config = types.GenerateVideosConfig(
             aspect_ratio=aspect_ratio,
+            resolution=resolution or "720p",
+            duration_seconds=duration_int,
         )
-        # Only set resolution if not default
-        if resolution and resolution != "720p":
-            config.resolution = resolution
 
-        logger.info(f"Starting Veo 3.1 video generation: {prompt[:100]}...")
+        logger.info(f"Starting Veo 3.1: aspect={aspect_ratio} res={resolution} dur={duration_int}s prompt={prompt[:80]}")
 
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
@@ -56,6 +61,7 @@ class VideoCreatorService:
             "prompt": prompt[:200],
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
+            "duration_seconds": duration_int,
         }
 
     @staticmethod
@@ -77,7 +83,10 @@ class VideoCreatorService:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
-        image = types.Image(image_bytes=image_bytes, mime_type="image/png")
+        # Infer mime type from extension
+        ext = (os.path.splitext(image_path)[1] or ".png").lower().lstrip(".")
+        mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+        image = types.Image(image_bytes=image_bytes, mime_type=mime)
 
         logger.info(f"Starting Veo 3.1 image-to-video: {prompt[:100]}...")
 

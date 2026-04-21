@@ -609,12 +609,17 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
 
       {error && <p style={{ fontSize: '13px', color: '#ff6b6b', textAlign: 'center' }}>{error}</p>}
 
-      {/* Video Result */}
+      {/* Video Result - constrained size for portrait 9:16 */}
       {videoResult && videoResult.video_url && (
         <div className="card" style={{ padding: '20px' }}>
           <p style={{ fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '12px' }}>Result</p>
-          <video src={videoResult.video_url} controls
-            style={{ width: '100%', borderRadius: '10px', marginBottom: '12px' }} />
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px' }}>
+            <video src={videoResult.video_url} controls playsInline
+              style={{
+                width: '100%', maxWidth: '360px', maxHeight: '640px',
+                borderRadius: '10px', background: '#000', objectFit: 'contain',
+              }} />
+          </div>
           <a href={videoResult.video_url} download
             style={{ display: 'block', textAlign: 'center', padding: '10px', borderRadius: '8px', background: 'rgba(255,255,255,0.08)', color: '#2997ff', fontSize: '14px', textDecoration: 'none' }}>
             Download Video
@@ -629,6 +634,7 @@ function VideosTab() {
   const [videos, setVideos] = useState<Video[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [playingId, setPlayingId] = useState<string | null>(null);
 
   useEffect(() => {
     loadVideos();
@@ -638,12 +644,16 @@ function VideosTab() {
     setIsLoading(true);
     setError('');
     try {
-      const res = await axios.get(`${API_BASE_URL}/tiktok/videos/list`);
-      const data = res.data?.data || res.data;
+      // Merge TikTok's list + our locally saved jobs (job queue) so users never lose videos
+      const [ttRes, jobsRes] = await Promise.all([
+        axios.get(`${API_BASE_URL}/tiktok/videos/list`).catch(() => ({ data: { data: {} } })),
+        axios.get(`${API_BASE_URL}/jobs/my?job_type=ugc_video&limit=50`).catch(() => ({ data: { data: { jobs: [] } } })),
+      ]);
+      const data = ttRes.data?.data || ttRes.data;
       console.log('[UGC] Videos list raw data:', JSON.stringify(data).substring(0, 500));
       const rawList = data?.video_list || data?.list || data?.videos || [];
       // Normalize field names from TikTok API
-      const normalized = rawList.map((v: any) => ({
+      const ttVideos = rawList.map((v: any) => ({
         video_id: v.video_id || v.id || '',
         video_name: v.file_name || v.video_name || v.name || 'Untitled Video',
         avatar_name: v.avatar_name || v.avatar_id || '',
@@ -653,8 +663,34 @@ function VideosTab() {
         video_url: v.video_url || v.preview_url || v.download_url || '',
         status: v.status || '',
       }));
-      console.log('[UGC] Normalized videos:', normalized.length);
-      setVideos(normalized);
+
+      // Include job-queue videos (covers cases where TikTok list is slow/empty + provides local backups)
+      const jobs = jobsRes.data?.data?.jobs || [];
+      const jobVideos: Video[] = jobs
+        .filter((j: any) => j.status === 'completed' && (j.result_url || j.result_data?.video_url))
+        .map((j: any) => ({
+          video_id: j.id,
+          video_name: j.input_data?.video_name || 'UGC Video',
+          avatar_name: j.input_data?.avatar_id || '',
+          duration: 0,
+          created_at: j.created_at || '',
+          thumbnail_url: j.result_data?.cover_url || '',
+          video_url: j.result_url?.startsWith('/') ? `${API_BASE_URL.replace('/api/v1', '')}${j.result_url}` : (j.result_url || j.result_data?.video_url || ''),
+          status: 'SUCCESS',
+        }));
+
+      // Dedupe by video_url, prefer job-queue copies (local backups)
+      const merged: Video[] = [];
+      const seen = new Set<string>();
+      for (const v of [...jobVideos, ...ttVideos]) {
+        const key = v.video_url || v.video_id;
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          merged.push(v);
+        }
+      }
+      console.log('[UGC] Merged videos:', merged.length, '(tt:', ttVideos.length, 'jobs:', jobVideos.length, ')');
+      setVideos(merged);
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'Failed to load videos');
     } finally {
@@ -691,37 +727,96 @@ function VideosTab() {
   }
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
-      {videos.map((video, i) => (
-        <div key={video.video_id || i} className="card" style={{ padding: '12px', overflow: 'hidden' }}>
-          {video.thumbnail_url ? (
-            <img src={`${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(video.thumbnail_url)}`} alt={video.video_name || 'Video'}
-              style={{ width: '100%', aspectRatio: '16/9', objectFit: 'cover', borderRadius: '8px', marginBottom: '10px' }}
-              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-          ) : (
-            <div style={{ width: '100%', aspectRatio: '16/9', background: 'rgba(255,255,255,0.04)', borderRadius: '8px', marginBottom: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="1.5">
-                <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M10 8l6 4-6 4V8z" />
-              </svg>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '16px' }}>
+      {videos.map((video, i) => {
+        const key = video.video_id || `v${i}`;
+        const isPlaying = playingId === key;
+        return (
+          <div key={key} className="card" style={{ padding: '12px', overflow: 'hidden' }}>
+            {/* Thumbnail OR inline player (9:16 portrait for TikTok UGC) */}
+            <div style={{
+              position: 'relative', width: '100%', aspectRatio: '9/16',
+              background: 'rgba(0,0,0,0.6)', borderRadius: '8px', marginBottom: '10px',
+              overflow: 'hidden', cursor: isPlaying ? 'default' : 'pointer',
+            }}
+            onClick={() => !isPlaying && video.video_url && setPlayingId(key)}>
+              {isPlaying && video.video_url ? (
+                <video src={video.video_url} controls autoPlay playsInline
+                  style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }} />
+              ) : video.thumbnail_url ? (
+                <>
+                  <img src={`${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(video.thumbnail_url)}`} alt={video.video_name || 'Video'}
+                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                    onError={(e) => {
+                      const img = e.target as HTMLImageElement;
+                      img.style.display = 'none';
+                      const fallback = img.nextElementSibling as HTMLElement;
+                      if (fallback) fallback.style.display = 'flex';
+                    }} />
+                  <div style={{
+                    display: 'none', width: '100%', height: '100%',
+                    alignItems: 'center', justifyContent: 'center',
+                    background: 'linear-gradient(135deg, #0071e3 0%, #2997ff 100%)',
+                  }}>
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="rgba(255,255,255,0.9)">
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                  </div>
+                  {video.video_url && (
+                    <div style={{
+                      position: 'absolute', inset: 0, display: 'flex',
+                      alignItems: 'center', justifyContent: 'center',
+                      background: 'rgba(0,0,0,0.25)', transition: 'background 0.2s',
+                    }}>
+                      <div style={{
+                        width: '48px', height: '48px', borderRadius: '50%',
+                        background: 'rgba(255,255,255,0.95)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="#000">
+                          <path d="M8 5v14l11-7z" />
+                        </svg>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{
+                  width: '100%', height: '100%', display: 'flex',
+                  alignItems: 'center', justifyContent: 'center',
+                  background: 'linear-gradient(135deg, #0071e3 0%, #2997ff 100%)',
+                }}>
+                  <svg width="48" height="48" viewBox="0 0 24 24" fill="rgba(255,255,255,0.9)">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                </div>
+              )}
             </div>
-          )}
-          <p style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed', margin: '0 0 4px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {video.video_name || 'Untitled Video'}
-          </p>
-          <div style={{ display: 'flex', gap: '8px', fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '10px', flexWrap: 'wrap' }}>
-            {video.avatar_name && <span>{video.avatar_name}</span>}
-            {video.duration ? <span>{video.duration}s</span> : null}
-            {video.status && <span style={{ color: video.status.toUpperCase() === 'SUCCESS' ? '#30d158' : video.status.toUpperCase() === 'FAILED' ? '#ff6b6b' : '#ffd60a' }}>{video.status}</span>}
-            {video.created_at && <span>{new Date(video.created_at).toLocaleDateString()}</span>}
+            <p style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed', margin: '0 0 4px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {video.video_name || 'Untitled Video'}
+            </p>
+            <div style={{ display: 'flex', gap: '8px', fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '10px', flexWrap: 'wrap' }}>
+              {video.duration ? <span>{video.duration}s</span> : null}
+              {video.status && <span style={{ color: video.status.toUpperCase() === 'SUCCESS' ? '#30d158' : video.status.toUpperCase() === 'FAILED' ? '#ff6b6b' : '#ffd60a' }}>{video.status}</span>}
+              {video.created_at && <span>{new Date(video.created_at).toLocaleDateString()}</span>}
+            </div>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              {video.video_url && !isPlaying && (
+                <button type="button" onClick={() => setPlayingId(key)}
+                  style={{ flex: 1, padding: '8px', borderRadius: '8px', border: 'none', background: '#0071e3', color: '#fff', fontSize: '12px', fontWeight: 500, cursor: 'pointer' }}>
+                  Play
+                </button>
+              )}
+              {video.video_url && (
+                <a href={video.video_url} download target="_blank" rel="noopener noreferrer"
+                  style={{ flex: 1, textAlign: 'center', padding: '8px', borderRadius: '8px', background: 'rgba(255,255,255,0.08)', color: '#2997ff', fontSize: '12px', textDecoration: 'none', fontWeight: 500 }}>
+                  Download
+                </a>
+              )}
+            </div>
           </div>
-          {video.video_url && (
-            <a href={video.video_url} target="_blank" rel="noopener noreferrer"
-              style={{ display: 'block', textAlign: 'center', padding: '8px', borderRadius: '8px', background: 'rgba(255,255,255,0.08)', color: '#2997ff', fontSize: '12px', textDecoration: 'none' }}>
-              Download
-            </a>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
