@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { API_BASE_URL } from '@/lib/api';
 
@@ -278,6 +278,23 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
   const [isCreating, setIsCreating] = useState(false);
   const [videoResult, setVideoResult] = useState<{ video_url?: string; material_id?: string } | null>(null);
   const [error, setError] = useState('');
+  const [statusLog, setStatusLog] = useState<string[]>([]);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const elapsedRef = useRef<NodeJS.Timeout | null>(null);
+
+  const addLog = (msg: string) => {
+    const time = new Date().toLocaleTimeString();
+    setStatusLog(prev => [...prev, `[${time}] ${msg}`]);
+  };
+
+  const startTimer = () => {
+    setElapsedTime(0);
+    elapsedRef.current = setInterval(() => setElapsedTime(prev => prev + 1), 1000);
+  };
+  const stopTimer = () => {
+    if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
+  };
+  const formatTime = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
 
   useEffect(() => {
     setScript(initialScript);
@@ -335,23 +352,26 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
     setIsCreating(true);
     setError('');
     setVideoResult(null);
+    setStatusLog([]);
+    startTimer();
 
     try {
       const cleanScript = sanitizeScript(script);
       if (cleanScript.length < 10) {
         setError('Script is too short after sanitization. Use plain text without emojis or special characters.');
         setIsCreating(false);
+        stopTimer();
         return;
       }
 
-      console.log('[UGC] Sending create request...');
+      addLog('Sending video creation request to TikTok...');
       const res = await axios.post(`${API_BASE_URL}/tiktok/videos/create`, {
         avatar_id: selectedAvatar,
         script: cleanScript,
         video_name: videoName || undefined,
       });
 
-      console.log('[UGC] Full API response:', JSON.stringify(res.data));
+      addLog('TikTok accepted the request. Extracting task ID...');
 
       // Extract task IDs - try every possible location
       const topData = res.data;
@@ -375,14 +395,17 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       // Filter out empty values
       taskIds = taskIds.filter((id: string) => id && id.length > 0);
 
-      console.log('[UGC] Extracted task IDs:', taskIds);
+      addLog(`Task ID: ${taskIds[0] || 'none'}`);
 
       if (taskIds.length === 0) {
-        // No task IDs found - show the raw response for debugging
         setError(`Video task created but no task ID returned. Response: ${JSON.stringify(innerData).substring(0, 200)}`);
         setIsCreating(false);
+        stopTimer();
+        addLog('ERROR: No task ID returned from TikTok');
         return;
       }
+
+      addLog('Video is queued on TikTok. Starting status checks...');
 
       // Start polling with progress tracking
       setError('');
@@ -400,28 +423,25 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       const pollInterval = setInterval(async () => {
         attempts++;
         try {
-          console.log(`[UGC] Poll attempt ${attempts}, elapsed: ${updateProgress()}`);
+          addLog(`Checking status... (attempt ${attempts}/60)`);
 
           const statusRes = await axios.get(
             `${API_BASE_URL}/tiktok/videos/status?task_ids=${encodeURIComponent(JSON.stringify(taskIds))}`
           );
 
-          console.log(`[UGC] Status response:`, JSON.stringify(statusRes.data).substring(0, 500));
-
           const statusData = statusRes.data?.data || statusRes.data;
-
-          // Extract task status - try all formats
           const taskList = statusData?.task_list || statusData?.list || [];
           const task = taskList.length > 0 ? taskList[0] : statusData;
           const rawStatus = task?.status || statusData?.status || '';
           const status = rawStatus.toUpperCase();
 
-          console.log(`[UGC] Task status: "${rawStatus}" -> "${status}"`);
-
-          if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'COMPLETE') {
+          if (status === 'UNKNOWN' || status === 'PROCESSING' || status === 'PENDING' || status === '') {
+            addLog(`Status: Processing... TikTok is generating your video`);
+          } else if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'COMPLETE') {
             clearInterval(pollInterval);
+            stopTimer();
+            addLog('Video generated successfully!');
             const videoInfo = task?.video_info || task?.video || task;
-            console.log('[UGC] Video info:', JSON.stringify(videoInfo));
             setVideoResult({
               video_url: videoInfo?.video_url || videoInfo?.url || videoInfo?.preview_url || '',
               material_id: videoInfo?.material_id || '',
@@ -429,21 +449,26 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
             setIsCreating(false);
           } else if (status === 'FAILED' || status === 'ERROR' || status === 'CANCELLED') {
             clearInterval(pollInterval);
+            stopTimer();
             const reason = task?.fail_reason || task?.error || 'Unknown reason';
+            addLog(`FAILED: ${reason}`);
             setError(`Video creation failed: ${reason}`);
             setIsCreating(false);
           } else if (attempts >= maxAttempts) {
             clearInterval(pollInterval);
-            setError(`Timed out after ${updateProgress()}. The video may still be processing on TikTok - check "My Videos" tab.`);
+            stopTimer();
+            addLog('Timed out — check My Videos tab');
+            setError(`Timed out after ${updateProgress()}. Check "My Videos" tab.`);
             setIsCreating(false);
+          } else {
+            addLog(`Status: ${rawStatus || 'waiting...'}`);
           }
-          // else: PROCESSING / PENDING - keep polling
 
         } catch (pollErr: any) {
-          console.error('[UGC] Poll error:', pollErr);
-          // Don't give up on first error - TikTok can be flaky
+          addLog(`Connection error (attempt ${attempts})`);
           if (attempts >= 5) {
             clearInterval(pollInterval);
+            stopTimer();
             setError(`Connection lost after ${updateProgress()}. The video may still be generating - check "My Videos" tab.`);
             setIsCreating(false);
           }
@@ -532,15 +557,50 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
         }}>
         {isCreating ? 'Creating Video...' : 'Create Speaking Video'}
       </button>
-      {isCreating && (
-        <div style={{ marginTop: '12px', padding: '16px', background: 'rgba(0,113,227,0.1)', borderLeft: '3px solid #0071e3', borderRadius: '8px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{ width: '16px', height: '16px', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#0071e3', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-            <div>
-              <p style={{ fontSize: '14px', color: '#2997ff', margin: 0, fontWeight: 500 }}>Video is being generated by TikTok...</p>
-              <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', margin: '4px 0 0' }}>This typically takes 2-5 minutes. You can stay on this page or check "My Videos" tab later.</p>
+      {/* Real-time status log */}
+      {(isCreating || statusLog.length > 0) && (
+        <div className="card" style={{ padding: '16px', marginTop: '12px' }}>
+          {/* Header with timer */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              {isCreating && (
+                <div style={{ width: '14px', height: '14px', border: '2px solid rgba(255,255,255,0.2)', borderTopColor: '#0071e3', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+              )}
+              <span style={{ fontSize: '13px', fontWeight: 600, color: isCreating ? '#2997ff' : '#30d158' }}>
+                {isCreating ? 'Generating Video' : 'Complete'}
+              </span>
             </div>
+            <span style={{ fontSize: '20px', fontWeight: 700, color: '#fff', fontVariantNumeric: 'tabular-nums' }}>
+              {formatTime(elapsedTime)}
+            </span>
           </div>
+
+          {/* Progress bar estimate (assume 2 min avg) */}
+          {isCreating && (
+            <div style={{ height: '4px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px', marginBottom: '12px', overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', background: 'linear-gradient(90deg, #0071e3, #2997ff)',
+                borderRadius: '2px', transition: 'width 1s linear',
+                width: `${Math.min(elapsedTime / 120 * 100, 95)}%`,
+              }} />
+            </div>
+          )}
+
+          {/* Status log entries */}
+          <div style={{ maxHeight: '160px', overflowY: 'auto', fontSize: '12px', fontFamily: 'monospace' }}>
+            {statusLog.map((line, i) => (
+              <p key={i} style={{
+                margin: '2px 0', padding: '2px 0',
+                color: line.includes('ERROR') || line.includes('FAILED') ? '#ff6b6b'
+                  : line.includes('successfully') || line.includes('SUCCESS') ? '#30d158'
+                  : line.includes('Processing') ? '#ffd60a'
+                  : 'rgba(255,255,255,0.5)',
+              }}>
+                {line}
+              </p>
+            ))}
+          </div>
+
           <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         </div>
       )}
