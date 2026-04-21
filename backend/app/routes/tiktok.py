@@ -22,7 +22,24 @@ UGC_VIDEOS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "generated_videos", "ugc",
 )
+UGC_THUMBS_DIR = os.path.join(UGC_VIDEOS_DIR, "thumbs")
 os.makedirs(UGC_VIDEOS_DIR, exist_ok=True)
+os.makedirs(UGC_THUMBS_DIR, exist_ok=True)
+
+
+def _generate_thumbnail(video_path: str, thumb_path: str) -> bool:
+    """Extract first frame of video as JPEG thumbnail via ffmpeg. Returns True on success."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1",
+             "-vf", "scale=480:-2", "-q:v", "3", thumb_path],
+            capture_output=True, timeout=30,
+        )
+        return result.returncode == 0 and os.path.exists(thumb_path)
+    except Exception as e:
+        logger.warning(f"[UGC] Thumbnail generation failed: {e}")
+        return False
 
 
 class ScriptTaskRequest(BaseModel):
@@ -152,6 +169,7 @@ async def video_status(task_ids: str = Query(...), user=Depends(get_optional_use
 
             # Save locally so TikTok URL expiry doesn't lose us the video
             local_filename = None
+            thumb_filename = None
             if video_url:
                 try:
                     local_filename = f"ugc_{task_id or uuid.uuid4().hex[:8]}.mp4"
@@ -166,6 +184,14 @@ async def video_status(task_ids: str = Query(...), user=Depends(get_optional_use
                         else:
                             local_filename = None
                             logger.warning(f"[UGC] Download failed status={r.status_code}")
+
+                    # Generate thumbnail (ffmpeg) so the My Videos grid is not blank
+                    if local_filename:
+                        thumb_filename = local_filename.replace(".mp4", ".jpg")
+                        thumb_path = os.path.join(UGC_THUMBS_DIR, thumb_filename)
+                        if not os.path.exists(thumb_path):
+                            if not _generate_thumbnail(filepath, thumb_path):
+                                thumb_filename = None
                 except Exception as de:
                     logger.warning(f"[UGC] Download error: {de}")
                     local_filename = None
@@ -188,6 +214,7 @@ async def video_status(task_ids: str = Query(...), user=Depends(get_optional_use
                                 "video_url": video_url,
                                 "cover_url": cover_url,
                                 "local_filename": local_filename,
+                                "thumb_filename": thumb_filename,
                             },
                             result_url=result_url,
                         )
@@ -208,6 +235,16 @@ async def get_local_video(filename: str):
     if not os.path.isfile(filepath):
         raise HTTPException(status_code=404, detail="Video not found locally")
     return FileResponse(filepath, media_type="video/mp4")
+
+
+@router.get("/videos/thumb/{filename}")
+async def get_local_thumb(filename: str):
+    """Serve a locally-generated UGC thumbnail"""
+    safe_name = os.path.basename(filename)
+    filepath = os.path.join(UGC_THUMBS_DIR, safe_name)
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(filepath, media_type="image/jpeg")
 
 
 @router.get("/avatars/debug")

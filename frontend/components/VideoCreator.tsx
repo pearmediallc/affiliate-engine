@@ -1,14 +1,20 @@
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { API_BASE_URL, API_HOST } from '@/lib/api';
+
+const resolveUrl = (u: string) => {
+  if (!u) return '';
+  if (u.startsWith('http://') || u.startsWith('https://')) return u;
+  return `${API_HOST}${u.startsWith('/') ? '' : '/'}${u}`;
+};
 
 export default function VideoCreator() {
   const [mode, setMode] = useState<'text' | 'image'>('text');
   const [prompt, setPrompt] = useState('');
   const [aspectRatio, setAspectRatio] = useState('16:9');
-  const [resolution, setResolution] = useState('1080p');
-  const [duration, setDuration] = useState('6s');
+  const [resolution, setResolution] = useState('720p');
+  const [duration, setDuration] = useState('8s');
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [generating, setGenerating] = useState(false);
   const [status, setStatus] = useState('');
@@ -62,11 +68,9 @@ export default function VideoCreator() {
 
         if (data.done) {
           setStatus('Complete!');
-          if (data.download_url) {
-            setResultUrl(data.download_url);
-          } else if (data.download_filename) {
-            setResultUrl(`${API_HOST}/api/v1/video/download/${data.download_filename}`);
-          }
+          const url = data.download_url || (data.video_filename ? `/api/v1/video/download/${data.video_filename}` : '');
+          if (url) setResultUrl(resolveUrl(url));
+          reloadMyVideos();
           return;
         }
         if (data.error) {
@@ -81,6 +85,25 @@ export default function VideoCreator() {
       setGenerating(false);
     }
   };
+
+  // My Videos
+  const [myVideos, setMyVideos] = useState<any[]>([]);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+
+  const reloadMyVideos = async () => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/jobs/my?job_type=veo_video&limit=30`);
+      setMyVideos((res.data?.data?.jobs || []).filter((j: any) => j.status === 'completed' && j.result_url));
+    } catch {}
+  };
+  useEffect(() => { reloadMyVideos(); }, []);
+
+  // Enforce Veo 3.1 rule: 1080p/4k require 8s duration
+  useEffect(() => {
+    if ((resolution === '1080p' || resolution === '4k') && duration !== '8s') {
+      setDuration('8s');
+    }
+  }, [resolution]);
 
   const handleEnhance = async () => {
     if (!resultUrl) return;
@@ -184,13 +207,15 @@ export default function VideoCreator() {
                 <select value={resolution} onChange={e => setResolution(e.target.value)}
                   style={{ ...inputStyle, cursor: 'pointer', appearance: 'none' as const }}>
                   <option value="720p">720p</option>
-                  <option value="1080p">1080p</option>
+                  <option value="1080p">1080p (8s only)</option>
+                  <option value="4k">4K (8s only)</option>
                 </select>
               </div>
               <div>
                 <label style={labelStyle}>Duration</label>
                 <select value={duration} onChange={e => setDuration(e.target.value)}
-                  style={{ ...inputStyle, cursor: 'pointer', appearance: 'none' as const }}>
+                  disabled={resolution === '1080p' || resolution === '4k'}
+                  style={{ ...inputStyle, cursor: 'pointer', appearance: 'none' as const, opacity: (resolution === '1080p' || resolution === '4k') ? 0.6 : 1 }}>
                   <option value="4s">4 seconds</option>
                   <option value="6s">6 seconds</option>
                   <option value="8s">8 seconds</option>
@@ -313,6 +338,86 @@ export default function VideoCreator() {
               </a>
             </div>
           )}
+        </div>
+      )}
+
+      {/* My Videos */}
+      {myVideos.length > 0 && (
+        <div className="card" style={{ padding: '24px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+            <label style={{ ...labelStyle, fontSize: '15px', marginBottom: 0 }}>My Videos</label>
+            <button type="button" onClick={reloadMyVideos}
+              style={{ padding: '6px 12px', borderRadius: '8px', border: 'none', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', fontSize: '12px', cursor: 'pointer' }}>
+              Refresh
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '12px' }}>
+            {myVideos.map((j: any) => {
+              const videoUrl = resolveUrl(j.result_url || '');
+              const thumbName = j.result_data?.thumb_filename;
+              const thumbUrl = thumbName ? resolveUrl(`/api/v1/video/thumb/${thumbName}`) : '';
+              const isPlaying = playingId === j.id;
+              const isPortrait = j.input_data?.aspect_ratio === '9:16';
+              const aspect = isPortrait ? '9/16' : '16/9';
+              return (
+                <div key={j.id} className="card" style={{ padding: '10px' }}>
+                  <div style={{
+                    position: 'relative', width: '100%', aspectRatio: aspect,
+                    background: '#000', borderRadius: '8px', marginBottom: '8px',
+                    overflow: 'hidden', cursor: isPlaying ? 'default' : 'pointer',
+                  }}
+                  onClick={() => !isPlaying && videoUrl && setPlayingId(j.id)}>
+                    {isPlaying && videoUrl ? (
+                      <video src={videoUrl} controls autoPlay playsInline
+                        style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }} />
+                    ) : thumbUrl ? (
+                      <>
+                        <img src={thumbUrl} alt=""
+                          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                        <div style={{
+                          position: 'absolute', inset: 0, display: 'flex',
+                          alignItems: 'center', justifyContent: 'center',
+                          background: 'rgba(0,0,0,0.25)',
+                        }}>
+                          <div style={{
+                            width: '44px', height: '44px', borderRadius: '50%',
+                            background: 'rgba(255,255,255,0.95)',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          }}>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="#000"><path d="M8 5v14l11-7z"/></svg>
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div style={{
+                        width: '100%', height: '100%', display: 'flex',
+                        alignItems: 'center', justifyContent: 'center',
+                        background: 'linear-gradient(135deg, #0071e3 0%, #2997ff 100%)',
+                      }}>
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="rgba(255,255,255,0.9)"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    )}
+                  </div>
+                  <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.5)', margin: '0 0 8px 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {j.input_data?.prompt || 'Veo video'}
+                  </p>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    {!isPlaying && (
+                      <button type="button" onClick={() => setPlayingId(j.id)}
+                        style={{ flex: 1, padding: '6px', borderRadius: '6px', border: 'none', background: '#0071e3', color: '#fff', fontSize: '11px', fontWeight: 500, cursor: 'pointer' }}>
+                        Play
+                      </button>
+                    )}
+                    <a href={videoUrl} download target="_blank" rel="noopener noreferrer"
+                      style={{ flex: 1, textAlign: 'center', padding: '6px', borderRadius: '6px', background: 'rgba(255,255,255,0.08)', color: '#2997ff', fontSize: '11px', textDecoration: 'none', fontWeight: 500 }}>
+                      Download
+                    </a>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>

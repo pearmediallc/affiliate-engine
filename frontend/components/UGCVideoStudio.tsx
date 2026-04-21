@@ -25,6 +25,7 @@ interface Video {
   thumbnail_url?: string;
   video_url?: string;
   status?: string;
+  _local_thumb?: boolean;
 }
 
 function ScriptsTab({ onUseScript }: { onUseScript: (script: string) => void }) {
@@ -666,18 +667,27 @@ function VideosTab() {
 
       // Include job-queue videos (covers cases where TikTok list is slow/empty + provides local backups)
       const jobs = jobsRes.data?.data?.jobs || [];
+      const apiHost = API_BASE_URL.replace('/api/v1', '');
       const jobVideos: Video[] = jobs
         .filter((j: any) => j.status === 'completed' && (j.result_url || j.result_data?.video_url))
-        .map((j: any) => ({
-          video_id: j.id,
-          video_name: j.input_data?.video_name || 'UGC Video',
-          avatar_name: j.input_data?.avatar_id || '',
-          duration: 0,
-          created_at: j.created_at || '',
-          thumbnail_url: j.result_data?.cover_url || '',
-          video_url: j.result_url?.startsWith('/') ? `${API_BASE_URL.replace('/api/v1', '')}${j.result_url}` : (j.result_url || j.result_data?.video_url || ''),
-          status: 'SUCCESS',
-        }));
+        .map((j: any) => {
+          const thumbName = j.result_data?.thumb_filename;
+          // Prefer locally-generated thumbnail over TikTok cover (which is usually missing)
+          const thumb_url = thumbName
+            ? `${apiHost}/api/v1/tiktok/videos/thumb/${thumbName}`
+            : (j.result_data?.cover_url || '');
+          return {
+            video_id: j.id,
+            video_name: j.input_data?.video_name || 'UGC Video',
+            avatar_name: j.input_data?.avatar_id || '',
+            duration: 0,
+            created_at: j.created_at || '',
+            thumbnail_url: thumb_url,
+            video_url: j.result_url?.startsWith('/') ? `${apiHost}${j.result_url}` : (j.result_url || j.result_data?.video_url || ''),
+            status: 'SUCCESS',
+            _local_thumb: !!thumbName,
+          } as Video & { _local_thumb?: boolean };
+        });
 
       // Dedupe by video_url, prefer job-queue copies (local backups)
       const merged: Video[] = [];
@@ -745,7 +755,7 @@ function VideosTab() {
                   style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }} />
               ) : video.thumbnail_url ? (
                 <>
-                  <img src={`${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(video.thumbnail_url)}`} alt={video.video_name || 'Video'}
+                  <img src={video._local_thumb ? video.thumbnail_url : `${API_BASE_URL}/tiktok/proxy-image?url=${encodeURIComponent(video.thumbnail_url)}`} alt={video.video_name || 'Video'}
                     style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                     onError={(e) => {
                       const img = e.target as HTMLImageElement;
