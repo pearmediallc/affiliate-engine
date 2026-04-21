@@ -315,41 +315,92 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
     loadAvatars();
   }, [loadAvatars]);
 
+  // Sanitize script for TikTok Avatar API
+  const sanitizeScript = (text: string): string => {
+    return text
+      .replace(/[""]/g, '')       // Remove smart quotes
+      .replace(/['']/g, '')       // Remove smart apostrophes
+      .replace(/["']/g, '')       // Remove regular quotes
+      .replace(/[→←↑↓]/g, '')    // Remove arrows
+      .replace(/[\u{1F000}-\u{1FFFF}]/gu, '') // Remove emojis
+      .replace(/[^\x20-\x7E\n]/g, '') // Remove non-ASCII except newlines
+      .replace(/\n+/g, ' ')      // Replace newlines with spaces
+      .replace(/\s+/g, ' ')      // Collapse multiple spaces
+      .trim()
+      .substring(0, 2000);        // Max 2000 chars
+  };
+
   const handleCreate = async () => {
     if (!selectedAvatar || !script.trim()) return;
     setIsCreating(true);
     setError('');
     setVideoResult(null);
     try {
+      const cleanScript = sanitizeScript(script);
+      if (cleanScript.length < 10) {
+        setError('Script is too short after sanitization. Use plain text without emojis or special characters.');
+        setIsCreating(false);
+        return;
+      }
+
       const res = await axios.post(`${API_BASE_URL}/tiktok/videos/create`, {
         avatar_id: selectedAvatar,
-        script: script,
+        script: cleanScript,
         video_name: videoName || undefined,
       });
-      const taskIds = res.data.task_ids || res.data.data?.task_ids || [res.data.task_id || res.data.data?.task_id];
+      // TikTok returns task IDs as task_id_list in the data
+      const data = res.data.data || res.data;
+      const taskIds = data?.task_id_list || data?.task_ids || [data?.task_id].filter(Boolean);
+
+      console.log('Create video response:', JSON.stringify(data).substring(0, 500));
+      console.log('Task IDs:', taskIds);
 
       if (taskIds.length > 0 && taskIds[0]) {
+        setError('');
+        // Poll for completion — TikTok takes 2-5 minutes
+        let attempts = 0;
+        const maxAttempts = 60; // 5 minutes at 5s intervals
         const poll = setInterval(async () => {
+          attempts++;
           try {
             const statusRes = await axios.get(`${API_BASE_URL}/tiktok/videos/status?task_ids=${JSON.stringify(taskIds)}`);
-            const status = statusRes.data.status || statusRes.data.data?.status;
-            if (status === 'complete' || status === 'completed') {
+            const statusData = statusRes.data.data || statusRes.data;
+            console.log(`Poll attempt ${attempts}:`, JSON.stringify(statusData).substring(0, 300));
+
+            // TikTok uses task_list with status per task
+            const taskList = statusData?.task_list || statusData?.list || [];
+            const task = taskList[0] || statusData;
+            const status = (task?.status || statusData?.status || '').toUpperCase();
+
+            if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'COMPLETE') {
               clearInterval(poll);
-              setVideoResult(statusRes.data.video || statusRes.data.data?.video || statusRes.data);
+              const videoInfo = task?.video_info || task?.video || {};
+              setVideoResult({
+                video_url: videoInfo.video_url || videoInfo.url || '',
+                ...videoInfo,
+              });
               setIsCreating(false);
-            } else if (status === 'failed' || status === 'error') {
+            } else if (status === 'FAILED' || status === 'ERROR' || status === 'CANCELLED') {
               clearInterval(poll);
-              setError('Video creation failed.');
+              setError(`Video creation failed: ${task?.fail_reason || status}`);
+              setIsCreating(false);
+            } else if (attempts >= maxAttempts) {
+              clearInterval(poll);
+              setError('Video creation timed out. Check "My Videos" tab — it may still be processing on TikTok.');
               setIsCreating(false);
             }
-          } catch {
-            clearInterval(poll);
-            setError('Failed to check video status.');
-            setIsCreating(false);
+            // else: still PROCESSING, keep polling
+          } catch (pollErr) {
+            console.error('Poll error:', pollErr);
+            if (attempts >= 3) {
+              clearInterval(poll);
+              setError('Lost connection while checking status. The video may still be generating — check "My Videos" tab.');
+              setIsCreating(false);
+            }
           }
         }, 5000);
       } else {
-        setVideoResult(res.data.video || res.data.data?.video || res.data);
+        setVideoResult(data?.video || data);
         setIsCreating(false);
       }
     } catch (err: any) {
@@ -405,10 +456,15 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
       <div className="card" style={{ padding: '20px' }}>
         <p style={{ fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>Step 2: Script</p>
         <textarea value={script} onChange={e => setScript(e.target.value)}
-          placeholder="Enter or paste your script here..."
-          style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '14px', height: '120px', resize: 'none', outline: 'none' }}
+          placeholder="Write naturally as if someone is speaking to camera. Example: Hello everyone. I want to share something that could save you hundreds of dollars on your home insurance. Most people are overpaying because they never compare rates..."
+          style={{ width: '100%', padding: '12px', background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#e8e8ed', fontSize: '14px', height: '140px', resize: 'none', outline: 'none' }}
         />
-        <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginTop: '6px', textAlign: 'right' }}>{script.length}/2000</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px' }}>
+          <p style={{ fontSize: '11px', color: 'rgba(255,255,255,0.3)' }}>
+            Plain text only. No emojis, quotes, or special characters. ~500 chars = 30s video.
+          </p>
+          <p style={{ fontSize: '12px', color: script.length > 2000 ? '#ff6b6b' : 'rgba(255,255,255,0.4)' }}>{script.length}/2000</p>
+        </div>
         <div style={{ marginTop: '12px' }}>
           <p style={{ fontSize: '11px', fontWeight: 600, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>Video Name (Optional)</p>
           <input type="text" value={videoName} onChange={e => setVideoName(e.target.value)}
