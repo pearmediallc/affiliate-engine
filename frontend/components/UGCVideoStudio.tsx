@@ -379,16 +379,18 @@ function CreateVideoTab({ initialScript }: { initialScript: string }) {
 
       let taskIds: string[] = [];
 
-      // Try all known field names
-      if (innerData?.task_id_list && Array.isArray(innerData.task_id_list)) {
+      // TikTok returns: {"list": [{"task_id": "xxx"}]} — extract from list items
+      if (Array.isArray(innerData?.list)) {
+        taskIds = innerData.list.map((item: any) => item?.task_id).filter(Boolean);
+      }
+      // Also try other field names as fallback
+      if (taskIds.length === 0 && innerData?.task_id_list && Array.isArray(innerData.task_id_list)) {
         taskIds = innerData.task_id_list;
-      } else if (innerData?.task_ids && Array.isArray(innerData.task_ids)) {
-        taskIds = innerData.task_ids;
-      } else if (innerData?.task_id) {
+      }
+      if (taskIds.length === 0 && innerData?.task_id) {
         taskIds = [innerData.task_id];
-      } else if (topData?.task_id_list && Array.isArray(topData.task_id_list)) {
-        taskIds = topData.task_id_list;
-      } else if (topData?.task_id) {
+      }
+      if (taskIds.length === 0 && topData?.task_id) {
         taskIds = [topData.task_id];
       }
 
