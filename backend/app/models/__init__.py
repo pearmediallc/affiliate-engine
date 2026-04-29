@@ -6,10 +6,12 @@ from .feedback import GenerationFeedback
 from .user import User, Role, UsageLog
 from .learning import LearningRecord, VerticalKnowledge, AISuggestion, Asset
 from .job import Job
+from .audit_log import AuditLog
 
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",
     "User", "Role", "UsageLog",
     "LearningRecord", "VerticalKnowledge", "AISuggestion", "Asset",
     "Job",
+    "AuditLog",
 ]

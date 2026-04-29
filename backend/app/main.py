@@ -5,6 +5,7 @@ from .database import init_db
 from .routes import create_router
 from .services import VerticalTemplatesService
 from .database import SessionLocal
+from .middleware.audit import AuditLogMiddleware
 import logging
 
 # Configure logging
@@ -19,6 +20,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# Audit log middleware — must be added BEFORE CORS so it sees the response status
+app.add_middleware(AuditLogMiddleware)
 
 # Add CORS middleware
 app.add_middleware(
