@@ -10,7 +10,7 @@ function getImageSrc(url: string | null | undefined): string | null {
   return url;
 }
 
-type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning' | 'models' | 'generations';
+type SubTab = 'overview' | 'users' | 'feedback' | 'suggestions' | 'learning' | 'models' | 'generations' | 'audit';
 
 // ---------------------------------------------------------------------------
 // Shared styles
@@ -214,6 +214,11 @@ function UsersTab() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [rejecting, setRejecting] = useState<{ id: string; email: string } | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [actionMsg, setActionMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
 
   const fetchUsers = useCallback(() => {
     setLoading(true);
@@ -249,62 +254,340 @@ function UsersTab() {
     }
   };
 
+  const handleApprove = async (userId: string) => {
+    try {
+      const r = await axios.post(`${API_BASE_URL}/auth/users/${userId}/approve`);
+      const updated = r.data?.data;
+      setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, ...updated } : u)));
+      setActionMsg({ text: 'User approved', type: 'success' });
+    } catch (e) {
+      setActionMsg({ text: 'Approval failed', type: 'error' });
+    }
+  };
+
+  const handleReject = async () => {
+    if (!rejecting) return;
+    try {
+      const r = await axios.post(`${API_BASE_URL}/auth/users/${rejecting.id}/reject`, {
+        reason: rejectReason,
+      });
+      const updated = r.data?.data;
+      setUsers((prev) => prev.map((u) => (u.id === rejecting.id ? { ...u, ...updated } : u)));
+      setActionMsg({ text: `Rejected ${rejecting.email}`, type: 'success' });
+      setRejecting(null);
+      setRejectReason('');
+    } catch {
+      setActionMsg({ text: 'Rejection failed', type: 'error' });
+    }
+  };
+
+  const pendingUsers = users.filter((u) => (u.status || 'approved') === 'pending');
+  const filteredUsers = statusFilter === 'all'
+    ? users
+    : users.filter((u) => (u.status || 'approved') === statusFilter);
+
+  const statusBadgeColor = (status: string, isActive: boolean) => {
+    if (status === 'pending') return 'blue';
+    if (status === 'rejected') return 'red';
+    if (!isActive) return 'gray';
+    return 'green';
+  };
+  const statusLabel = (status: string, isActive: boolean) => {
+    if (status === 'pending') return 'Pending';
+    if (status === 'rejected') return 'Rejected';
+    if (!isActive) return 'Inactive';
+    return 'Active';
+  };
+
   if (loading) return <div style={styles.spinner}>Loading users...</div>;
 
   return (
-    <div style={styles.card}>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead>
-          <tr style={{ borderBottom: '1px solid rgba(0,0,0,0.08)' }}>
-            <th style={styles.th}>Email</th>
-            <th style={styles.th}>Name</th>
-            <th style={styles.th}>Role</th>
-            <th style={styles.th}>Status</th>
-            <th style={styles.th}>Last Login</th>
-            <th style={styles.th}>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {users.length === 0 && (
-            <tr>
-              <td colSpan={6} style={styles.empty}>No users found.</td>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {/* Action bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+        <button style={styles.btnPrimary} onClick={() => setShowCreate(true)}>+ Create User</button>
+        <select
+          style={styles.select}
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as 'all' | 'pending' | 'approved' | 'rejected')}
+        >
+          <option value="all">All ({users.length})</option>
+          <option value="pending">Pending ({pendingUsers.length})</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+        </select>
+        {actionMsg && (
+          <span style={{ fontSize: '13px', color: actionMsg.type === 'success' ? '#30d158' : '#ff6b6b' }}>
+            {actionMsg.text}
+          </span>
+        )}
+      </div>
+
+      {/* Pending highlight banner */}
+      {pendingUsers.length > 0 && statusFilter !== 'pending' && (
+        <div
+          style={{
+            padding: '12px 16px',
+            background: 'rgba(41,151,255,0.1)',
+            border: '1px solid rgba(41,151,255,0.25)',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            fontSize: '13px',
+            color: '#2997ff',
+          }}
+          onClick={() => setStatusFilter('pending')}
+        >
+          {pendingUsers.length} user{pendingUsers.length === 1 ? '' : 's'} awaiting your approval — click to review →
+        </div>
+      )}
+
+      {/* Users table */}
+      <div style={styles.card}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+              <th style={styles.th}>Email</th>
+              <th style={styles.th}>Name</th>
+              <th style={styles.th}>Role</th>
+              <th style={styles.th}>Status</th>
+              <th style={styles.th}>Last Login</th>
+              <th style={styles.th}>Actions</th>
             </tr>
-          )}
-          {users.map((u, idx) => (
-            <tr key={u.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: idx % 2 === 1 ? 'rgba(255,255,255,0.03)' : 'transparent' }}>
-              <td style={styles.td}>{u.email}</td>
-              <td style={styles.td}>{u.full_name || '--'}</td>
-              <td style={styles.td}>
-                <select
-                  style={styles.select}
-                  value={u.role}
-                  onChange={(e) => handleRoleChange(u.id, e.target.value)}
-                >
-                  <option value="user">user</option>
-                  <option value="admin">admin</option>
-                  <option value="editor">editor</option>
-                </select>
-              </td>
-              <td style={styles.td}>
-                <span style={styles.badge(u.is_active ? 'green' : 'red')}>
-                  {u.is_active ? 'Active' : 'Inactive'}
-                </span>
-              </td>
-              <td style={styles.td}>
-                {u.last_login ? new Date(u.last_login).toLocaleDateString() : '--'}
-              </td>
-              <td style={styles.td}>
-                <button
-                  style={u.is_active ? styles.btnDanger : styles.btnPrimary}
-                  onClick={() => handleDeactivate(u.id, u.is_active)}
-                >
-                  {u.is_active ? 'Deactivate' : 'Activate'}
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {filteredUsers.length === 0 && (
+              <tr><td colSpan={6} style={styles.empty}>No users to show.</td></tr>
+            )}
+            {filteredUsers.map((u, idx) => {
+              const status = u.status || 'approved';
+              const isPending = status === 'pending';
+              const isRejected = status === 'rejected';
+              return (
+                <tr key={u.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', background: idx % 2 === 1 ? 'rgba(255,255,255,0.03)' : 'transparent' }}>
+                  <td style={styles.td}>{u.email}</td>
+                  <td style={styles.td}>{u.full_name || '--'}</td>
+                  <td style={styles.td}>
+                    <select
+                      style={styles.select}
+                      value={u.role}
+                      disabled={isPending || isRejected}
+                      onChange={(e) => handleRoleChange(u.id, e.target.value)}
+                    >
+                      <option value="viewer">viewer</option>
+                      <option value="editor">editor</option>
+                      <option value="admin">admin</option>
+                    </select>
+                  </td>
+                  <td style={styles.td}>
+                    <span style={styles.badge(statusBadgeColor(status, u.is_active))}>
+                      {statusLabel(status, u.is_active)}
+                    </span>
+                    {isRejected && u.rejection_reason && (
+                      <p style={{ fontSize: '11px', color: 'rgba(255,255,255,0.45)', margin: '4px 0 0' }}>
+                        {u.rejection_reason}
+                      </p>
+                    )}
+                  </td>
+                  <td style={styles.td}>
+                    {u.last_login ? new Date(u.last_login).toLocaleDateString() : '--'}
+                  </td>
+                  <td style={styles.td}>
+                    {isPending ? (
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button style={styles.btnPrimary} onClick={() => handleApprove(u.id)}>Approve</button>
+                        <button style={styles.btnDanger} onClick={() => { setRejecting({ id: u.id, email: u.email }); setRejectReason(''); }}>Reject</button>
+                      </div>
+                    ) : isRejected ? (
+                      <button style={styles.btnPrimary} onClick={() => handleApprove(u.id)}>Approve</button>
+                    ) : (
+                      <button
+                        style={u.is_active ? styles.btnDanger : styles.btnPrimary}
+                        onClick={() => handleDeactivate(u.id, u.is_active)}
+                      >
+                        {u.is_active ? 'Deactivate' : 'Activate'}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} onCreated={(u) => { setUsers((prev) => [u, ...prev]); setShowCreate(false); setActionMsg({ text: `Created ${u.email}`, type: 'success' }); }} />}
+      {rejecting && (
+        <RejectModal
+          email={rejecting.email}
+          reason={rejectReason}
+          setReason={setRejectReason}
+          onCancel={() => { setRejecting(null); setRejectReason(''); }}
+          onConfirm={handleReject}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Create-user modal
+// ---------------------------------------------------------------------------
+
+function CreateUserModal({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onCreated: (user: any) => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [role, setRole] = useState('viewer');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const r = await axios.post(`${API_BASE_URL}/auth/users`, {
+        email, password, full_name: fullName || undefined, role,
+      });
+      onCreated(r.data?.data);
+    } catch (err) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const e = err as any;
+      setError(e?.response?.data?.detail || 'Failed to create user');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '10px 14px',
+    background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: '8px', color: '#e8e8ed', fontSize: '14px', outline: 'none',
+  };
+  const labelStyle: React.CSSProperties = {
+    display: 'block', fontSize: '12px', fontWeight: 600,
+    color: 'rgba(255,255,255,0.6)', marginBottom: '6px',
+    textTransform: 'uppercase', letterSpacing: '0.4px',
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1000, padding: '24px',
+    }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: 'rgba(25, 25, 28, 0.98)', backdropFilter: 'blur(24px)',
+          borderRadius: '14px', border: '1px solid rgba(255,255,255,0.1)',
+          padding: '28px', maxWidth: '420px', width: '100%',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ fontSize: '20px', fontWeight: 600, color: '#fff', margin: '0 0 6px' }}>Create User</h3>
+        <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', margin: '0 0 20px' }}>
+          Admin-created users are auto-approved and can sign in immediately.
+        </p>
+
+        {error && (
+          <div style={{ padding: '10px 14px', marginBottom: '16px', background: 'rgba(255,59,48,0.12)', borderLeft: '3px solid #ff3b30', borderRadius: '6px' }}>
+            <p style={{ fontSize: '13px', color: '#ff6b6b', margin: 0 }}>{error}</p>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: '14px' }}>
+            <label style={labelStyle}>Email</label>
+            <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} style={inputStyle} placeholder="user@example.com" />
+          </div>
+          <div style={{ marginBottom: '14px' }}>
+            <label style={labelStyle}>Password</label>
+            <input type="password" required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} style={inputStyle} placeholder="At least 8 characters" />
+          </div>
+          <div style={{ marginBottom: '14px' }}>
+            <label style={labelStyle}>Full Name (optional)</label>
+            <input type="text" value={fullName} onChange={(e) => setFullName(e.target.value)} style={inputStyle} />
+          </div>
+          <div style={{ marginBottom: '20px' }}>
+            <label style={labelStyle}>Role</label>
+            <select value={role} onChange={(e) => setRole(e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+              <option value="viewer">viewer</option>
+              <option value="editor">editor</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <button type="button" onClick={onClose} style={styles.btnSecondary}>Cancel</button>
+            <button type="submit" disabled={submitting || !email || !password} style={{ ...styles.btnPrimary, opacity: submitting || !email || !password ? 0.6 : 1 }}>
+              {submitting ? 'Creating...' : 'Create User'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reject-user modal
+// ---------------------------------------------------------------------------
+
+function RejectModal({
+  email, reason, setReason, onCancel, onConfirm,
+}: {
+  email: string;
+  reason: string;
+  setReason: (v: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 1000, padding: '24px',
+      }}
+      onClick={onCancel}
+    >
+      <div
+        style={{
+          background: 'rgba(25,25,28,0.98)', backdropFilter: 'blur(24px)',
+          borderRadius: '14px', border: '1px solid rgba(255,255,255,0.1)',
+          padding: '28px', maxWidth: '420px', width: '100%',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ fontSize: '20px', fontWeight: 600, color: '#fff', margin: '0 0 6px' }}>Reject Registration</h3>
+        <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', margin: '0 0 20px' }}>
+          Reason will be shown to <strong style={{ color: '#fff' }}>{email}</strong> on their next login attempt.
+        </p>
+        <textarea
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          rows={3}
+          placeholder="e.g. Email domain not on allowlist; please use your work email."
+          style={{
+            width: '100%', padding: '10px 14px',
+            background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: '8px', color: '#e8e8ed', fontSize: '14px',
+            outline: 'none', resize: 'vertical', marginBottom: '16px',
+          }}
+        />
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={styles.btnSecondary}>Cancel</button>
+          <button onClick={onConfirm} style={styles.btnDanger}>Reject User</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1018,11 +1301,12 @@ export default function AdminPanel() {
     { id: 'learning', label: 'Learning' },
     { id: 'models', label: 'Models' },
     { id: 'generations', label: 'Generations' },
+    { id: 'audit', label: 'Audit Log' },
   ];
 
   return (
     <div style={styles.page}>
-      <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+      <div style={{ maxWidth: '1400px', margin: '0 auto' }}>
         <h1 style={{ ...styles.heading, marginBottom: '24px' }}>Admin Dashboard</h1>
 
         <div style={styles.tabBar}>
@@ -1040,6 +1324,322 @@ export default function AdminPanel() {
         {activeTab === 'learning' && <LearningTab />}
         {activeTab === 'models' && <ModelsTab />}
         {activeTab === 'generations' && <GenerationsTab />}
+        {activeTab === 'audit' && <AuditLogTab />}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Audit Log Tab — full timeline of every recorded action
+// ---------------------------------------------------------------------------
+
+const AUDIT_ACTION_LABELS: Record<string, { label: string; color: string }> = {
+  login_success:          { label: 'Login',           color: 'green' },
+  login_failed:           { label: 'Login failed',    color: 'red' },
+  logout:                 { label: 'Logout',          color: 'gray' },
+  register:               { label: 'Registered',      color: 'blue' },
+  user_approved:          { label: 'User approved',   color: 'green' },
+  user_rejected:          { label: 'User rejected',   color: 'red' },
+  user_created_by_admin:  { label: 'Admin created',   color: 'blue' },
+  user_deactivated:       { label: 'Deactivated',     color: 'red' },
+  user_reactivated:       { label: 'Reactivated',     color: 'green' },
+  role_changed:           { label: 'Role changed',    color: 'blue' },
+  api_request:            { label: 'API call',        color: 'gray' },
+  page_view:              { label: 'Page view',       color: 'gray' },
+  generation_started:     { label: 'Gen started',     color: 'blue' },
+  generation_completed:   { label: 'Gen completed',   color: 'green' },
+  generation_failed:      { label: 'Gen failed',      color: 'red' },
+  download:               { label: 'Download',        color: 'gray' },
+  feedback_given:         { label: 'Feedback',        color: 'blue' },
+};
+
+const AUDIT_CATEGORIES = ['auth', 'admin', 'navigation', 'generation', 'jobs', 'api'];
+
+interface AuditEntry {
+  id: string;
+  timestamp: string;
+  user_id: string | null;
+  user_email: string | null;
+  role: string | null;
+  action: string;
+  category: string | null;
+  resource_type: string | null;
+  resource_id: string | null;
+  screen: string | null;
+  method: string | null;
+  path: string | null;
+  status_code: number | null;
+  duration_ms: number | null;
+  ip: string | null;
+  user_agent: string | null;
+  metadata: Record<string, unknown> | null;
+}
+
+function AuditLogTab() {
+  const [entries, setEntries] = useState<AuditEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [summary, setSummary] = useState<any>(null);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [filters, setFilters] = useState({
+    user_email: '', action: '', category: '',
+    method: '', status_code: '', search: '',
+    since_hours: '24',
+  });
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const fetchAudit = useCallback(() => {
+    setLoading(true);
+    const params: Record<string, string | number> = { page, page_size: 100 };
+    if (filters.user_email) params.user_email = filters.user_email;
+    if (filters.action) params.action = filters.action;
+    if (filters.category) params.category = filters.category;
+    if (filters.method) params.method = filters.method;
+    if (filters.status_code) params.status_code = filters.status_code;
+    if (filters.search) params.search = filters.search;
+    if (filters.since_hours) params.since_hours = filters.since_hours;
+
+    axios.get(`${API_BASE_URL}/admin/audit-log`, { params })
+      .then((r) => {
+        const d = r.data?.data ?? {};
+        setEntries(d.entries || []);
+        setTotalPages(d.total_pages || 1);
+        setTotal(d.total || 0);
+      })
+      .catch(() => setEntries([]))
+      .finally(() => setLoading(false));
+  }, [page, filters]);
+
+  const fetchSummary = useCallback(() => {
+    const since = filters.since_hours || '24';
+    axios.get(`${API_BASE_URL}/admin/audit-log/summary`, { params: { since_hours: since } })
+      .then((r) => setSummary(r.data?.data))
+      .catch(() => setSummary(null));
+  }, [filters.since_hours]);
+
+  useEffect(() => { fetchAudit(); }, [fetchAudit]);
+  useEffect(() => { fetchSummary(); }, [fetchSummary]);
+
+  // Live tail — re-fetch every 5s while autoRefresh is on
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const iv = setInterval(() => { fetchAudit(); fetchSummary(); }, 5000);
+    return () => clearInterval(iv);
+  }, [autoRefresh, fetchAudit, fetchSummary]);
+
+  const updateFilter = (key: string, value: string) => {
+    setFilters((prev) => ({ ...prev, [key]: value }));
+    setPage(1);
+  };
+  const clearFilters = () => {
+    setFilters({ user_email: '', action: '', category: '', method: '', status_code: '', search: '', since_hours: '24' });
+    setPage(1);
+  };
+
+  const fmtAge = (iso: string) => {
+    const ms = Date.now() - new Date(iso).getTime();
+    if (ms < 60_000) return `${Math.floor(ms / 1000)}s ago`;
+    if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+    if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+    return new Date(iso).toLocaleString();
+  };
+
+  const inputStyle: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.06)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    borderRadius: '6px',
+    padding: '6px 10px',
+    fontSize: '13px',
+    color: '#e8e8ed',
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {/* Summary cards */}
+      {summary && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px' }}>
+          <div style={styles.card}>
+            <p style={styles.statLabel}>Events ({summary.since_hours}h)</p>
+            <p style={styles.statValue}>{summary.total_events ?? 0}</p>
+          </div>
+          <div style={styles.card}>
+            <p style={styles.statLabel}>Failed Logins ({summary.since_hours}h)</p>
+            <p style={{ ...styles.statValue, color: (summary.failed_logins ?? 0) > 0 ? '#ff6b6b' : '#fff' }}>
+              {summary.failed_logins ?? 0}
+            </p>
+          </div>
+          {summary.by_user?.[0] && (
+            <div style={styles.card}>
+              <p style={styles.statLabel}>Most Active User</p>
+              <p style={{ ...styles.statValue, fontSize: '14px' }}>{summary.by_user[0].user_email}</p>
+              <p style={{ ...styles.statLabel, marginTop: '4px' }}>{summary.by_user[0].count} events</p>
+            </div>
+          )}
+          {summary.by_action?.[0] && (
+            <div style={styles.card}>
+              <p style={styles.statLabel}>Top Action</p>
+              <p style={{ ...styles.statValue, fontSize: '14px' }}>
+                {AUDIT_ACTION_LABELS[summary.by_action[0].action]?.label || summary.by_action[0].action}
+              </p>
+              <p style={{ ...styles.statLabel, marginTop: '4px' }}>{summary.by_action[0].count}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+        <input
+          placeholder="Search path, screen, email..."
+          value={filters.search}
+          onChange={(e) => updateFilter('search', e.target.value)}
+          style={{ ...inputStyle, width: '220px' }}
+        />
+        <input
+          placeholder="user@email"
+          value={filters.user_email}
+          onChange={(e) => updateFilter('user_email', e.target.value)}
+          style={{ ...inputStyle, width: '180px' }}
+        />
+        <select value={filters.action} onChange={(e) => updateFilter('action', e.target.value)} style={styles.select}>
+          <option value="">All actions</option>
+          {Object.keys(AUDIT_ACTION_LABELS).map((a) => (
+            <option key={a} value={a}>{AUDIT_ACTION_LABELS[a].label}</option>
+          ))}
+        </select>
+        <select value={filters.category} onChange={(e) => updateFilter('category', e.target.value)} style={styles.select}>
+          <option value="">All categories</option>
+          {AUDIT_CATEGORIES.map((c) => (<option key={c} value={c}>{c}</option>))}
+        </select>
+        <select value={filters.method} onChange={(e) => updateFilter('method', e.target.value)} style={styles.select}>
+          <option value="">All methods</option>
+          {['GET', 'POST', 'PUT', 'DELETE'].map((m) => (<option key={m} value={m}>{m}</option>))}
+        </select>
+        <select value={filters.since_hours} onChange={(e) => updateFilter('since_hours', e.target.value)} style={styles.select}>
+          <option value="1">Last 1h</option>
+          <option value="24">Last 24h</option>
+          <option value="168">Last 7d</option>
+          <option value="720">Last 30d</option>
+        </select>
+        <button style={styles.btnSecondary} onClick={clearFilters}>Clear</button>
+        <button
+          style={autoRefresh ? styles.btnPrimary : styles.btnSecondary}
+          onClick={() => setAutoRefresh((v) => !v)}
+        >
+          {autoRefresh ? 'Live ●' : 'Live ○'}
+        </button>
+        <button style={styles.btnSecondary} onClick={() => { fetchAudit(); fetchSummary(); }}>
+          Refresh
+        </button>
+        <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.45)', marginLeft: 'auto' }}>
+          {total.toLocaleString()} total
+        </span>
+      </div>
+
+      {/* Table */}
+      <div style={styles.card}>
+        {loading ? (
+          <div style={styles.spinner}>Loading audit log...</div>
+        ) : entries.length === 0 ? (
+          <div style={styles.empty}>No audit events match these filters.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                  <th style={styles.th}>When</th>
+                  <th style={styles.th}>User</th>
+                  <th style={styles.th}>Action</th>
+                  <th style={styles.th}>Screen / Path</th>
+                  <th style={styles.th}>Method</th>
+                  <th style={styles.th}>Status</th>
+                  <th style={styles.th}>Duration</th>
+                  <th style={styles.th}>IP</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((e, idx) => {
+                  const meta = AUDIT_ACTION_LABELS[e.action] || { label: e.action, color: 'gray' };
+                  const isExpanded = expanded === e.id;
+                  const statusBad = (e.status_code ?? 0) >= 400;
+                  return (
+                    <>
+                      <tr
+                        key={e.id}
+                        onClick={() => setExpanded(isExpanded ? null : e.id)}
+                        style={{
+                          borderBottom: '1px solid rgba(255,255,255,0.06)',
+                          background: idx % 2 === 1 ? 'rgba(255,255,255,0.03)' : 'transparent',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <td style={{ ...styles.td, whiteSpace: 'nowrap', fontSize: '12px', color: 'rgba(255,255,255,0.6)' }}>
+                          {fmtAge(e.timestamp)}
+                        </td>
+                        <td style={{ ...styles.td, fontSize: '12px' }}>
+                          {e.user_email || <span style={{ color: 'rgba(255,255,255,0.35)' }}>anonymous</span>}
+                          {e.role && (
+                            <span style={{ ...styles.badge('gray'), marginLeft: '6px', fontSize: '10px' }}>{e.role}</span>
+                          )}
+                        </td>
+                        <td style={styles.td}>
+                          <span style={styles.badge(meta.color)}>{meta.label}</span>
+                        </td>
+                        <td style={{ ...styles.td, fontSize: '12px', maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          <span style={{ color: '#2997ff' }}>{e.screen || ''}</span>
+                          {e.screen && e.path && ' · '}
+                          <span style={{ color: 'rgba(255,255,255,0.5)' }}>{e.path}</span>
+                        </td>
+                        <td style={{ ...styles.td, fontSize: '11px', color: 'rgba(255,255,255,0.5)' }}>{e.method || '--'}</td>
+                        <td style={styles.td}>
+                          {e.status_code ? (
+                            <span style={{ ...styles.badge(statusBad ? 'red' : 'green'), fontSize: '11px' }}>{e.status_code}</span>
+                          ) : '--'}
+                        </td>
+                        <td style={{ ...styles.td, fontSize: '11px', color: 'rgba(255,255,255,0.5)' }}>
+                          {e.duration_ms != null ? `${e.duration_ms}ms` : '--'}
+                        </td>
+                        <td style={{ ...styles.td, fontSize: '11px', color: 'rgba(255,255,255,0.45)', fontFamily: 'monospace' }}>
+                          {e.ip || '--'}
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr style={{ background: 'rgba(0,0,0,0.25)' }}>
+                          <td colSpan={8} style={{ padding: '12px 16px' }}>
+                            <pre style={{
+                              margin: 0, fontSize: '11px', color: 'rgba(255,255,255,0.7)',
+                              fontFamily: 'ui-monospace, monospace', whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                            }}>{JSON.stringify({
+                              id: e.id,
+                              timestamp: e.timestamp,
+                              category: e.category,
+                              resource: e.resource_type ? { type: e.resource_type, id: e.resource_id } : undefined,
+                              user_agent: e.user_agent,
+                              metadata: e.metadata,
+                            }, null, 2)}</pre>
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {totalPages > 1 && (
+          <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginTop: '16px' }}>
+            <button style={styles.btnSecondary} disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Previous</button>
+            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.48)', lineHeight: '32px' }}>Page {page} of {totalPages}</span>
+            <button style={styles.btnSecondary} disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>Next</button>
+          </div>
+        )}
       </div>
     </div>
   );

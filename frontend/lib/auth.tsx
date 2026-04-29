@@ -25,7 +25,12 @@ interface AuthContextType {
   token: string | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, fullName?: string) => Promise<void>;
+  /**
+   * Register a user. Returns a result object:
+   *   { approval_required: false } → user is logged in, redirect to app
+   *   { approval_required: true }  → registration is pending admin approval; show banner.
+   */
+  register: (email: string, password: string, fullName?: string) => Promise<{ approval_required: boolean; status: string }>;
   logout: () => void;
   hasPermission: (feature: string) => boolean;
 }
@@ -90,14 +95,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const res = await axios.post(`${API_URL}/auth/register`, {
       email, password, full_name: fullName
     });
-    if (res.data.success) {
-      const { user: userData, access_token } = res.data.data;
-      setUser(userData);
-      setToken(access_token);
-      localStorage.setItem('auth_token', access_token);
-    } else {
+    if (!res.data.success) {
       throw new Error(res.data.message || 'Registration failed');
     }
+    const data = res.data.data || {};
+    // First user (auto-approved) gets a token immediately.
+    if (data.access_token) {
+      setUser(data.user);
+      setToken(data.access_token);
+      localStorage.setItem('auth_token', data.access_token);
+      return { approval_required: false, status: data.status || 'approved' };
+    }
+    // Otherwise the user is pending admin approval — caller should show banner.
+    return { approval_required: true, status: data.status || 'pending' };
   };
 
   const logout = () => {

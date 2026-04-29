@@ -9,16 +9,25 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
   const [loading, setLoading] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setInfo('');
     setLoading(true);
     try {
       if (isRegister) {
-        await register(email, password, fullName || undefined);
+        const result = await register(email, password, fullName || undefined);
+        if (result.approval_required) {
+          // Don't navigate — show success message and switch to sign-in mode.
+          setInfo("Thanks for registering! Your account is pending admin approval. You'll be able to sign in once an admin approves it.");
+          setIsRegister(false);
+          setPassword('');
+          setFullName('');
+        }
       } else {
         await login(email, password);
       }
@@ -95,6 +104,16 @@ export default function LoginPage() {
               borderLeft: '3px solid #ff3b30', borderRadius: '8px',
             }}>
               <p style={{ fontSize: '14px', color: '#ff6b6b', margin: 0 }}>{error}</p>
+            </div>
+          )}
+
+          {info && (
+            <div style={{
+              padding: '12px 16px', marginBottom: '20px',
+              background: 'rgba(48, 209, 88, 0.12)',
+              borderLeft: '3px solid #30d158', borderRadius: '8px',
+            }}>
+              <p style={{ fontSize: '14px', color: '#30d158', margin: 0 }}>{info}</p>
             </div>
           )}
 
