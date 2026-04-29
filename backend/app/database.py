@@ -28,5 +28,12 @@ def get_db():
 
 
 def init_db():
-    """Initialize database - creates all tables"""
+    """Initialize database - creates all tables, then runs additive migrations."""
     Base.metadata.create_all(bind=engine)
+    # Apply additive column migrations (User.status, etc.) so existing DBs upgrade in place.
+    try:
+        from .migrations import run_migrations
+        run_migrations()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Schema migrations failed: {e}", exc_info=True)

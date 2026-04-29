@@ -2,6 +2,7 @@
 import logging
 from typing import Optional
 from ..config import settings
+from .pricing import Pricing
 import uuid
 import base64
 import requests
@@ -129,6 +130,9 @@ class SpeechGeneratorService:
 
         logger.info(f"Speech generated successfully with OpenAI TTS ({len(audio_data)} bytes)")
 
+        char_count = len(text or "")
+        cost_usd = Pricing.tts(char_count, "tts-1-hd")
+
         return {
             "audio_base64": audio_base64,
             "audio_data": audio_data,
@@ -139,6 +143,8 @@ class SpeechGeneratorService:
             "format": "mp3",
             "model": "tts-1-hd",
             "provider": "openai",
+            "char_count": char_count,
+            "cost_usd": cost_usd,
         }
 
     def _generate_with_google_tts(self, text: str, voice: str, language: str, output_format: str) -> dict:
@@ -183,6 +189,10 @@ class SpeechGeneratorService:
 
         logger.info(f"Speech generated successfully with Google Cloud TTS ({len(audio_data)} bytes)")
 
+        char_count = len(text or "")
+        # Neural2 voices are billed at the WaveNet/Neural rate ($16 / 1M chars)
+        cost_usd = Pricing.tts(char_count, "google-neural")
+
         return {
             "audio_base64": audio_base64,
             "audio_data": audio_data,
@@ -193,6 +203,8 @@ class SpeechGeneratorService:
             "format": "mp3",
             "model": "google-cloud-tts",
             "provider": "google-cloud",
+            "char_count": char_count,
+            "cost_usd": cost_usd,
         }
 
     def get_available_voices(self) -> dict:

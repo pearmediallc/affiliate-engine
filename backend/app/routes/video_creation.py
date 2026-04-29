@@ -11,6 +11,7 @@ from ..services.video_creator import VideoCreatorService, VIDEOS_DIR
 from ..services.job_service import JobService
 from ..services.script_parser import parse_script, normalize_for_veo
 from ..services.long_video_service import LongVideoService, LONG_VIDEOS_DIR, LONG_STITCHED_DIR
+from ..services.pricing import Pricing
 from ..middleware.auth import get_current_user
 from ..models.job import Job
 from ..database import SessionLocal
@@ -24,6 +25,9 @@ router = APIRouter()
 
 VEO_THUMBS_DIR = os.path.join(VIDEOS_DIR, "thumbs")
 os.makedirs(VEO_THUMBS_DIR, exist_ok=True)
+
+# Job types this router persists for the user. /status accepts any of these.
+VEO_JOB_TYPES = ("veo_video", "image_to_video")
 
 
 def _veo_thumb(video_path: str, thumb_path: str) -> bool:
@@ -75,9 +79,11 @@ async def generate_video(
             resolution=resolution,
             duration=str(dur_int),
         )
+        # Real cost reported by service; fallback to pricing module if missing
+        cost = float(result.get("cost_usd") or Pricing.veo_video(dur_int))
         if user:
-            log_usage("video_creation", user.id, db, cost_usd=0.10)
-            # Persist Veo job so user can track + retrieve later
+            log_usage("video_creation", user.id, db, cost_usd=cost,
+                      metadata={"model": "veo-3.1-generate-preview", "duration_seconds": dur_int})
             try:
                 JobService.create_job(
                     db=db, user_id=user.id, job_type="veo_video",
@@ -88,7 +94,7 @@ async def generate_video(
                         "resolution": resolution,
                         "duration": dur_int,
                     },
-                    cost_usd=0.10,
+                    cost_usd=cost,
                 )
             except Exception as je:
                 logger.warning(f"Veo job record failed: {je}")
@@ -104,11 +110,17 @@ async def generate_from_image(
     image: UploadFile = File(...),
     prompt: str = Form(default=""),
     aspect_ratio: str = Form(default="16:9"),
+    duration: str = Form(default="8"),
     user=Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    """Generate a video using an uploaded image as the starting frame"""
+    """Generate a video using an uploaded image as the starting frame."""
     try:
+        try:
+            dur_int = int(str(duration).rstrip("s").strip())
+        except Exception:
+            dur_int = 8
+
         suffix = f".{image.filename.split('.')[-1]}" if image.filename else ".png"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await image.read()
@@ -120,9 +132,28 @@ async def generate_from_image(
                 image_path=tmp_path,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
+                duration=dur_int,
             )
+            cost = float(result.get("cost_usd") or Pricing.veo_video(dur_int))
             if user:
-                log_usage("video_creation", user.id, db, cost_usd=0.10)
+                log_usage("video_creation", user.id, db, cost_usd=cost,
+                          metadata={"model": "veo-3.1-generate-preview",
+                                    "duration_seconds": dur_int, "type": "image_to_video"})
+                try:
+                    # Persist I2V job so it shows up in My Videos / analytics like text-to-video does
+                    JobService.create_job(
+                        db=db, user_id=user.id, job_type="image_to_video",
+                        provider="google", provider_job_id=result.get("operation_name", ""),
+                        input_data={
+                            "prompt": (prompt or "")[:500],
+                            "aspect_ratio": aspect_ratio,
+                            "duration": dur_int,
+                            "source": "uploaded_image",
+                        },
+                        cost_usd=cost,
+                    )
+                except Exception as je:
+                    logger.warning(f"I2V job record failed: {je}")
 
             return APIResponse(success=True, message="Image-to-video generation started", data=result)
         finally:
@@ -142,7 +173,7 @@ async def video_status(
     user=Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    """Check the status of a video generation operation"""
+    """Check the status of a video generation operation (text-to-video OR image-to-video)."""
     try:
         result = VideoCreatorService.check_status(operation_name)
 
@@ -162,7 +193,7 @@ async def video_status(
                     job = db.query(Job).filter(
                         Job.user_id == user.id,
                         Job.provider_job_id == operation_name,
-                        Job.job_type == "veo_video",
+                        Job.job_type.in_(VEO_JOB_TYPES),
                     ).first()
                     if job and job.status != "completed":
                         JobService.complete_job(
@@ -170,6 +201,7 @@ async def video_status(
                             result_data={
                                 "video_filename": filename,
                                 "thumb_filename": result.get("thumb_filename"),
+                                "job_type": job.job_type,
                             },
                             result_url=f"/api/v1/video/download/{filename}",
                         )
@@ -203,44 +235,70 @@ async def veo_thumb(filename: str):
 
 # ---- Long Video (chained Veo + optional stitch) ----
 
-class LongVideoRequest(BaseModel):
-    script: str
-    aspect_ratio: str = "16:9"
-    target_segments: int = 8       # max Veo 3.1 can do = 21 (1 base + 20 ext)
-    auto_stitch: bool = False
-    budget_usd: float = 3.5
-
-
 @router.post("/long/create")
 async def long_video_create(
-    request: LongVideoRequest,
+    script: str = Form(...),
+    aspect_ratio: str = Form("16:9"),
+    target_segments: int = Form(8),
+    auto_stitch: bool = Form(False),
+    budget_usd: float = Form(20.0),
+    base_image: Optional[UploadFile] = File(None),
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Start a long-video job. Parses script, kicks off base clip, returns job_id."""
+    """
+    Start a long-video job. Parses script, kicks off base clip, returns job_id.
+
+    If `base_image` is uploaded, the FIRST segment is generated via Veo
+    image-to-video (animating that image). Extensions are still text-only,
+    matching Veo's API constraints.
+    """
     try:
         # Parse user's raw script
-        raw_segments = parse_script(request.script, target_segments=request.target_segments)
+        raw_segments = parse_script(script, target_segments=target_segments)
         if not raw_segments:
             raise HTTPException(status_code=400, detail="Could not parse script - please provide at least one line of description")
 
-        # Cap by target_segments AND by budget
-        budget_max = LongVideoService.max_segments_for_budget(request.budget_usd)
-        effective_max = min(request.target_segments, budget_max, 21)  # 21 = Veo's hard ceiling
+        # Cap by target_segments AND by budget (using REAL Veo pricing, not stale constants)
+        budget_max = LongVideoService.max_segments_for_budget(budget_usd)
+        effective_max = min(target_segments, budget_max, 21)  # 21 = Veo's hard ceiling
         if effective_max < 1:
-            raise HTTPException(status_code=400, detail="Budget too low to generate even one clip")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Budget too low. At current Veo 3.1 pricing one base clip costs "
+                       f"${LongVideoService.COST_PER_BASE_CLIP:.2f}.",
+            )
+
+        # If user uploaded a base image, save it temp-side and pass path through
+        base_image_path = None
+        if base_image is not None:
+            suffix = f".{base_image.filename.split('.')[-1]}" if base_image.filename else ".png"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                content = await base_image.read()
+                tmp.write(content)
+                base_image_path = tmp.name
 
         plan = normalize_for_veo(raw_segments, max_segments=effective_max)
         job = LongVideoService.start_job(
             db=db, user_id=user.id,
             segments_plan=plan,
-            aspect_ratio=request.aspect_ratio,
-            auto_stitch=request.auto_stitch,
-            budget_usd=request.budget_usd,
-            raw_script=request.script,
+            aspect_ratio=aspect_ratio,
+            auto_stitch=auto_stitch,
+            budget_usd=budget_usd,
+            raw_script=script,
+            base_image_path=base_image_path,
         )
 
-        log_usage("long_video", user.id, db, cost_usd=0.40)
+        log_usage("long_video", user.id, db,
+                  cost_usd=LongVideoService.COST_PER_BASE_CLIP,
+                  metadata={"segments": len(plan), "with_image": bool(base_image_path)})
+
+        # Don't leak temp path back to frontend
+        if base_image_path:
+            try:
+                os.unlink(base_image_path)
+            except Exception:
+                pass
 
         return APIResponse(
             success=True,
@@ -250,7 +308,8 @@ async def long_video_create(
                 "segment_count": len(plan),
                 "estimated_cost_usd": round(LongVideoService.estimate_cost(len(plan)), 2),
                 "estimated_length_seconds": 8 + (len(plan) - 1) * 7,
-                "auto_stitch": request.auto_stitch,
+                "auto_stitch": auto_stitch,
+                "with_base_image": bool(base_image_path),
                 "raw_segment_count_detected": len(raw_segments),
                 "truncated": len(raw_segments) > effective_max,
             },

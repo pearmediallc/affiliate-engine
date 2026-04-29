@@ -6,6 +6,7 @@ import os
 from typing import Optional
 from ..config import settings
 from ..models import Image
+from .pricing import Pricing
 from sqlalchemy.orm import Session
 import requests
 import io
@@ -80,6 +81,15 @@ class ImageGeneratorService:
             else:
                 actual_provider = self.provider
 
+            # Real cost: prefer cost reported by provider helper, else look up in pricing table
+            real_cost = image_data.get("cost_usd")
+            if real_cost is None:
+                real_cost = Pricing.image(
+                    model=model_name,
+                    size=image_data.get("size", "1024x1024"),
+                    quality=image_data.get("quality", "standard"),
+                )
+
             # Create image record
             image = Image(
                 id=image_id,
@@ -93,7 +103,7 @@ class ImageGeneratorService:
                 generation_provider=actual_provider,
                 generation_model=image_data.get("model"),
                 seed=image_data.get("seed"),
-                cost_usd=self.cost_per_image,
+                cost_usd=float(real_cost),
             )
 
             if db:
@@ -225,6 +235,9 @@ class ImageGeneratorService:
                             "path": filepath,
                             "model": "ideogram-v3",
                             "seed": uuid.uuid4().hex[:8],
+                            "size": "1024x1024",
+                            "quality": "standard",
+                            "cost_usd": Pricing.image("ideogram-v3", "1024x1024", "standard"),
                         }
 
             raise Exception("Ideogram returned no image data")
@@ -253,12 +266,14 @@ class ImageGeneratorService:
                 "Content-Type": "application/json",
             }
 
+            dalle_size = "1024x1024"
+            dalle_quality = "standard"
             payload = {
                 "model": "dall-e-3",
                 "prompt": prompt,
                 "n": 1,
-                "size": "1024x1024",  # DALL-E 3 standard sizes
-                "quality": "standard",
+                "size": dalle_size,
+                "quality": dalle_quality,
                 "response_format": "url",
             }
 
@@ -284,6 +299,9 @@ class ImageGeneratorService:
                 "path": None,
                 "model": "dall-e-3",
                 "seed": uuid.uuid4().hex[:8],
+                "size": dalle_size,
+                "quality": dalle_quality,
+                "cost_usd": Pricing.image("dall-e-3", dalle_size, dalle_quality),
             }
 
         except Exception as e:
@@ -342,6 +360,9 @@ class ImageGeneratorService:
                     "path": filepath,
                     "model": image_model,
                     "seed": uuid.uuid4().hex[:8],
+                    "size": "1024x1024",
+                    "quality": "standard",
+                    "cost_usd": Pricing.image(image_model, "1024x1024", "standard"),
                 }
 
             raise Exception("Imagen 4 returned no image data")
@@ -380,6 +401,9 @@ class ImageGeneratorService:
                                 "path": filepath,
                                 "model": "gemini-2.5-flash-image",
                                 "seed": uuid.uuid4().hex[:8],
+                                "size": "1024x1024",
+                                "quality": "standard",
+                                "cost_usd": Pricing.image("gemini-2.5-flash-image", "1024x1024", "standard"),
                             }
 
                 raise Exception("gemini-2.5-flash-image returned no image data")
@@ -441,6 +465,9 @@ class ImageGeneratorService:
                         "path": None,
                         "model": "flux-dev",
                         "seed": data.get("seed", uuid.uuid4().hex[:8]),
+                        "size": "1216x684",
+                        "quality": "standard",
+                        "cost_usd": Pricing.image("flux-dev", "1216x684", "standard"),
                     }
 
             logger.error(f"FAL response missing image data: {data}")

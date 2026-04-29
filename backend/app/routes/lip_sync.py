@@ -6,6 +6,10 @@ from ..database import get_db
 from ..schemas import APIResponse
 from ..middleware.auth import get_optional_user, log_usage
 from ..services.lip_sync import LipSyncService, DOWNLOADS_DIR
+from ..services.job_service import JobService
+from ..services.pricing import Pricing
+from ..services.cost_tracker import update_job_cost
+from ..models.job import Job
 import tempfile
 import os
 import logging
@@ -51,7 +55,20 @@ async def generate_lip_sync(
             )
 
             if user:
-                log_usage("lip_sync", user.id, db, cost_usd=0.05)
+                # Estimate cost up front; we'll true-up on /status when Replicate
+                # reports actual predict_time.
+                est_cost = Pricing.lip_sync(predict_time_sec=None, hardware="t4")
+                log_usage("lip_sync", user.id, db, cost_usd=est_cost,
+                          metadata={"prediction_id": result.get("prediction_id"), "model": model})
+                try:
+                    JobService.create_job(
+                        db=db, user_id=user.id, job_type="talking_head",
+                        provider="replicate", provider_job_id=result.get("prediction_id", ""),
+                        input_data={"model": model},
+                        cost_usd=est_cost,
+                    )
+                except Exception as je:
+                    logger.warning(f"Lip-sync job record failed: {je}")
 
             return APIResponse(
                 success=True,
@@ -72,10 +89,47 @@ async def generate_lip_sync(
 
 
 @router.get("/status/{prediction_id}")
-async def lip_sync_status(prediction_id: str):
-    """Check the status of a lip-sync generation job"""
+async def lip_sync_status(
+    prediction_id: str,
+    user=Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
+    """Check the status of a lip-sync generation job. True-up cost from
+    Replicate's reported predict_time when complete."""
     try:
         result = LipSyncService.check_status(prediction_id)
+
+        # On success, true-up Job.cost_usd from real predict_time and
+        # mark the job complete with the result URL.
+        if result.get("status") == "succeeded" and user:
+            try:
+                job = db.query(Job).filter(
+                    Job.user_id == user.id,
+                    Job.provider_job_id == prediction_id,
+                    Job.job_type == "talking_head",
+                ).first()
+                if job:
+                    actual_cost = float(result.get("cost_usd") or 0.0)
+                    if actual_cost > 0:
+                        # Replace estimate with actual
+                        job.cost_usd = actual_cost
+                        db.add(job)
+                        db.commit()
+                    if job.status != "completed":
+                        result_url = (f"/api/v1/lip-sync/download/{result['download_filename']}"
+                                      if result.get("download_filename") else result.get("video_url", ""))
+                        JobService.complete_job(
+                            db=db, job_id=job.id,
+                            result_data={
+                                "video_url": result.get("video_url"),
+                                "download_filename": result.get("download_filename"),
+                                "predict_time_sec": result.get("predict_time_sec"),
+                            },
+                            result_url=result_url,
+                        )
+            except Exception as je:
+                logger.warning(f"Lip-sync job complete failed: {je}")
+
         return APIResponse(
             success=True,
             message=f"Status: {result['status']}",

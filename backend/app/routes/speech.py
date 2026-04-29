@@ -52,14 +52,28 @@ async def generate_speech(
             output_format=request.output_format,
         )
 
+        cost = float(result.get("cost_usd") or 0.0)
         if user:
-            log_usage("speech_generation", user.id, db, cost_usd=0.02)
+            log_usage("speech_generation", user.id, db, cost_usd=cost,
+                      metadata={"provider": result.get("provider"), "model": result.get("model"),
+                                "char_count": result.get("char_count")})
             try:
                 LearningService.record_generation(
                     db=db, user_id=user.id, vertical="general",
                     feature="speech_generation",
                     input_data={"text": request.text[:500]},
-                    output_data={"provider": result.get("provider", "unknown"), "cost": 0.02},
+                    output_data={"provider": result.get("provider", "unknown"), "cost": cost},
+                )
+            except Exception:
+                pass
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="speech_generation",
+                    input_data={"text": request.text[:500], "voice": request.voice, "language": request.language},
+                    result_data={"provider": result.get("provider"), "model": result.get("model"),
+                                 "char_count": result.get("char_count"), "duration_ms": result.get("duration_ms")},
+                    cost_usd=cost, provider=result.get("provider", "unknown"),
                 )
             except Exception:
                 pass

@@ -93,8 +93,18 @@ export default function VideoCreator() {
 
   const reloadMyVideos = async () => {
     try {
-      const res = await axios.get(`${API_BASE_URL}/jobs/my?job_type=veo_video&limit=30`);
-      setMyVideos((res.data?.data?.jobs || []).filter((j: any) => j.status === 'completed' && j.result_url));
+      // Fetch BOTH text-to-video and image-to-video jobs and merge
+      const [t2v, i2v] = await Promise.all([
+        axios.get(`${API_BASE_URL}/jobs/my?job_type=veo_video&limit=30`),
+        axios.get(`${API_BASE_URL}/jobs/my?job_type=image_to_video&limit=30`),
+      ]);
+      const merge = [
+        ...(t2v.data?.data?.jobs || []),
+        ...(i2v.data?.data?.jobs || []),
+      ].filter((j: any) => j.status === 'completed' && j.result_url);
+      // Sort newest first
+      merge.sort((a: any, b: any) => (a.created_at < b.created_at ? 1 : -1));
+      setMyVideos(merge);
     } catch {}
   };
   useEffect(() => { reloadMyVideos(); }, []);
@@ -385,6 +395,7 @@ export default function VideoCreator() {
                 <div key={j.id} className="card" style={{ padding: '10px' }}>
                   <div style={{
                     position: 'relative', width: '100%', aspectRatio: aspect,
+                    maxHeight: '320px',
                     background: '#000', borderRadius: '8px', marginBottom: '8px',
                     overflow: 'hidden', cursor: isPlaying ? 'default' : 'pointer',
                   }}
@@ -450,13 +461,20 @@ export default function VideoCreator() {
 
 
 // ---------- Long Video Panel ----------
+// Pricing constants kept in sync with backend services/pricing.py.
+// 8s base + 7s extension at $0.40/sec for Veo 3.1 with audio.
+const LONG_BASE_COST = 0.40 * 8;     // $3.20
+const LONG_EXT_COST  = 0.40 * 7;     // $2.80
+
 function LongVideoPanel() {
   const [script, setScript] = useState('');
   const [aspectRatio, setAspectRatio] = useState('16:9');
   const [targetSegments, setTargetSegments] = useState(5);
   const [autoStitch, setAutoStitch] = useState(false);
-  const [budget, setBudget] = useState(3.5);
+  // Default budget covers ~5 segments at the real Veo 3.1 rate
+  const [budget, setBudget] = useState(20.0);
   const [showAdvisory, setShowAdvisory] = useState(true);
+  const [baseImage, setBaseImage] = useState<File | null>(null);
 
   const [jobId, setJobId] = useState<string | null>(null);
   const [snap, setSnap] = useState<any>(null);
@@ -467,19 +485,23 @@ function LongVideoPanel() {
   const labelStyle = { fontSize: '13px', fontWeight: 600, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase' as const, letterSpacing: '0.5px', marginBottom: '8px', display: 'block' };
 
   const estSec = 8 + (targetSegments - 1) * 7;
-  const estCost = 0.40 + (targetSegments - 1) * 0.35;
+  const estCost = LONG_BASE_COST + (targetSegments - 1) * LONG_EXT_COST;
 
   const handleStart = async () => {
     setError('');
     setStarting(true);
     setSnap(null);
     try {
-      const res = await axios.post(`${API_BASE_URL}/video/long/create`, {
-        script,
-        aspect_ratio: aspectRatio,
-        target_segments: targetSegments,
-        auto_stitch: autoStitch,
-        budget_usd: budget,
+      const fd = new FormData();
+      fd.append('script', script);
+      fd.append('aspect_ratio', aspectRatio);
+      fd.append('target_segments', String(targetSegments));
+      fd.append('auto_stitch', String(autoStitch));
+      fd.append('budget_usd', String(budget));
+      if (baseImage) fd.append('base_image', baseImage);
+
+      const res = await axios.post(`${API_BASE_URL}/video/long/create`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
       });
       if (!res.data.success) throw new Error(res.data.message);
       setJobId(res.data.data.job_id);
@@ -583,6 +605,44 @@ Close-up on the fisherman's hands untying the rope.`}
           </div>
 
           <div className="card" style={{ padding: '24px' }}>
+            {/* Optional base image: when set, segment 0 is image-to-video */}
+            <label style={labelStyle}>Base Image (optional)</label>
+            <div
+              style={{ ...inputStyle, padding: '20px', textAlign: 'center', cursor: 'pointer', marginBottom: '16px' }}
+              onClick={() => document.getElementById('lv-base-image-input')?.click()}
+            >
+              {baseImage ? (
+                <div>
+                  <p style={{ color: '#30d158', fontSize: '14px', margin: 0 }}>{baseImage.name}</p>
+                  <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '11px', marginTop: '4px' }}>
+                    {(baseImage.size / 1024 / 1024).toFixed(1)}MB · used as the first frame (image-to-video)
+                  </p>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); setBaseImage(null); }}
+                    style={{ marginTop: '8px', background: 'none', border: 'none', color: '#ff6b6b', fontSize: '12px', cursor: 'pointer' }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <p style={{ fontSize: '20px', margin: 0 }}>+</p>
+                  <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: '13px', margin: '6px 0 2px' }}>Optional: Upload a starting image</p>
+                  <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: '11px', margin: 0 }}>
+                    PNG/JPG · animates from this frame; extensions continue text-only
+                  </p>
+                </div>
+              )}
+              <input
+                id="lv-base-image-input"
+                type="file"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={(e) => setBaseImage(e.target.files?.[0] || null)}
+              />
+            </div>
+
             <label style={labelStyle}>Script</label>
             <textarea value={script} onChange={e => setScript(e.target.value)}
               placeholder="Paste your script in any format..."
@@ -602,10 +662,11 @@ Close-up on the fisherman's hands untying the rope.`}
                 <label style={labelStyle}>Budget (USD)</label>
                 <select value={budget} onChange={e => setBudget(parseFloat(e.target.value))}
                   style={{ ...inputStyle, cursor: 'pointer', appearance: 'none' as const }}>
-                  <option value="2.0">$2.00 (~5 clips)</option>
-                  <option value="3.5">$3.50 (~10 clips)</option>
-                  <option value="5.0">$5.00 (~14 clips)</option>
-                  <option value="7.5">$7.50 (~21 clips, max)</option>
+                  <option value="3.5">$3.50 (~1 clip)</option>
+                  <option value="9.0">$9.00 (~3 clips)</option>
+                  <option value="20.0">$20.00 (~7 clips)</option>
+                  <option value="40.0">$40.00 (~14 clips)</option>
+                  <option value="60.0">$60.00 (~21 clips, max)</option>
                 </select>
               </div>
             </div>

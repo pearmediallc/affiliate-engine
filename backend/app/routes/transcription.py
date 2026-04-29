@@ -82,8 +82,24 @@ async def transcribe_audio_file(
                 language=language,
             )
 
+            cost = float(result.get("cost_usd") or 0.0)
             if user:
-                log_usage("transcript_analysis", user.id, db, cost_usd=0.02)
+                log_usage("transcript_analysis", user.id, db, cost_usd=cost,
+                          metadata={"provider": result.get("provider"),
+                                    "model": result.get("model"),
+                                    "duration_seconds": result.get("duration_seconds")})
+                try:
+                    from ..services.job_service import JobService
+                    JobService.save_sync_result(
+                        db=db, user_id=user.id, job_type="transcription",
+                        input_data={"filename": file.filename, "language": language},
+                        result_data={"provider": result.get("provider"), "model": result.get("model"),
+                                     "duration_seconds": result.get("duration_seconds"),
+                                     "transcription_chars": len(result.get("transcription") or "")},
+                        cost_usd=cost, provider=result.get("provider", "openai"),
+                    )
+                except Exception:
+                    pass
 
             return APIResponse(
                 success=True,
@@ -140,8 +156,24 @@ async def transcribe_audio_url(
             language=request.language,
         )
 
+        cost = float(result.get("cost_usd") or 0.0)
         if user:
-            log_usage("transcript_analysis", user.id, db, cost_usd=0.02)
+            log_usage("transcript_analysis", user.id, db, cost_usd=cost,
+                      metadata={"provider": result.get("provider"),
+                                "model": result.get("model"),
+                                "duration_seconds": result.get("duration_seconds")})
+            try:
+                from ..services.job_service import JobService
+                JobService.save_sync_result(
+                    db=db, user_id=user.id, job_type="transcription",
+                    input_data={"audio_url": request.audio_url, "language": request.language},
+                    result_data={"provider": result.get("provider"), "model": result.get("model"),
+                                 "duration_seconds": result.get("duration_seconds"),
+                                 "transcription_chars": len(result.get("transcription") or "")},
+                    cost_usd=cost, provider=result.get("provider", "openai"),
+                )
+            except Exception:
+                pass
 
         return APIResponse(
             success=True,

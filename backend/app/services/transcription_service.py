@@ -4,6 +4,8 @@ import logging
 import httpx
 from typing import Optional
 from ..config import settings
+from .pricing import Pricing
+from .cost_tracker import estimate_audio_seconds_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +81,15 @@ class TranscriptionService:
 
             logger.info(f"Transcription completed using Whisper")
 
+            duration_sec = estimate_audio_seconds_from_path(audio_file_path) or 0.0
             return {
                 "transcription": transcript.text,
                 "provider": "openai_whisper",
                 "language": language or "detected",
                 "success": True,
                 "model": "whisper-1",
+                "duration_seconds": duration_sec,
+                "cost_usd": Pricing.transcription(duration_sec, "openai"),
             }
 
         except Exception as e:
@@ -136,6 +141,12 @@ class TranscriptionService:
 
                 logger.info(f"Transcription completed using Deepgram")
 
+                # Deepgram returns duration in metadata
+                duration_sec = float(
+                    result.get("metadata", {}).get("duration")
+                    or estimate_audio_seconds_from_path(audio_file_path)
+                    or 0.0
+                )
                 return {
                     "transcription": transcript,
                     "provider": "deepgram",
@@ -143,6 +154,8 @@ class TranscriptionService:
                     "success": True,
                     "model": "nova-2",
                     "confidence": result.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("confidence", None),
+                    "duration_seconds": duration_sec,
+                    "cost_usd": Pricing.transcription(duration_sec, "deepgram"),
                 }
 
         except Exception as e:

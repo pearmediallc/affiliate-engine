@@ -10,6 +10,7 @@ from ..middleware.auth import require_admin
 from ..models.image import Image
 from ..models.feedback import GenerationFeedback
 from ..models.user import User, UsageLog
+from ..models.job import Job
 from ..models.learning import LearningRecord, VerticalKnowledge, AISuggestion
 from ..services.learning_service import LearningService
 
@@ -21,10 +22,14 @@ async def admin_dashboard(
     admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Overview stats: total users, generations, spend, satisfaction by vertical"""
+    """Overview stats: total users, generations, spend (image + jobs), satisfaction by vertical"""
     total_users = db.query(func.count(User.id)).scalar()
-    total_generations = db.query(func.count(Image.id)).scalar()
-    total_spend = db.query(func.coalesce(func.sum(Image.cost_usd), 0.0)).scalar()
+    total_images = db.query(func.count(Image.id)).scalar()
+    total_jobs = db.query(func.count(Job.id)).scalar()
+    total_generations = (total_images or 0) + (total_jobs or 0)
+    image_spend = db.query(func.coalesce(func.sum(Image.cost_usd), 0.0)).scalar() or 0.0
+    job_spend = db.query(func.coalesce(func.sum(Job.cost_usd), 0.0)).scalar() or 0.0
+    total_spend = float(image_spend) + float(job_spend)
 
     # Satisfaction by vertical
     verticals = (
@@ -57,7 +62,11 @@ async def admin_dashboard(
         data={
             "total_users": total_users,
             "total_generations": total_generations,
-            "total_spend": float(total_spend),
+            "total_images": total_images,
+            "total_jobs": total_jobs,
+            "total_spend": round(total_spend, 4),
+            "image_spend": round(float(image_spend), 4),
+            "job_spend": round(float(job_spend), 4),
             "satisfaction_by_vertical": satisfaction_by_vertical,
             "pending_suggestions": pending_suggestions,
         },

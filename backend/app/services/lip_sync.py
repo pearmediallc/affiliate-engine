@@ -6,6 +6,7 @@ import logging
 import requests
 from typing import Optional
 from ..config import settings
+from .pricing import Pricing
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,18 @@ class LipSyncService:
                         result["download_filename"] = filename
                 except Exception as dl_err:
                     logger.warning(f"Failed to download lip-sync result: {dl_err}")
+
+        # Compute real cost from Replicate's reported predict_time when present.
+        # Replicate exposes runtime under data["metrics"]["predict_time"] (seconds).
+        predict_time = None
+        try:
+            metrics = data.get("metrics") or {}
+            predict_time = metrics.get("predict_time")
+        except Exception:
+            pass
+        result["predict_time_sec"] = predict_time
+        # Hardware tier — SadTalker on Replicate uses T4 by default
+        result["cost_usd"] = Pricing.lip_sync(predict_time, hardware="t4")
 
         return result
 

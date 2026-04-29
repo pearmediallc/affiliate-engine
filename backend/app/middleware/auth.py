@@ -125,7 +125,7 @@ def require_admin(user = Depends(get_current_user)):
 
 
 def log_usage(feature: str, user_id: str, db: Session, cost_usd: float = 0.0, metadata: dict = None):
-    """Log a usage event for rate limiting tracking"""
+    """Log a usage event for rate limiting tracking + spend audit. Stores cost as float."""
     from ..models.user import UsageLog
     import uuid
 
@@ -133,7 +133,7 @@ def log_usage(feature: str, user_id: str, db: Session, cost_usd: float = 0.0, me
         id=str(uuid.uuid4()),
         user_id=user_id,
         feature=feature,
-        cost_usd=str(cost_usd),
+        cost_usd=float(cost_usd or 0.0),
         metadata_json=metadata,
     )
     db.add(log)

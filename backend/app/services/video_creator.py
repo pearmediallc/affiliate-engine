@@ -6,6 +6,7 @@ import logging
 import base64
 from typing import Optional
 from ..config import settings
+from .pricing import Pricing
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ class VideoCreatorService:
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "duration_seconds": duration_int,
+            "model": "veo-3.1-generate-preview",
+            "cost_usd": Pricing.veo_video(duration_int, "veo-3.1-generate-preview"),
         }
 
     @staticmethod
@@ -69,6 +72,7 @@ class VideoCreatorService:
         image_path: str,
         prompt: str = "",
         aspect_ratio: str = "16:9",
+        duration: int = 8,
     ) -> dict:
         """Generate video using an image as the starting frame."""
         from google import genai
@@ -90,11 +94,20 @@ class VideoCreatorService:
 
         logger.info(f"Starting Veo 3.1 image-to-video: {prompt[:100]}...")
 
+        # Default to 8s if caller didn't specify; Veo I2V supports 4/6/8s.
+        try:
+            duration_int = int(str(duration).rstrip("s").strip())
+        except (ValueError, AttributeError):
+            duration_int = 8
+
         operation = client.models.generate_videos(
             model="veo-3.1-generate-preview",
             prompt=prompt or "Animate this image with natural, cinematic motion",
             image=image,
-            config=types.GenerateVideosConfig(aspect_ratio=aspect_ratio),
+            config=types.GenerateVideosConfig(
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration_int,
+            ),
         )
 
         return {
@@ -102,6 +115,10 @@ class VideoCreatorService:
             "status": "generating",
             "prompt": prompt[:200],
             "type": "image_to_video",
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": duration_int,
+            "model": "veo-3.1-generate-preview",
+            "cost_usd": Pricing.veo_video(duration_int, "veo-3.1-generate-preview"),
         }
 
     @staticmethod
@@ -188,6 +205,9 @@ class VideoCreatorService:
             "prompt": prompt[:200],
             "resolution": "720p",
             "extended_from": previous_operation_name,
+            "model": "veo-3.1-generate-preview",
+            "duration_seconds": 7,
+            "cost_usd": Pricing.veo_extension(7, "veo-3.1-generate-preview"),
         }
 
     @staticmethod

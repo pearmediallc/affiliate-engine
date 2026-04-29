@@ -3,18 +3,24 @@ Long-video engine: chains Veo 3.1 base + extensions + optional ffmpeg stitch.
 
 State machine lives in Job.result_data["segments"] so it survives restarts.
 The /long/status endpoint reads state (fast); background task advances it.
+
+The base segment can optionally start from an uploaded image (image-to-video).
+Extensions are always text-only (Veo extension API doesn't take images).
 """
 import os
 import uuid
 import logging
 import subprocess
 import threading
+import shutil
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional
 from sqlalchemy.orm import Session
 from .video_creator import VideoCreatorService, VIDEOS_DIR
 from .job_service import JobService
+from .pricing import Pricing
+from .cost_tracker import update_job_cost
 from ..models.job import Job
 
 logger = logging.getLogger(__name__)
@@ -27,29 +33,34 @@ STUCK_TIMEOUT = timedelta(minutes=10)
 
 LONG_VIDEOS_DIR = os.path.join(VIDEOS_DIR, "long")
 LONG_STITCHED_DIR = os.path.join(VIDEOS_DIR, "long", "stitched")
+LONG_BASE_IMAGES_DIR = os.path.join(VIDEOS_DIR, "long", "base_images")
 os.makedirs(LONG_VIDEOS_DIR, exist_ok=True)
 os.makedirs(LONG_STITCHED_DIR, exist_ok=True)
-
-# Cost model (approximate, Veo 3.1 standard)
-COST_PER_BASE_CLIP = 0.40  # 8s base
-COST_PER_EXTENSION = 0.35  # 7s extension
+os.makedirs(LONG_BASE_IMAGES_DIR, exist_ok=True)
 
 
 class LongVideoService:
+    # Real Veo 3.1 pricing — sourced from Pricing module (env-overridable).
+    COST_PER_BASE_CLIP = Pricing.veo_video(8)              # 8s base clip
+    COST_PER_EXTENSION = Pricing.veo_extension(7)          # 7s extension
 
     @staticmethod
     def estimate_cost(segment_count: int) -> float:
         if segment_count <= 0:
             return 0.0
-        return COST_PER_BASE_CLIP + (segment_count - 1) * COST_PER_EXTENSION
+        return LongVideoService.COST_PER_BASE_CLIP + (segment_count - 1) * LongVideoService.COST_PER_EXTENSION
 
     @staticmethod
     def max_segments_for_budget(budget_usd: float) -> int:
         """Inverse: how many segments fit in the budget?"""
-        if budget_usd <= COST_PER_BASE_CLIP:
+        base = LongVideoService.COST_PER_BASE_CLIP
+        ext = LongVideoService.COST_PER_EXTENSION
+        if budget_usd < base:
+            return 0
+        if budget_usd < base + ext:
             return 1
-        remaining = budget_usd - COST_PER_BASE_CLIP
-        return 1 + int(remaining / COST_PER_EXTENSION)
+        remaining = budget_usd - base
+        return 1 + int(remaining / ext)
 
     @staticmethod
     def start_job(
@@ -60,25 +71,56 @@ class LongVideoService:
         auto_stitch: bool,
         budget_usd: float,
         raw_script: str,
+        base_image_path: Optional[str] = None,
     ) -> Job:
         """
         Create Job record and kick off the first (base) segment.
+
+        If base_image_path is provided, segment 0 uses Veo image-to-video
+        (animating that image). Otherwise text-to-video as before.
+
         Returns the Job. Frontend polls /long/status/{job_id} to drive progress.
         """
         if not segments_plan:
             raise ValueError("Segments plan is empty")
 
-        # Kick off base clip (8s)
+        # Persist the base image (if any) so we can reference it from segment metadata.
+        # Veo's image-to-video is one-shot — extensions don't reuse the image — so we
+        # only need it for the first call. Copy into long base_images dir for trace.
+        persisted_base_image = None
+        if base_image_path and os.path.exists(base_image_path):
+            ext = (os.path.splitext(base_image_path)[1] or ".png").lower()
+            persisted_base_image = os.path.join(
+                LONG_BASE_IMAGES_DIR, f"{uuid.uuid4().hex[:12]}{ext}"
+            )
+            try:
+                shutil.copy(base_image_path, persisted_base_image)
+            except Exception as e:
+                logger.warning(f"Failed to persist base image: {e}")
+                persisted_base_image = None
+
+        # Kick off base clip (8s) — image-to-video if base image present, else text-to-video.
         first = segments_plan[0]
-        result = VideoCreatorService.generate_video(
-            prompt=first["prompt"],
-            aspect_ratio=aspect_ratio,
-            resolution="720p",   # must be 720p to allow later extensions
-            duration="8",
-        )
+        if persisted_base_image:
+            result = VideoCreatorService.generate_from_image(
+                image_path=persisted_base_image,
+                prompt=first["prompt"],
+                aspect_ratio=aspect_ratio,
+                duration=8,
+            )
+            first["kind"] = "base_image"
+        else:
+            result = VideoCreatorService.generate_video(
+                prompt=first["prompt"],
+                aspect_ratio=aspect_ratio,
+                resolution="720p",   # must be 720p to allow later extensions
+                duration="8",
+            )
         first["operation_name"] = result["operation_name"]
         first["status"] = "generating"
         first["started_at"] = datetime.utcnow().isoformat()
+
+        first_cost = float(result.get("cost_usd") or LongVideoService.COST_PER_BASE_CLIP)
 
         job = JobService.create_job(
             db=db, user_id=user_id, job_type="long_video",
@@ -89,15 +131,16 @@ class LongVideoService:
                 "budget_usd": budget_usd,
                 "raw_script": raw_script[:2000],
                 "segment_count": len(segments_plan),
+                "base_image": persisted_base_image,  # path on disk (server-side only)
             },
-            cost_usd=COST_PER_BASE_CLIP,
+            cost_usd=first_cost,
         )
         # Store segment plan in result_data
         JobService.update_job(db=db, job_id=job.id, result_data={
             "segments": segments_plan,
             "stitched_filename": None,
             "stitched_url": None,
-            "cost_so_far": COST_PER_BASE_CLIP,
+            "cost_so_far": first_cost,
             "error": None,
         })
         return job
@@ -162,7 +205,7 @@ class LongVideoService:
             return {"status": "failed", "error": "No segments"}
 
         auto_stitch = (job.input_data or {}).get("auto_stitch", False)
-        budget = (job.input_data or {}).get("budget_usd", 3.5)
+        budget = (job.input_data or {}).get("budget_usd", 20.0)
         cost_so_far = result_data.get("cost_so_far", 0.0)
 
         # Find the segment to act on (the one currently generating, or first pending)
@@ -205,7 +248,11 @@ class LongVideoService:
         # If the active segment is still pending (no operation_name), kick it off now
         if active["status"] == "pending":
             # Budget check BEFORE kicking off extension
-            next_cost = COST_PER_BASE_CLIP if active["kind"] == "base" else COST_PER_EXTENSION
+            next_cost = (
+                LongVideoService.COST_PER_BASE_CLIP
+                if active["kind"] in ("base", "base_image")
+                else LongVideoService.COST_PER_EXTENSION
+            )
             if cost_so_far + next_cost > budget + 0.01:
                 active["status"] = "skipped_budget"
                 logger.info(f"Long-video job {job.id}: budget hit, skipping segment {active_idx}")
@@ -226,10 +273,14 @@ class LongVideoService:
                 active["operation_name"] = result["operation_name"]
                 active["status"] = "generating"
                 active["started_at"] = datetime.utcnow().isoformat()
-                cost_so_far += next_cost
+                # Use real cost reported by service if present
+                actual_cost = float(result.get("cost_usd") or LongVideoService.COST_PER_EXTENSION)
+                cost_so_far += actual_cost
                 result_data["cost_so_far"] = cost_so_far
                 JobService.update_job(db=db, job_id=job.id, result_data=result_data,
                                       provider_job_id=result["operation_name"])
+                # Increment Job.cost_usd so analytics queries reflect real spend
+                update_job_cost(db, job.id, actual_cost)
                 return LongVideoService._snapshot(job, result_data)
             except Exception as e:
                 logger.error(f"Failed to kick off segment {active_idx}: {e}", exc_info=True)
@@ -352,6 +403,7 @@ class LongVideoService:
             "skipped_budget_count": skipped,
             "cancelled_count": cancelled,
             "cost_so_far": result_data.get("cost_so_far", 0.0),
+            "with_base_image": bool((job.input_data or {}).get("base_image")),
             "segments": [
                 {
                     "index": s["index"],
@@ -369,3 +421,8 @@ class LongVideoService:
             "auto_stitch": (job.input_data or {}).get("auto_stitch", False),
             "error": result_data.get("error"),
         }
+
+
+# Backwards-compatible legacy module-level constants (used by older imports if any)
+COST_PER_BASE_CLIP = LongVideoService.COST_PER_BASE_CLIP
+COST_PER_EXTENSION = LongVideoService.COST_PER_EXTENSION
