@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from .config import settings
 from .database import init_db
 from .routes import create_router
@@ -7,6 +8,7 @@ from .services import VerticalTemplatesService
 from .database import SessionLocal
 from .middleware.audit import AuditLogMiddleware
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +34,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Global exception handler — guarantees CORS headers on 500 responses too.
+# Without this, an unhandled exception bubbles past CORSMiddleware and the
+# browser sees a CORS error instead of the real 500. We attach Allow-Origin
+# explicitly here so error responses still pass the browser's CORS check.
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+    origin = request.headers.get("origin", "")
+    headers = {}
+    # Reflect the request origin if cors_allow_all is on, OR if origin is in the allowlist.
+    if origin and (settings.cors_allow_all or origin in settings.cors_origins):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "type": exc.__class__.__name__},
+        headers=headers,
+    )
 
 
 @app.on_event("startup")

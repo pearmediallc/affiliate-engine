@@ -3,6 +3,10 @@
 Use `record()` from any route or service that wants to leave a breadcrumb in
 the admin audit timeline. Failures are swallowed so audit logging never breaks
 the originating request.
+
+Critical design choice: every write opens its OWN DB session via SessionLocal.
+The caller's `db` argument is IGNORED (kept only for API compatibility). This
+guarantees that an audit-log failure can NEVER corrupt the caller's transaction.
 """
 import logging
 import uuid
@@ -10,6 +14,7 @@ from datetime import datetime
 from typing import Optional, Any
 from sqlalchemy.orm import Session
 from ..models.audit_log import AuditLog
+from ..database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +32,7 @@ def _truncate(s: Any, n: int = _MAX_FIELD_LEN) -> Optional[str]:
 
 
 def record(
-    db: Session,
+    db: Optional[Session] = None,
     *,
     action: str,
     category: Optional[str] = None,
@@ -45,8 +50,17 @@ def record(
     user_agent: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> Optional[AuditLog]:
-    """Best-effort write to audit_logs. Never raises."""
+    """Best-effort write to audit_logs. Never raises.
+
+    The `db` argument is accepted for API compatibility but IGNORED — we always
+    open a private SessionLocal so a write failure can't corrupt any caller's
+    transaction. If the audit_logs table is missing, the column types differ,
+    or the DB is otherwise unhappy, the function logs a warning and returns
+    None. The caller continues unaffected.
+    """
+    own_session: Optional[Session] = None
     try:
+        own_session = SessionLocal()
         log = AuditLog(
             id=str(uuid.uuid4()),
             timestamp=datetime.utcnow(),
@@ -66,35 +80,45 @@ def record(
             user_agent=_truncate(user_agent, 512),
             metadata_json=metadata or {},
         )
-        db.add(log)
-        db.commit()
+        own_session.add(log)
+        own_session.commit()
         return log
     except Exception as e:
         logger.warning(f"audit_log record failed: {e}")
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        if own_session is not None:
+            try:
+                own_session.rollback()
+            except Exception:
+                pass
         return None
+    finally:
+        if own_session is not None:
+            try:
+                own_session.close()
+            except Exception:
+                pass
 
 
 def record_for_user(
-    db: Session,
+    db: Optional[Session],
     user,
     *,
     action: str,
     **kwargs,
 ) -> Optional[AuditLog]:
-    """Convenience: extract user_id/email/role from a User model instance."""
+    """Convenience: extract user_id/email/role from a User model instance.
+
+    `db` is ignored — record() opens its own session.
+    """
     if user is None:
-        return record(db, action=action, **kwargs)
+        return record(action=action, **kwargs)
     role_name = None
     try:
         role_name = user.role.name if user.role else None
     except Exception:
         pass
     return record(
-        db, action=action,
+        action=action,
         user_id=getattr(user, "id", None),
         user_email=getattr(user, "email", None),
         role=role_name,

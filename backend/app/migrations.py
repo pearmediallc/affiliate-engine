@@ -16,12 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 # Each entry: (table_name, column_name, ddl_fragment_for_alter)
-# DDL is dialect-friendly: SQLite doesn't enforce types but accepts them.
+# DDL must be portable across SQLite + Postgres.
+# - VARCHAR works on both
+# - TEXT works on both
+# - TIMESTAMP works on both (Postgres native; SQLite stores as TEXT but accepts it)
+# - DATETIME is SQLite-only — DON'T USE IT in migrations
 _REQUIRED_COLUMNS = [
     # User approval workflow
     ("users", "status", "VARCHAR DEFAULT 'approved'"),
     ("users", "rejection_reason", "TEXT"),
-    ("users", "approved_at", "DATETIME"),
+    ("users", "approved_at", "TIMESTAMP"),
     ("users", "approved_by", "VARCHAR"),
 ]
 

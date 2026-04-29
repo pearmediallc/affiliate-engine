@@ -89,45 +89,56 @@ def _category_for_path(path: str) -> str:
 
 class AuditLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Capture request metadata BEFORE handler runs (in case body is consumed)
-        path = request.url.path
+        # Wrap EVERYTHING in try/except so an audit-side bug can never break
+        # the underlying request. If anything in the audit path fails, just
+        # serve the response unaltered.
+        try:
+            path = request.url.path
+        except Exception:
+            return await call_next(request)
+
         if _should_skip(path):
             return await call_next(request)
 
-        method = request.method
-        ip = request.client.host if request.client else None
-        ua = request.headers.get("user-agent")
-        auth_header = request.headers.get("authorization") or ""
-        token = auth_header.split(" ", 1)[1] if auth_header.lower().startswith("bearer ") else None
+        # Capture cheap metadata up-front
+        try:
+            method = request.method
+            ip = request.client.host if request.client else None
+            ua = request.headers.get("user-agent")
+            auth_header = request.headers.get("authorization") or ""
+            token = auth_header.split(" ", 1)[1] if auth_header.lower().startswith("bearer ") else None
+        except Exception:
+            method = ip = ua = token = None
 
         start = time.time()
+        # Always run the actual handler — if IT raises, let the global
+        # exception handler in main.py deal with it. We do NOT swallow
+        # the handler's exception (that would hide real bugs).
         response: Response = await call_next(request)
-        duration_ms = int((time.time() - start) * 1000)
-
-        # Resolve user (best-effort — never block the response)
-        user_id, user_email, role = (None, None, None)
-        if token:
-            try:
-                user_id, user_email, role = _resolve_user_from_token(token)
-            except Exception:
-                pass
-
-        # Write audit row in a fresh DB session to avoid cross-thread issues
         try:
-            db = SessionLocal()
-            try:
-                record(
-                    db,
-                    action=ACTION_API_REQUEST,
-                    category=_category_for_path(path),
-                    user_id=user_id, user_email=user_email, role=role,
-                    method=method, path=path,
-                    status_code=response.status_code,
-                    duration_ms=duration_ms,
-                    ip=ip, user_agent=ua,
-                )
-            finally:
-                db.close()
+            duration_ms = int((time.time() - start) * 1000)
+        except Exception:
+            duration_ms = None
+
+        # Best-effort user resolution + audit write. Any failure here is
+        # logged but never re-raised.
+        try:
+            user_id, user_email, role = (None, None, None)
+            if token:
+                try:
+                    user_id, user_email, role = _resolve_user_from_token(token)
+                except Exception:
+                    pass
+
+            record(
+                action=ACTION_API_REQUEST,
+                category=_category_for_path(path),
+                user_id=user_id, user_email=user_email, role=role,
+                method=method, path=path,
+                status_code=getattr(response, "status_code", None),
+                duration_ms=duration_ms,
+                ip=ip, user_agent=ua,
+            )
         except Exception as e:
             logger.debug(f"audit middleware swallow: {e}")
 
