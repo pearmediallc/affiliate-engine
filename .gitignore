@@ -50,6 +50,13 @@ out/
 
 # Project specific
 generated_images/
+generated_videos/
 uploads/
 instance/
 logs/
+
+# gstack artifacts (security reports may contain sensitive findings)
+.gstack/
+
+# TypeScript incremental build artifacts
+*.tsbuildinfo

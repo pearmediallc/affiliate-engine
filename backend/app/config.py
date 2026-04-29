@@ -1,5 +1,12 @@
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import Optional
+
+
+# The literal default string we used to ship as a fallback. Anyone who copies
+# this back into config or paste it into env "to make it work" needs to be
+# loudly stopped — that's how the production breach happens.
+_LEGACY_INSECURE_KEY = "change-me-in-production-use-a-real-secret-key"
 
 
 class Settings(BaseSettings):
@@ -13,10 +20,36 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "sqlite:///./affiliate_images.db"  # Default SQLite, override with DATABASE_URL env var for Postgres
 
-    # Auth / JWT
-    secret_key: str = "change-me-in-production-use-a-real-secret-key"
+    # Auth / JWT.
+    # SECRET_KEY is REQUIRED in env. There is no fallback default — that's the
+    # whole point of a secret. Generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(64))"
+    # Use DIFFERENT keys per environment (dev != staging != prod).
+    secret_key: str
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 1440  # 24 hours
+
+    @field_validator("secret_key")
+    @classmethod
+    def _secret_key_strong_enough(cls, v: str) -> str:
+        if not v:
+            raise ValueError(
+                "SECRET_KEY env var is required. Generate one with "
+                "`python -c 'import secrets; print(secrets.token_urlsafe(64))'` "
+                "and add it to your .env (or Render env vars in production)."
+            )
+        if v.strip() == _LEGACY_INSECURE_KEY:
+            raise ValueError(
+                "SECRET_KEY is set to the legacy public placeholder string — "
+                "this key is in the GitHub repo and anyone can forge JWTs. "
+                "Generate a fresh one immediately."
+            )
+        if len(v) < 32:
+            raise ValueError(
+                f"SECRET_KEY is too short ({len(v)} chars). Use at least 32 chars; "
+                "we recommend 64 from secrets.token_urlsafe(64)."
+            )
+        return v
 
     # API Keys
     gemini_api_key: Optional[str] = None  # Google Gemini API key
