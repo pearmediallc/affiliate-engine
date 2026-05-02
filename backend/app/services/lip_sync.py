@@ -1,4 +1,12 @@
-"""Lip-sync service - generates talking-head videos from portrait + audio using Replicate API"""
+"""Lip-sync service - generates talking-head videos from portrait + audio using Replicate API.
+
+Uses Replicate's MODEL-NAME prediction endpoint (not version-pinned). This avoids the
+"422 Invalid version or not permitted" failures that happen when Replicate authors rotate
+or archive specific version SHAs. Replicate routes model-name predictions to the latest
+published version automatically.
+
+Reference: https://replicate.com/docs/reference/http#models.predictions.create
+"""
 import os
 import uuid
 import time
@@ -13,13 +21,27 @@ logger = logging.getLogger(__name__)
 DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Available lip-sync models on Replicate
+# Lip-sync models, keyed by short id. We pin the OWNER/NAME, not a version SHA,
+# so model authors can publish updates without breaking us.
 MODELS = {
     "sadtalker": {
-        "version": "cddbe60a2c5decfd19e4d3e12c03734520eb5c9c2d0a08aeb1c7bbff0e855014",
+        "owner": "cjwbw",
+        "model": "sadtalker",
         "name": "SadTalker",
         "description": "Audio-driven single image talking face animation",
         "supports_video_input": False,
+        "input_keys": {"image": "source_image", "audio": "driven_audio"},
+        "extras": {"enhancer": "gfpgan"},
+    },
+    # Fallbacks. If sadtalker is unavailable, the route can switch model id.
+    "wav2lip": {
+        "owner": "cjwbw",
+        "model": "wav2lip",
+        "name": "Wav2Lip",
+        "description": "Lip-sync model (faster, lower quality than SadTalker)",
+        "supports_video_input": True,
+        "input_keys": {"image": "face", "audio": "audio"},
+        "extras": {},
     },
 }
 
@@ -37,7 +59,11 @@ class LipSyncService:
         audio_url: str,
         model: str = "sadtalker",
     ) -> dict:
-        """Start a lip-sync generation job on Replicate. Returns prediction ID."""
+        """Start a lip-sync generation job on Replicate.
+
+        Uses the model-name prediction endpoint, which always routes to the latest
+        published version of `{owner}/{model}`. Returns prediction ID.
+        """
         token = settings.replicate_api_token
         if not token:
             raise ValueError("REPLICATE_API_TOKEN not configured")
@@ -51,26 +77,28 @@ class LipSyncService:
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "version": model_info["version"],
-            "input": {
-                "source_image": image_url,
-                "driven_audio": audio_url,
-                "enhancer": "gfpgan",  # Face enhancement
-            },
+        # Build input using each model's expected keys (e.g. SadTalker uses
+        # source_image/driven_audio; Wav2Lip uses face/audio).
+        input_keys = model_info["input_keys"]
+        payload_input = {
+            input_keys["image"]: image_url,
+            input_keys["audio"]: audio_url,
+            **model_info.get("extras", {}),
         }
 
-        r = requests.post(
-            "https://api.replicate.com/v1/predictions",
-            headers=headers, json=payload, timeout=30,
-        )
+        owner = model_info["owner"]
+        name = model_info["model"]
+        url = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
+
+        logger.info(f"Lip-sync request: model={owner}/{name}")
+        r = requests.post(url, headers=headers, json={"input": payload_input}, timeout=30)
 
         if r.status_code not in (200, 201):
             raise Exception(f"Replicate API error: {r.status_code} - {r.text[:300]}")
 
         data = r.json()
         prediction_id = data.get("id")
-        logger.info(f"Lip-sync job started: {prediction_id}")
+        logger.info(f"Lip-sync job started: {prediction_id} (model={owner}/{name})")
 
         return {
             "prediction_id": prediction_id,
