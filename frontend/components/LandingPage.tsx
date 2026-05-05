@@ -310,24 +310,22 @@ function WorkflowSection({ onCta }: { onCta: () => void }) {
           fontFamily: 'Barlow, sans-serif',
         }}
       >
-        {/* Top-row scrapbook layout: sticky note (left) | center copy | deadlines card (right) */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr',
-            gap: 32,
-            alignItems: 'center',
-          }}
-          className="lg:grid-cols-[260px_1fr_300px]"
-        >
-          {/* Yellow sticky note — desktop only */}
-          <div className="hidden lg:flex" style={{ justifyContent: 'flex-start' }}>
+        {/* TOP HERO BLOCK — relative wrapper so the floating cards anchor to it.
+            Center copy is in normal flow; sticky note + deadlines float over the
+            top corners on >=md screens, and stack inline below the copy on mobile. */}
+        <div className="workflow-hero">
+          {/* Sticky note — top-left float, scaled & positioned via class */}
+          <div className="workflow-sticky">
             <StickyNote />
           </div>
 
+          {/* Deadlines — top-right float */}
+          <div className="workflow-deadline">
+            <DeadlineCard />
+          </div>
+
           {/* Center copy */}
-          <div style={{ textAlign: 'center', maxWidth: 720, margin: '0 auto' }}>
-            {/* Small product icon, like the reference image */}
+          <div className="workflow-center">
             <div
               style={{
                 display: 'inline-flex',
@@ -413,33 +411,72 @@ function WorkflowSection({ onCta }: { onCta: () => void }) {
               </svg>
             </button>
           </div>
-
-          {/* Deadlines card — desktop only */}
-          <div className="hidden lg:flex" style={{ justifyContent: 'flex-end' }}>
-            <DeadlineCard />
-          </div>
         </div>
 
-        {/* Bottom row: Active Sprints (left) + Seamless Sync (right) — bigger cards now */}
-        <div
-          style={{
-            marginTop: 80,
-            display: 'grid',
-            gridTemplateColumns: '1fr',
-            gap: 20,
-          }}
-          className="lg:grid-cols-[1.3fr_1fr]"
-        >
+        {/* Bottom row — Active Sprints + Seamless Sync */}
+        <div className="workflow-bottom">
           <ActiveSprintsCard />
           <SeamlessSyncCard />
         </div>
-
-        {/* Mobile-only: stack the floating cards below */}
-        <div className="lg:hidden" style={{ marginTop: 32, display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <StickyNote />
-          <DeadlineCard />
-        </div>
       </div>
+
+      {/* Scoped CSS: media queries for the scrapbook composition.
+          Pattern: at <960px the floating cards become inline rows below the
+          center copy. At >=960px they absolutely position to the corners. */}
+      <style jsx>{`
+        .workflow-hero {
+          position: relative;
+          padding: 0;
+        }
+        .workflow-center {
+          text-align: center;
+          max-width: 720px;
+          margin: 0 auto;
+          padding: 0 0 0 0;
+        }
+        .workflow-sticky,
+        .workflow-deadline {
+          margin: 24px auto 0;
+          display: flex;
+          justify-content: center;
+        }
+        .workflow-bottom {
+          margin-top: 56px;
+          display: grid;
+          grid-template-columns: 1fr;
+          gap: 20px;
+        }
+
+        /* Tablet+: floating decorations, side-by-side bottom cards */
+        @media (min-width: 960px) {
+          .workflow-hero {
+            min-height: 520px;
+          }
+          .workflow-center {
+            padding-top: 24px;
+          }
+          .workflow-sticky {
+            position: absolute;
+            top: 0;
+            left: 0;
+            margin: 0;
+            display: block;
+            z-index: 2;
+          }
+          .workflow-deadline {
+            position: absolute;
+            top: 40px;
+            right: 0;
+            margin: 0;
+            display: block;
+            z-index: 2;
+          }
+          .workflow-bottom {
+            margin-top: 80px;
+            grid-template-columns: 1.3fr 1fr;
+          }
+        }
+      `}</style>
     </section>
   );
 }
@@ -845,64 +882,110 @@ function FeaturesBento() {
           </div>
         </div>
 
-        {/* Bento grid */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-            gridAutoRows: 'minmax(220px, auto)',
-            gap: 16,
-          }}
-        >
-          {/* Big tile — Long-form video */}
-          <BentoTile
-            number="01"
-            label="Long-Form Video"
-            title="Chain Veo 3.1 base + 20 extensions into one polished mp4"
-            body="Up to 148 seconds of cinematic AI video. Auto-stitched with ffmpeg. Cancel mid-flight, set a budget, or feed an existing image to animate from. Built on the same Veo 3.1 the big agencies pay $200/min for."
-            span={{ gridColumn: 'span 2', gridRow: 'span 2', minHeight: 460 }}
-            accent="🎬"
-          />
-
-          {/* Real-time yields style — Cost tracking */}
-          <BentoTile
-            number="02"
-            label="Real Cost Tracking"
-            title="Watch every cent in real time"
-            body="Per-call billing from each provider's actual rate card. Zero hardcoded estimates. Filter by provider, vertical, model, or user."
-          />
-
-          {/* Bank-grade — Two-phase approval */}
-          <BentoTile
-            number="03"
-            label="Audit-Grade Trust"
-            title="Two-phase approval, full audit log"
-            body="Every login, every edit, every generation recorded. Pending registrations need admin approval. Reject with a reason."
-          />
-
-          {/* Cross-chain — Multi-provider */}
-          <BentoTile
-            number="04"
-            label="Multi-Provider"
-            title="Failover across Imagen → DALL·E → FLUX → Ideogram automatically"
-            body="One generation request, intelligent routing across 4+ image providers. Same for video, TTS, and transcription. Never blocked by a single vendor."
-            link="View providers →"
-          />
-
-          <BentoTile
-            number="05"
-            label="14 Verticals"
-            title="Pre-built psychology for every offer"
-            body="Insurance, Nutra, ED, Bizop, Refi, Home Improvement, more. 5 conversion angles each (pain, benefit, social proof, curiosity, urgency)."
-          />
-
-          <BentoTile
-            number="06"
-            label="Talking Head + Lip-Sync"
-            title="Portrait + script → spokesperson video in 60 seconds"
-            body="Replicate-powered SadTalker, OpenAI/Google TTS, Whisper transcripts. Plug-and-play UGC."
-          />
+        {/* Bento grid — symmetric 4-column layout, no orphan tiles.
+            Layout target on >=md screens:
+            ┌───────────────┬─────┬─────┐
+            │               │  02 │  03 │
+            │   01 (big)    ├─────┼─────┤
+            │   2x2 cells   │  04 │  05 │
+            │               │     │     │
+            ├───────────────┴─────┴─────┤
+            │      06 (full-width banner)│
+            └───────────────────────────┘  */}
+        <div className="bento-grid">
+          <div className="bento-cell bento-01">
+            <BentoTile
+              number="01"
+              label="Long-Form Video"
+              title="Chain Veo 3.1 base + 20 extensions into one polished mp4"
+              body="Up to 148 seconds of cinematic AI video. Auto-stitched with ffmpeg. Cancel mid-flight, set a budget, or feed an existing image to animate from. Built on the same Veo 3.1 the big agencies pay $200/min for."
+              accent="🎬"
+              fillHeight
+            />
+          </div>
+          <div className="bento-cell">
+            <BentoTile
+              number="02"
+              label="Real Cost Tracking"
+              title="Watch every cent in real time"
+              body="Per-call billing from each provider's actual rate card. Zero hardcoded estimates. Filter by provider, vertical, model, or user."
+              fillHeight
+            />
+          </div>
+          <div className="bento-cell">
+            <BentoTile
+              number="03"
+              label="Audit-Grade Trust"
+              title="Two-phase approval, full audit log"
+              body="Every login, every edit, every generation recorded. Pending registrations need admin approval. Reject with a reason."
+              fillHeight
+            />
+          </div>
+          <div className="bento-cell">
+            <BentoTile
+              number="04"
+              label="Multi-Provider"
+              title="Failover Imagen → DALL·E → FLUX → Ideogram"
+              body="One generation request, intelligent routing across 4+ image providers. Same for video, TTS, and transcription."
+              fillHeight
+            />
+          </div>
+          <div className="bento-cell">
+            <BentoTile
+              number="05"
+              label="14 Verticals"
+              title="Pre-built psychology for every offer"
+              body="Insurance, Nutra, ED, Bizop, Refi, more. 5 conversion angles each: pain, benefit, social proof, curiosity, urgency."
+              fillHeight
+            />
+          </div>
+          <div className="bento-cell bento-06">
+            <BentoTile
+              number="06"
+              label="Talking Head + Lip-Sync"
+              title="Portrait + script → spokesperson video in 60 seconds"
+              body="Replicate-powered SadTalker, OpenAI/Google TTS, Whisper transcripts. Plug-and-play UGC for affiliate creators who don't want to be on camera."
+              accent="🎙️"
+              wide
+              fillHeight
+            />
+          </div>
         </div>
+
+        <style jsx>{`
+          .bento-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 16px;
+          }
+          .bento-cell {
+            min-height: 220px;
+          }
+          @media (min-width: 768px) {
+            .bento-grid {
+              grid-template-columns: repeat(2, 1fr);
+              grid-auto-rows: minmax(220px, auto);
+            }
+            .bento-06 {
+              grid-column: span 2;
+              min-height: 240px;
+            }
+          }
+          @media (min-width: 1024px) {
+            .bento-grid {
+              grid-template-columns: repeat(4, 1fr);
+            }
+            .bento-01 {
+              grid-column: span 2;
+              grid-row: span 2;
+              min-height: 460px;
+            }
+            .bento-06 {
+              grid-column: span 4;
+              min-height: 220px;
+            }
+          }
+        `}</style>
 
         {/* Banner CTA — like RIVR's "Melt rigid assets into fluid yield" */}
         <div
@@ -1008,17 +1091,19 @@ function BentoTile({
   label,
   title,
   body,
-  span,
   accent,
   link,
+  wide,
+  fillHeight,
 }: {
   number: string;
   label: string;
   title: string;
   body: string;
-  span?: React.CSSProperties;
   accent?: string;
   link?: string;
+  wide?: boolean;
+  fillHeight?: boolean;
 }) {
   return (
     <div
@@ -1031,91 +1116,109 @@ function BentoTile({
         backdropFilter: 'blur(12px)',
         transition: 'all 0.3s',
         display: 'flex',
-        flexDirection: 'column',
-        ...span,
+        flexDirection: wide ? 'row' : 'column',
+        gap: wide ? 32 : 0,
+        height: fillHeight ? '100%' : 'auto',
+        alignItems: wide ? 'center' : 'stretch',
       }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      {/* When wide=true, accent sits on the left as a hero-style icon column */}
+      {wide && accent && (
         <div
           style={{
-            fontSize: 11,
-            letterSpacing: '0.6px',
-            textTransform: 'uppercase',
-            color: 'rgba(255,255,255,0.45)',
-            fontWeight: 600,
-            fontFamily: 'Barlow, sans-serif',
-          }}
-        >
-          {label}
-        </div>
-        <div
-          style={{
-            fontSize: 11,
-            color: 'rgba(255,255,255,0.3)',
-            fontFamily: 'monospace',
-            letterSpacing: '0.2em',
-          }}
-        >
-          {number}
-        </div>
-      </div>
-
-      {accent && (
-        <div
-          style={{
-            fontSize: 56,
-            margin: '24px 0 12px',
-            opacity: 0.8,
+            fontSize: 72,
+            opacity: 0.85,
+            flexShrink: 0,
+            paddingLeft: 12,
           }}
         >
           {accent}
         </div>
       )}
 
-      <h3
-        style={{
-          marginTop: accent ? 0 : 24,
-          fontSize: span ? 24 : 19,
-          fontWeight: 600,
-          color: '#fff',
-          letterSpacing: '-0.5px',
-          lineHeight: 1.18,
-          fontFamily: 'Barlow, sans-serif',
-        }}
-      >
-        {title}
-      </h3>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div
+            style={{
+              fontSize: 11,
+              letterSpacing: '0.6px',
+              textTransform: 'uppercase',
+              color: 'rgba(255,255,255,0.45)',
+              fontWeight: 600,
+              fontFamily: 'Barlow, sans-serif',
+            }}
+          >
+            {label}
+          </div>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'rgba(255,255,255,0.3)',
+              fontFamily: 'monospace',
+              letterSpacing: '0.2em',
+            }}
+          >
+            {number}
+          </div>
+        </div>
 
-      <p
-        style={{
-          marginTop: 12,
-          fontSize: 14,
-          color: 'rgba(255,255,255,0.6)',
-          lineHeight: 1.5,
-          fontFamily: 'Barlow, sans-serif',
-          flex: 1,
-        }}
-      >
-        {body}
-      </p>
+        {!wide && accent && (
+          <div
+            style={{
+              fontSize: 56,
+              margin: '24px 0 12px',
+              opacity: 0.8,
+            }}
+          >
+            {accent}
+          </div>
+        )}
 
-      {link && (
-        <a
-          href="#"
+        <h3
           style={{
-            marginTop: 16,
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 6,
-            fontSize: 13,
-            color: '#2997ff',
-            fontWeight: 500,
+            marginTop: !wide && accent ? 0 : 18,
+            fontSize: wide ? 24 : 19,
+            fontWeight: 600,
+            color: '#fff',
+            letterSpacing: '-0.5px',
+            lineHeight: 1.18,
             fontFamily: 'Barlow, sans-serif',
           }}
         >
-          {link}
-        </a>
-      )}
+          {title}
+        </h3>
+
+        <p
+          style={{
+            marginTop: 10,
+            fontSize: 14,
+            color: 'rgba(255,255,255,0.6)',
+            lineHeight: 1.5,
+            fontFamily: 'Barlow, sans-serif',
+            flex: 1,
+          }}
+        >
+          {body}
+        </p>
+
+        {link && (
+          <a
+            href="#"
+            style={{
+              marginTop: 14,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 13,
+              color: '#2997ff',
+              fontWeight: 500,
+              fontFamily: 'Barlow, sans-serif',
+            }}
+          >
+            {link}
+          </a>
+        )}
+      </div>
     </div>
   );
 }
