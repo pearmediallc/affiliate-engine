@@ -4,6 +4,8 @@
 
 /* SF Pro font - use system fonts as fallback */
 @import url('https://fonts.cdnfonts.com/css/sf-pro-display');
+/* Landing-page fonts: Barlow + Instrument Serif */
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap');
 
 * {
   margin: 0;

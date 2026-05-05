@@ -6,6 +6,7 @@ import JobsPanel from '@/components/JobsPanel';
 import { fetchTemplates, fetchAnalytics } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import LoginPage from '@/components/LoginPage';
+import LandingPage from '@/components/LandingPage';
 
 export default function Home() {
   const { user, loading: authLoading } = useAuth();
@@ -14,6 +15,9 @@ export default function Home() {
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  // Public visitors land on the marketing page first; clicking any CTA flips
+  // to the login screen instead of jumping to it directly.
+  const [showLogin, setShowLogin] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -41,14 +45,14 @@ export default function Home() {
 
   if (authLoading) {
     return (
-      <div style={{ minHeight: '100vh', backgroundColor: '#f5f5f7', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <p style={{ color: 'rgba(0,0,0,0.48)', fontSize: '17px' }}>Loading...</p>
+      <div style={{ minHeight: '100vh', backgroundColor: '#0a0a0c', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <p style={{ color: 'rgba(255,255,255,0.48)', fontSize: '17px' }}>Loading...</p>
       </div>
     );
   }
 
   if (!user) {
-    return <LoginPage />;
+    return showLogin ? <LoginPage /> : <LandingPage onCta={() => setShowLogin(true)} />;
   }
 
   if (loading) {
