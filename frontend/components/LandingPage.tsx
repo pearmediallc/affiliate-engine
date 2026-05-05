@@ -285,7 +285,7 @@ function Logo() {
 }
 
 // ---------------------------------------------------------------------------
-// Section 2 — Workflow showcase (sticky-note + cards reference)
+// Section 2 — Workflow showcase (light cream scrapbook composition)
 // ---------------------------------------------------------------------------
 
 function WorkflowSection({ onCta }: { onCta: () => void }) {
@@ -293,242 +293,274 @@ function WorkflowSection({ onCta }: { onCta: () => void }) {
     <section
       id="workflow"
       style={{
-        padding: '120px 24px',
-        background:
-          'radial-gradient(ellipse at top, rgba(41,151,255,0.08) 0%, rgba(10,10,12,1) 60%)',
+        padding: '100px 24px 120px',
+        // Subtle dot grid on warm cream — keeps the bright energy from the hero.
+        background: `
+          radial-gradient(circle, rgba(40,40,40,0.10) 1px, transparent 1px) 0 0 / 22px 22px,
+          linear-gradient(180deg, #faf8f3 0%, #f4f1ea 100%)
+        `,
         position: 'relative',
       }}
     >
-      <div style={{ maxWidth: 1200, margin: '0 auto', position: 'relative' }}>
-        {/* Floating decorations on the sides */}
-        <StickyNote
+      <div
+        style={{
+          maxWidth: 1200,
+          margin: '0 auto',
+          position: 'relative',
+          fontFamily: 'Barlow, sans-serif',
+        }}
+      >
+        {/* Top-row scrapbook layout: sticky note (left) | center copy | deadlines card (right) */}
+        <div
           style={{
-            position: 'absolute',
-            top: 20,
-            left: -10,
-            transform: 'rotate(-6deg)',
-            display: 'none',
+            display: 'grid',
+            gridTemplateColumns: '1fr',
+            gap: 32,
+            alignItems: 'center',
           }}
-          className="lg:block"
-        />
-        <DeadlineCard
-          style={{
-            position: 'absolute',
-            top: 60,
-            right: -20,
-            display: 'none',
-          }}
-          className="lg:block"
-        />
-
-        {/* Centered headline + tagline */}
-        <div style={{ textAlign: 'center', maxWidth: 760, margin: '0 auto' }}>
-          <div
-            style={{
-              display: 'inline-block',
-              padding: '6px 14px',
-              borderRadius: 999,
-              border: '1px solid rgba(255,255,255,0.12)',
-              background: 'rgba(255,255,255,0.04)',
-              fontSize: 12,
-              letterSpacing: '0.5px',
-              textTransform: 'uppercase',
-              color: 'rgba(255,255,255,0.6)',
-              marginBottom: 20,
-              fontFamily: 'Barlow, sans-serif',
-            }}
-          >
-            The end-to-end workflow
+          className="lg:grid-cols-[260px_1fr_300px]"
+        >
+          {/* Yellow sticky note — desktop only */}
+          <div className="hidden lg:flex" style={{ justifyContent: 'flex-start' }}>
+            <StickyNote />
           </div>
-          <h2
-            style={{
-              fontSize: 'clamp(36px, 5vw, 64px)',
-              fontWeight: 600,
-              letterSpacing: '-2px',
-              lineHeight: 1.05,
-              color: '#fff',
-              fontFamily: 'Barlow, sans-serif',
-            }}
-          >
-            Capture the idea, generate the creative,
-            <br />
-            <span
+
+          {/* Center copy */}
+          <div style={{ textAlign: 'center', maxWidth: 720, margin: '0 auto' }}>
+            {/* Small product icon, like the reference image */}
+            <div
               style={{
-                fontFamily: '"Instrument Serif", serif',
-                fontStyle: 'italic',
-                fontWeight: 400,
-                color: 'rgba(255,255,255,0.7)',
+                display: 'inline-flex',
+                width: 72,
+                height: 72,
+                borderRadius: 18,
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: '#ffffff',
+                boxShadow:
+                  '0 1px 0 rgba(255,255,255,0.6) inset, 0 12px 32px rgba(40,40,60,0.10), 0 4px 12px rgba(40,40,60,0.05)',
+                marginBottom: 24,
               }}
             >
-              ship every variant.
-            </span>
-          </h2>
-          <p
-            style={{
-              marginTop: 24,
-              fontSize: 17,
-              color: 'rgba(255,255,255,0.6)',
-              fontFamily: 'Barlow, sans-serif',
-              fontWeight: 400,
-            }}
-          >
-            One platform from research to publish. Stop juggling 7 SaaS tools.
-            Stop hand-cutting Veo prompts. Generate, review, ship.
-          </p>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                <rect x="3" y="3" width="6" height="14" rx="1" fill="#0071e3" />
+                <rect x="11" y="7" width="6" height="10" rx="1" fill="#2997ff" />
+                <rect x="19" y="11" width="3" height="6" rx="1" fill="#5fb3ff" />
+              </svg>
+            </div>
+
+            <h2
+              style={{
+                fontSize: 'clamp(36px, 4.4vw, 60px)',
+                fontWeight: 700,
+                letterSpacing: '-1.6px',
+                lineHeight: 1.02,
+                color: '#0f0f10',
+                fontFamily: 'Barlow, sans-serif',
+              }}
+            >
+              Capture the idea,
+              <br />
+              generate the creative,
+              <br />
+              <span
+                style={{
+                  fontFamily: '"Instrument Serif", serif',
+                  fontStyle: 'italic',
+                  fontWeight: 400,
+                  color: '#5b5b62',
+                  fontSize: '1.04em',
+                }}
+              >
+                ship every variant.
+              </span>
+            </h2>
+
+            <p
+              style={{
+                marginTop: 24,
+                fontSize: 17,
+                lineHeight: 1.55,
+                color: '#5b5b62',
+                fontFamily: 'Barlow, sans-serif',
+                fontWeight: 400,
+              }}
+            >
+              One platform from research to publish. Stop juggling 7 SaaS tools.
+              Stop hand-cutting Veo prompts. Generate, review, ship.
+            </p>
+
+            <button
+              onClick={onCta}
+              style={{
+                marginTop: 28,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 10,
+                background: '#0f0f10',
+                color: '#fff',
+                padding: '14px 28px',
+                borderRadius: 999,
+                fontSize: 15,
+                fontWeight: 500,
+                fontFamily: 'Barlow, sans-serif',
+                boxShadow: '0 12px 28px rgba(15,15,16,0.18)',
+              }}
+            >
+              Try the workflow
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
+                <path d="M5 12h14M13 6l6 6-6 6" />
+              </svg>
+            </button>
+          </div>
+
+          {/* Deadlines card — desktop only */}
+          <div className="hidden lg:flex" style={{ justifyContent: 'flex-end' }}>
+            <DeadlineCard />
+          </div>
         </div>
 
-        {/* Active sprints + Seamless sync style cards */}
+        {/* Bottom row: Active Sprints (left) + Seamless Sync (right) — bigger cards now */}
         <div
           style={{
             marginTop: 80,
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-            gap: 16,
+            gridTemplateColumns: '1fr',
+            gap: 20,
           }}
+          className="lg:grid-cols-[1.3fr_1fr]"
         >
-          <WorkflowCard
-            label="Active Sprints"
-            children={
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <SprintRow tag="14" tagBg="#30d158" name="Insurance Q3" pct={80} />
-                <SprintRow tag="6"  tagBg="#0071e3" name="Nutra New Hooks" pct={42} />
-                <SprintRow tag="3"  tagBg="#ff453a" name="Bizop Funnel" pct={112} />
-              </div>
-            }
-          />
-          <WorkflowCard
-            label="Vertical Coverage"
-            children={
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {[
-                  'Home Insurance', 'Health Insurance', 'Medicare',
-                  'Auto', 'Life', 'CCW', 'Nutra', 'CBD',
-                  'Blood Sugar', 'ED', 'Refinance', 'Home Improvement',
-                  'WiFi', 'Bizop',
-                ].map((v) => (
-                  <span
-                    key={v}
-                    style={{
-                      padding: '6px 12px',
-                      borderRadius: 999,
-                      background: 'rgba(255,255,255,0.06)',
-                      border: '1px solid rgba(255,255,255,0.08)',
-                      fontSize: 12,
-                      color: '#e8e8ed',
-                      fontFamily: 'Barlow, sans-serif',
-                    }}
-                  >
-                    {v}
-                  </span>
-                ))}
-              </div>
-            }
-          />
-          <WorkflowCard
-            label="Seamless Sync"
-            children={
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <SyncRow icon="🎬" name="Veo 3.1" desc="Real cinematic video" />
-                <SyncRow icon="🖼️" name="Imagen 4 / DALL·E 3 / FLUX" desc="14 ad-creative angles" />
-                <SyncRow icon="🎙️" name="Whisper · OpenAI TTS · Lip-sync" desc="Talking-head ready" />
-              </div>
-            }
-          />
+          <ActiveSprintsCard />
+          <SeamlessSyncCard />
         </div>
 
-        <div style={{ textAlign: 'center', marginTop: 56 }}>
-          <button
-            onClick={onCta}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 10,
-              background: '#fff',
-              color: '#0a0a0c',
-              padding: '14px 28px',
-              borderRadius: 999,
-              fontSize: 16,
-              fontWeight: 500,
-              fontFamily: 'Barlow, sans-serif',
-            }}
-          >
-            Try the workflow
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4">
-              <path d="M5 12h14M13 6l6 6-6 6" />
-            </svg>
-          </button>
+        {/* Mobile-only: stack the floating cards below */}
+        <div className="lg:hidden" style={{ marginTop: 32, display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <StickyNote />
+          <DeadlineCard />
         </div>
       </div>
     </section>
   );
 }
 
-function StickyNote({ style, className }: { style?: React.CSSProperties; className?: string }) {
+function StickyNote() {
   return (
     <div
-      className={className}
       style={{
         width: 240,
-        height: 240,
-        background: '#fcef74',
-        boxShadow: '0 24px 48px rgba(0,0,0,0.35)',
-        padding: 28,
+        background: '#ffe567',
+        // Hand-folded paper feel with two layered shadows
+        boxShadow:
+          '0 1px 0 rgba(255,255,255,0.4) inset, 0 16px 32px rgba(40,40,40,0.18), 0 4px 12px rgba(40,40,40,0.08)',
+        padding: '32px 26px 36px',
         fontFamily: '"Instrument Serif", serif',
         fontStyle: 'italic',
         fontSize: 22,
-        color: '#1a1a1a',
-        lineHeight: 1.25,
-        ...style,
+        lineHeight: 1.28,
+        color: '#1c1c1e',
+        transform: 'rotate(-4deg)',
+        position: 'relative',
+        borderRadius: 2,
       }}
     >
-      Capture fleeting hooks, organize creative angles, ship faster than your competitors.
+      <div
+        style={{
+          position: 'absolute',
+          top: 14,
+          right: 22,
+          width: 12,
+          height: 12,
+          borderRadius: '50%',
+          background: '#dc4f4f',
+          boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+        }}
+      />
+      Capture fleeting hooks, organize creative angles, ship before your competitors do.
+      <div
+        style={{
+          marginTop: 18,
+          width: 36,
+          height: 36,
+          borderRadius: 8,
+          background: '#0071e3',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: '#fff',
+        }}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+          <path d="M5 12l5 5L20 7" />
+        </svg>
+      </div>
     </div>
   );
 }
 
-function DeadlineCard({ style, className }: { style?: React.CSSProperties; className?: string }) {
+function DeadlineCard() {
   return (
     <div
-      className={className}
       style={{
-        width: 280,
-        background: 'rgba(255,255,255,0.94)',
+        width: 290,
+        background: '#ffffff',
         color: '#1a1a1a',
-        borderRadius: 16,
-        padding: '18px 18px 22px',
+        borderRadius: 18,
+        padding: 18,
         fontFamily: 'Barlow, sans-serif',
-        boxShadow: '0 24px 48px rgba(0,0,0,0.35)',
-        ...style,
+        boxShadow:
+          '0 1px 0 rgba(255,255,255,0.6) inset, 0 18px 40px rgba(40,40,60,0.12), 0 4px 12px rgba(40,40,60,0.06)',
+        transform: 'rotate(2deg)',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
         <div
           style={{
-            width: 32,
-            height: 32,
-            borderRadius: 8,
-            background: '#fff',
-            border: '1px solid #eee',
+            width: 36,
+            height: 36,
+            borderRadius: 10,
+            background: '#f4f1ea',
+            border: '1px solid #ebe6dc',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
+            fontSize: 18,
           }}
         >
-          ⏱️
+          ⏱
         </div>
-        <span style={{ fontSize: 14, fontWeight: 600 }}>Deadlines</span>
+        <span style={{ fontSize: 15, fontWeight: 600, color: '#0f0f10' }}>Deadlines</span>
       </div>
+
       <div
         style={{
-          padding: 12,
-          borderRadius: 10,
-          background: 'rgba(41,151,255,0.08)',
-          border: '1px solid rgba(41,151,255,0.15)',
+          padding: 14,
+          borderRadius: 12,
+          background: 'linear-gradient(135deg, #eff6ff 0%, #f8faff 100%)',
+          border: '1px solid #dbeafe',
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600 }}>Q3 Variant Drop</div>
-        <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>50 ads ready by Friday</div>
-        <div style={{ fontSize: 12, color: '#0071e3', marginTop: 8, fontWeight: 600 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: '#0f0f10' }}>
+          Q3 Variant Drop
+        </div>
+        <div style={{ fontSize: 12, color: '#5b5b62', marginTop: 2 }}>
+          Review with the creative lead
+        </div>
+        <div
+          style={{
+            marginTop: 12,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 10px',
+            borderRadius: 6,
+            background: '#fff',
+            border: '1px solid #dbeafe',
+            fontSize: 12,
+            fontWeight: 600,
+            color: '#0071e3',
+          }}
+        >
           🕐 13:00 – 13:45
         </div>
       </div>
@@ -536,98 +568,216 @@ function DeadlineCard({ style, className }: { style?: React.CSSProperties; class
   );
 }
 
-function WorkflowCard({ label, children }: { label: string; children: React.ReactNode }) {
+function ActiveSprintsCard() {
+  const sprints = [
+    { tag: '14', tagBg: '#30d158', name: 'Insurance Q3',  date: 'Sep 10', pct: 80 },
+    { tag: '6',  tagBg: '#0071e3', name: 'Nutra New Hooks', date: 'Sep 14', pct: 42 },
+    { tag: '3',  tagBg: '#ff453a', name: 'Bizop Funnel',    date: 'Sep 18', pct: 112 },
+  ];
   return (
     <div
       style={{
-        padding: 24,
-        borderRadius: 18,
-        background: 'rgba(255,255,255,0.04)',
-        border: '1px solid rgba(255,255,255,0.08)',
-        backdropFilter: 'blur(12px)',
+        background: '#ffffff',
+        borderRadius: 24,
+        padding: 28,
+        border: '1px solid #ebe6dc',
+        boxShadow:
+          '0 1px 0 rgba(255,255,255,0.6) inset, 0 18px 40px rgba(40,40,60,0.08)',
       }}
     >
       <div
         style={{
           fontSize: 13,
           fontWeight: 600,
-          color: 'rgba(255,255,255,0.5)',
+          color: '#5b5b62',
           letterSpacing: '0.4px',
           textTransform: 'uppercase',
-          marginBottom: 18,
+          marginBottom: 22,
           fontFamily: 'Barlow, sans-serif',
         }}
       >
-        {label}
+        Active Sprints
       </div>
-      {children}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+        {sprints.map((s) => (
+          <div key={s.name}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+              <span
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: '50%',
+                  background: s.tagBg,
+                  color: '#fff',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                {s.tag}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 15, fontWeight: 500, color: '#0f0f10' }}>{s.name}</div>
+                <div style={{ fontSize: 11, color: '#9b9ba1', marginTop: 1 }}>{s.date}</div>
+              </div>
+              <span style={{ fontSize: 12, color: '#5b5b62', fontWeight: 500 }}>{s.pct}%</span>
+            </div>
+            <div
+              style={{
+                height: 4,
+                borderRadius: 2,
+                background: '#f4f1ea',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  height: '100%',
+                  width: `${Math.min(s.pct, 100)}%`,
+                  background: s.pct > 100 ? '#ff453a' : 'linear-gradient(90deg,#0071e3,#2997ff)',
+                }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-function SprintRow({ tag, tagBg, name, pct }: { tag: string; tagBg: string; name: string; pct: number }) {
+function SeamlessSyncCard() {
+  const rows = [
+    {
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0071e3" strokeWidth="1.8">
+          <rect x="3" y="6" width="14" height="12" rx="2" />
+          <path d="M17 10l4-2v8l-4-2z" />
+        </svg>
+      ),
+      name: 'Veo 3.1',
+      desc: 'Real cinematic video',
+      bg: '#eff6ff',
+    },
+    {
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#bf5af2" strokeWidth="1.8">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <circle cx="8.5" cy="8.5" r="1.5" />
+          <path d="M21 15l-5-5L5 21" />
+        </svg>
+      ),
+      name: 'Imagen 4 / DALL·E 3 / FLUX',
+      desc: '14 ad-creative angles per vertical',
+      bg: '#faf3ff',
+    },
+    {
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff9500" strokeWidth="1.8">
+          <rect x="9" y="2" width="6" height="12" rx="3" />
+          <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3" />
+        </svg>
+      ),
+      name: 'Whisper · OpenAI TTS · Lip-sync',
+      desc: 'Talking-head ready',
+      bg: '#fff5e6',
+    },
+  ];
+
   return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-        <span
-          style={{
-            width: 24,
-            height: 24,
-            borderRadius: '50%',
-            background: tagBg,
-            color: '#fff',
-            fontSize: 11,
-            fontWeight: 600,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          {tag}
-        </span>
-        <span style={{ fontSize: 14, fontWeight: 500, color: '#e8e8ed', flex: 1 }}>{name}</span>
-        <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{pct}%</span>
-      </div>
+    <div
+      style={{
+        background: '#ffffff',
+        borderRadius: 24,
+        padding: 28,
+        border: '1px solid #ebe6dc',
+        boxShadow:
+          '0 1px 0 rgba(255,255,255,0.6) inset, 0 18px 40px rgba(40,40,60,0.08)',
+      }}
+    >
       <div
         style={{
-          height: 4,
-          borderRadius: 2,
-          background: 'rgba(255,255,255,0.08)',
-          overflow: 'hidden',
+          fontSize: 13,
+          fontWeight: 600,
+          color: '#5b5b62',
+          letterSpacing: '0.4px',
+          textTransform: 'uppercase',
+          marginBottom: 22,
+          fontFamily: 'Barlow, sans-serif',
+        }}
+      >
+        Seamless Sync
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        {rows.map((r) => (
+          <div key={r.name} style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <div
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: 12,
+                background: r.bg,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              {r.icon}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 15, fontWeight: 500, color: '#0f0f10' }}>{r.name}</div>
+              <div style={{ fontSize: 12, color: '#5b5b62', marginTop: 1 }}>{r.desc}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Vertical pills row — keeps the "all 14 verticals" message visible */}
+      <div
+        style={{
+          marginTop: 22,
+          paddingTop: 22,
+          borderTop: '1px solid #f4f1ea',
         }}
       >
         <div
           style={{
-            height: '100%',
-            width: `${Math.min(pct, 100)}%`,
-            background: pct > 100 ? '#ff453a' : 'linear-gradient(90deg,#0071e3,#2997ff)',
+            fontSize: 11,
+            fontWeight: 600,
+            color: '#9b9ba1',
+            letterSpacing: '0.4px',
+            textTransform: 'uppercase',
+            marginBottom: 10,
           }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function SyncRow({ icon, name, desc }: { icon: string; name: string; desc: string }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-      <div
-        style={{
-          width: 36,
-          height: 36,
-          borderRadius: 8,
-          background: 'rgba(255,255,255,0.08)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          fontSize: 18,
-        }}
-      >
-        {icon}
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 500, color: '#e8e8ed' }}>{name}</div>
-        <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.5)' }}>{desc}</div>
+        >
+          14 verticals supported
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {[
+            'Insurance', 'Medicare', 'Auto', 'Life', 'CCW',
+            'Nutra', 'CBD', 'Blood Sugar', 'ED',
+            'Refi', 'Home Improvement', 'WiFi', 'Bizop', 'Health',
+          ].map((v) => (
+            <span
+              key={v}
+              style={{
+                padding: '4px 10px',
+                borderRadius: 999,
+                background: '#f4f1ea',
+                color: '#5b5b62',
+                fontSize: 11,
+                fontWeight: 500,
+              }}
+            >
+              {v}
+            </span>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -823,6 +973,10 @@ function FeaturesBento() {
             </div>
             <div style={{ display: 'flex', gap: 12 }}>
               <button
+                onClick={() => {
+                  const el = document.getElementById('pricing');
+                  el?.scrollIntoView({ behavior: 'smooth' });
+                }}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -840,20 +994,6 @@ function FeaturesBento() {
                   <path d="M7 17 L17 7 M9 7 H17 V15" />
                 </svg>
                 Launch App
-              </button>
-              <button
-                style={{
-                  border: '1px solid rgba(255,255,255,0.4)',
-                  color: '#fff',
-                  borderRadius: 999,
-                  padding: '14px 24px',
-                  fontSize: 15,
-                  fontWeight: 500,
-                  fontFamily: 'Barlow, sans-serif',
-                  background: 'rgba(255,255,255,0.06)',
-                }}
-              >
-                Read Docs
               </button>
             </div>
           </div>
