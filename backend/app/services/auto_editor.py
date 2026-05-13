@@ -68,6 +68,158 @@ def _get_duration(path: str) -> float:
         return 0.0
 
 
+def _get_resolution(path: str) -> tuple[int, int]:
+    """Return (width, height) of first video stream, or (0, 0) on failure."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "v:0", path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        streams = json.loads(r.stdout).get("streams", [])
+        if streams:
+            return int(streams[0].get("width", 0)), int(streams[0].get("height", 0))
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _normalize_input(input_path: str, output_path: str, max_dim: int = 1080) -> str:
+    """
+    Scale the video down so neither dimension exceeds max_dim.
+    Returns output_path if normalization happened, input_path if skipped.
+    """
+    w, h = _get_resolution(input_path)
+    if w == 0 or h == 0 or max(w, h) <= max_dim:
+        return input_path  # already small enough, skip re-encode
+
+    logger.info(f"Normalizing input {w}x{h} → max {max_dim}px")
+    ok = _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"scale={max_dim}:{max_dim}:force_original_aspect_ratio=decrease",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ])
+    return output_path if ok and os.path.isfile(output_path) else input_path
+
+
+# ── Single-pass helpers (one encode per output, no intermediate files) ────────
+
+# Scale that caps both dimensions to 1920 max — handles landscape and portrait
+_NORMALIZE_FILTER = "scale=1920:1920:force_original_aspect_ratio=decrease"
+
+
+def _single_pass_edit(
+    input_path: str,
+    output_path: str,
+    color_grade: str = "none",
+    caption_text: str = "",
+    caption_style: str = "subtitle",
+    aspect: str = "16:9",
+    music_path: Optional[str] = None,
+) -> bool:
+    """
+    All-in-one ffmpeg pass: normalize → color grade → aspect crop/scale → caption.
+    One encode per output aspect; no intermediate temp files.
+    Ultrafast preset + 2 threads to stay within 512 MB RAM.
+    """
+    vf_parts: list[str] = [_NORMALIZE_FILTER]
+
+    color_filter = _COLOR_GRADE_FILTERS.get(color_grade)
+    if color_filter:
+        vf_parts.append(color_filter)
+
+    aspect_filter = _ASPECT_FILTERS.get(aspect)
+    if aspect_filter:
+        vf_parts.append(aspect_filter)
+
+    if caption_text.strip():
+        text = caption_text.strip().replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        if caption_style == "bold_center":
+            fs, y = 52, "(h-text_h)/2"
+        else:
+            fs, y = 40, "h-text_h-80"
+        vf_parts.append(
+            f"drawtext=text='{text}':x=(w-text_w)/2:y={y}:"
+            f"fontsize={fs}:fontcolor=white:borderw=2:bordercolor=black@0.8"
+        )
+
+    vf = ",".join(vf_parts)
+    has_music = bool(music_path and os.path.isfile(music_path))
+
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if has_music:
+        cmd += ["-i", music_path]
+        fc = (
+            f"[0:v]{vf}[vout];"
+            "[0:a]volume=1.0[va];"
+            "[1:a]volume=0.12[ma];"
+            "[va][ma]amix=inputs=2:duration=first,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+        )
+        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]"]
+    else:
+        cmd += ["-vf", vf, "-map", "0:v", "-map", "0:a?"]
+
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    return _run(cmd)
+
+
+def _single_pass_caption(
+    input_path: str,
+    output_path: str,
+    srt_path: str,
+    caption_style: str = "subtitle",
+    aspect: str = "9:16",
+) -> bool:
+    """
+    Burn SRT captions + aspect-ratio crop in one ffmpeg pass.
+    Fallback to drawtext-based burn if subtitles filter fails (no libass).
+    """
+    if caption_style == "bold_center":
+        force_style = "FontSize=52,PrimaryColour=&HFFFFFF,Alignment=10,BorderStyle=3,Outline=3,Shadow=0"
+    else:
+        force_style = "FontSize=36,PrimaryColour=&HFFFFFF,Alignment=2,BorderStyle=4,BackColour=&H80000000,MarginV=40"
+
+    safe_srt = srt_path.replace("\\", "/").replace(":", "\\:")
+    aspect_filter = _ASPECT_FILTERS.get(aspect, "")
+    vf_parts = [_NORMALIZE_FILTER]
+    if aspect_filter:
+        vf_parts.append(aspect_filter)
+    vf_parts.append(f"subtitles={safe_srt}:force_style='{force_style}'")
+    vf = ",".join(vf_parts)
+
+    ok = _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ])
+    if ok and os.path.isfile(output_path):
+        return True
+
+    # libass not available — fall back to drawtext (reads SRT, burns manually)
+    logger.warning("subtitles filter failed, falling back to plain aspect export without captions")
+    vf2 = ",".join([_NORMALIZE_FILTER, aspect_filter] if aspect_filter else [_NORMALIZE_FILTER])
+    return _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", vf2,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ])
+
+
 # ─────────────────────────────────────────────── STEP 1: stitch
 
 def _stitch_shots(video_paths: list[str], output_path: str) -> bool:
@@ -316,9 +468,67 @@ def _export_aspect(input_path: str, aspect: str) -> Optional[str]:
     ok = _run([
         "ffmpeg", "-y", "-i", input_path,
         "-vf", filt,
-        "-c:a", "copy", out,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
+        out,
     ])
     return out if ok else None
+
+
+# ─────────────────────────────────────────────── STEP 7: auto-caption helpers
+
+def _fmt_srt_time(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _segments_to_captions(segments: list[dict], words_per_line: int = 5) -> list[dict]:
+    """Chunk Whisper segments into short caption lines with proportional timestamps."""
+    captions = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start))
+        words = text.split()
+        if not words:
+            continue
+        word_dur = (end - start) / len(words)
+        for i in range(0, len(words), words_per_line):
+            chunk = words[i:i + words_per_line]
+            c_start = start + i * word_dur
+            c_end = min(c_start + len(chunk) * word_dur, end)
+            captions.append({
+                "start": round(c_start, 3),
+                "end": round(c_end, 3),
+                "text": " ".join(chunk),
+            })
+    return captions
+
+
+def _captions_to_srt(captions: list[dict]) -> str:
+    parts = []
+    for i, cap in enumerate(captions, 1):
+        parts.append(
+            f"{i}\n{_fmt_srt_time(cap['start'])} --> {_fmt_srt_time(cap['end'])}\n{cap['text']}"
+        )
+    return "\n\n".join(parts)
+
+
+def _burn_srt(input_path: str, output_path: str, srt_path: str, style: str = "subtitle") -> bool:
+    if style == "bold_center":
+        force_style = "FontSize=52,PrimaryColour=&HFFFFFF,Alignment=10,BorderStyle=3,Outline=3,Shadow=0"
+    else:
+        force_style = "FontSize=36,PrimaryColour=&HFFFFFF,Alignment=2,BorderStyle=4,BackColour=&H80000000,MarginV=40"
+    safe_path = srt_path.replace("\\", "/").replace(":", "\\:")
+    return _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"subtitles={safe_path}:force_style='{force_style}'",
+        "-c:a", "copy", output_path,
+    ])
 
 
 # ─────────────────────────────────────────────── Public API

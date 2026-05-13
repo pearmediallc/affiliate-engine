@@ -6,6 +6,7 @@ Body bytes are NEVER stored — that would leak prompts, passwords, image data.
 Designed to be cheap: a single INSERT per request via background DB session,
 so a failure to log never breaks the originating request.
 """
+import asyncio
 import time
 import logging
 from fastapi import Request
@@ -120,26 +121,28 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
         except Exception:
             duration_ms = None
 
-        # Best-effort user resolution + audit write. Any failure here is
-        # logged but never re-raised.
-        try:
-            user_id, user_email, role = (None, None, None)
-            if token:
-                try:
-                    user_id, user_email, role = _resolve_user_from_token(token)
-                except Exception:
-                    pass
+        # Best-effort user resolution + audit write — run in thread so the
+        # sync DB call never blocks the event loop.
+        def _audit_write():
+            try:
+                user_id, user_email, role = (None, None, None)
+                if token:
+                    try:
+                        user_id, user_email, role = _resolve_user_from_token(token)
+                    except Exception:
+                        pass
+                record(
+                    action=ACTION_API_REQUEST,
+                    category=_category_for_path(path),
+                    user_id=user_id, user_email=user_email, role=role,
+                    method=method, path=path,
+                    status_code=getattr(response, "status_code", None),
+                    duration_ms=duration_ms,
+                    ip=ip, user_agent=ua,
+                )
+            except Exception as e:
+                logger.debug(f"audit middleware swallow: {e}")
 
-            record(
-                action=ACTION_API_REQUEST,
-                category=_category_for_path(path),
-                user_id=user_id, user_email=user_email, role=role,
-                method=method, path=path,
-                status_code=getattr(response, "status_code", None),
-                duration_ms=duration_ms,
-                ip=ip, user_agent=ua,
-            )
-        except Exception as e:
-            logger.debug(f"audit middleware swallow: {e}")
+        asyncio.get_event_loop().run_in_executor(None, _audit_write)
 
         return response

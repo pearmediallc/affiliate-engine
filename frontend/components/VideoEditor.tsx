@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef } from 'react';
-import { editVideo, API_HOST } from '../lib/api';
+import { editVideo, autoCaptionVideo, API_HOST } from '../lib/api';
 
 const labelStyle: React.CSSProperties = {
   fontSize: '12px', fontWeight: 600, color: 'rgba(255,255,255,0.45)',
@@ -16,6 +16,13 @@ const CAPTION_STYLES = [
 const MUSIC_MOODS = ['', 'motivational', 'upbeat', 'energetic', 'calm', 'dramatic', 'corporate', 'inspiring'];
 const ASPECTS = ['16:9', '9:16', '1:1'];
 
+interface CaptionResult {
+  urls: Record<string, string>;
+  srt: string;
+  transcript: string;
+  caption_count: number;
+}
+
 export default function VideoEditor() {
   const [file, setFile] = useState<File | null>(null);
   const [colorGrade, setColorGrade] = useState('none');
@@ -27,6 +34,44 @@ export default function VideoEditor() {
   const [error, setError] = useState('');
   const [results, setResults] = useState<Record<string, string> | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Auto-caption state
+  const [acWordsPerLine, setAcWordsPerLine] = useState(5);
+  const [acStyle, setAcStyle] = useState('subtitle');
+  const [acAspects, setAcAspects] = useState<string[]>(['9:16']);
+  const [acProcessing, setAcProcessing] = useState(false);
+  const [acError, setAcError] = useState('');
+  const [acResult, setAcResult] = useState<CaptionResult | null>(null);
+
+  function toggleAcAspect(a: string) {
+    setAcAspects(prev => prev.includes(a) ? prev.filter(x => x !== a) : [...prev, a]);
+  }
+
+  async function handleAutoCaption() {
+    if (!file) return;
+    setAcProcessing(true); setAcError(''); setAcResult(null);
+    try {
+      const fd = new FormData();
+      fd.append('video', file);
+      fd.append('words_per_line', String(acWordsPerLine));
+      fd.append('caption_style', acStyle);
+      fd.append('output_aspects', acAspects.join(',') || '9:16');
+      const r = await autoCaptionVideo(fd);
+      if (r.success && r.data?.urls) {
+        const resolved: Record<string, string> = {};
+        for (const [k, url] of Object.entries(r.data.urls as Record<string, string>)) {
+          resolved[k] = (url as string).startsWith('http') ? url as string : `${API_HOST}${url}`;
+        }
+        setAcResult({ ...r.data, urls: resolved });
+      } else {
+        setAcError(r.message || 'Auto-caption failed');
+      }
+    } catch (e: any) {
+      setAcError(e?.response?.data?.detail || e.message || 'Failed');
+    } finally {
+      setAcProcessing(false);
+    }
+  }
 
   function toggleAspect(a: string) {
     setSelectedAspects(prev =>
@@ -244,6 +289,148 @@ export default function VideoEditor() {
           </div>
         </div>
       )}
+
+      {/* ── Auto-Caption ── */}
+      <div className="card" style={{ padding: '20px' }}>
+        <div style={{ marginBottom: '16px' }}>
+          <h3 style={{ fontSize: '16px', fontWeight: 600, color: '#e8e8ed', margin: 0 }}>Auto-Caption</h3>
+          <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)', marginTop: '4px' }}>
+            Transcribes speech with Whisper AI and burns accurate timed captions — like professional caption tools.
+            Upload a video above first.
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', marginBottom: '16px' }}>
+          {/* Words per line */}
+          <div>
+            <label style={labelStyle}>Words per caption line</label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              {[3, 5, 7].map(n => (
+                <button key={n} onClick={() => setAcWordsPerLine(n)}
+                  style={{
+                    padding: '7px 16px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                    fontSize: '14px', fontWeight: 600, transition: 'all 0.15s',
+                    background: acWordsPerLine === n ? '#0071e3' : 'rgba(255,255,255,0.08)',
+                    color: acWordsPerLine === n ? '#fff' : 'rgba(255,255,255,0.6)',
+                  }}>{n}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Style */}
+          <div>
+            <label style={labelStyle}>Caption style</label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              {[{ id: 'subtitle', label: 'Bottom subtitle' }, { id: 'bold_center', label: 'Bold center' }].map(s => (
+                <button key={s.id} onClick={() => setAcStyle(s.id)}
+                  style={{
+                    padding: '7px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                    fontSize: '13px', transition: 'all 0.15s',
+                    background: acStyle === s.id ? '#0071e3' : 'rgba(255,255,255,0.08)',
+                    color: acStyle === s.id ? '#fff' : 'rgba(255,255,255,0.6)',
+                  }}>{s.label}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Export formats */}
+          <div>
+            <label style={labelStyle}>Export format</label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              {ASPECTS.map(a => (
+                <button key={a} onClick={() => toggleAcAspect(a)}
+                  style={{
+                    padding: '7px 14px', borderRadius: '8px',
+                    border: `1px solid ${acAspects.includes(a) ? '#0071e3' : 'rgba(255,255,255,0.12)'}`,
+                    cursor: 'pointer', fontSize: '13px', fontWeight: 500, transition: 'all 0.15s',
+                    background: acAspects.includes(a) ? 'rgba(0,113,227,0.15)' : 'rgba(255,255,255,0.04)',
+                    color: acAspects.includes(a) ? '#2997ff' : 'rgba(255,255,255,0.5)',
+                  }}>{a}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <button
+          className="btn-primary"
+          onClick={handleAutoCaption}
+          disabled={!file || acProcessing}
+          style={{ fontSize: '14px', marginBottom: '12px' }}
+        >
+          {acProcessing ? 'Transcribing & burning captions...' : 'Transcribe & Caption'}
+        </button>
+
+        {acProcessing && (
+          <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '8px' }}>
+            Extracting audio → Whisper transcription → burning captions — takes 30–90 seconds
+          </p>
+        )}
+
+        {acError && (
+          <div style={{ background: 'rgba(255,69,58,0.1)', border: '1px solid rgba(255,69,58,0.3)', borderRadius: '8px', padding: '10px 14px', fontSize: '13px', color: '#ff6961', marginBottom: '8px' }}>
+            {acError}
+          </div>
+        )}
+
+        {/* Results */}
+        {acResult && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <div style={{ background: 'rgba(48,209,88,0.08)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '8px', padding: '10px 14px', fontSize: '13px', color: '#30d158' }}>
+              {acResult.caption_count} caption lines generated
+            </div>
+
+            {/* Transcript */}
+            <div>
+              <label style={labelStyle}>Transcript</label>
+              <div style={{
+                background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: '8px', padding: '12px', fontSize: '13px', color: 'rgba(255,255,255,0.7)',
+                lineHeight: 1.6, maxHeight: '120px', overflowY: 'auto',
+              }}>
+                {acResult.transcript}
+              </div>
+            </div>
+
+            {/* SRT download */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <label style={{ ...labelStyle, marginBottom: 0 }}>SRT file</label>
+              <a
+                href={`data:text/plain;charset=utf-8,${encodeURIComponent(acResult.srt)}`}
+                download="captions.srt"
+                style={{
+                  padding: '5px 12px', borderRadius: '7px', background: 'rgba(255,255,255,0.08)',
+                  color: '#e8e8ed', fontSize: '12px', textDecoration: 'none',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                }}
+              >
+                Download .srt
+              </a>
+            </div>
+
+            {/* Video outputs */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '12px' }}>
+              {Object.entries(acResult.urls).map(([aspect, url]) => (
+                <div key={aspect} style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '12px', overflow: 'hidden' }}>
+                  <div style={{
+                    aspectRatio: aspect === '9:16' ? '9/16' : aspect === '1:1' ? '1/1' : '16/9',
+                    maxHeight: aspect === '9:16' ? '300px' : '180px',
+                    background: '#000',
+                  }}>
+                    <video src={url} controls style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                  </div>
+                  <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed' }}>{aspect}</span>
+                    <a href={url} download style={{
+                      padding: '5px 12px', borderRadius: '7px', background: '#0071e3', color: '#fff',
+                      fontSize: '12px', textDecoration: 'none', fontWeight: 500,
+                    }}>Download</a>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

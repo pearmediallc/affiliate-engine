@@ -380,6 +380,15 @@ export const searchStock = async (query: string, orientation = 'portrait') => {
   return r.data;
 };
 
+// Auto-caption: transcribe with Whisper + burn timed captions
+export const autoCaptionVideo = async (formData: FormData) => {
+  const r = await apiClient.post('/video-edit/auto-caption', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300000,
+  });
+  return r.data;
+};
+
 // Standalone video editor
 export const editVideo = async (formData: FormData) => {
   const r = await apiClient.post('/video-edit/edit', formData, {
