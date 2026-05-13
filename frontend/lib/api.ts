@@ -380,4 +380,13 @@ export const searchStock = async (query: string, orientation = 'portrait') => {
   return r.data;
 };
 
+// Standalone video editor
+export const editVideo = async (formData: FormData) => {
+  const r = await apiClient.post('/video-edit/edit', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300000, // 5 min — ffmpeg can take a while
+  });
+  return r.data;
+};
+
 export default apiClient;

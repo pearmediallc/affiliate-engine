@@ -18,6 +18,9 @@ import TalkingHead from './TalkingHead';
 import VideoCreator from './VideoCreator';
 import { useAuth } from '@/lib/auth';
 import CampaignStudio from './CampaignStudio';
+import VideoEditor from './VideoEditor';
+import MusicLibrary from './MusicLibrary';
+import StockLibrary from './StockLibrary';
 
 interface Template {
   [key: string]: unknown;
@@ -88,6 +91,30 @@ const navGroups = [
           <path d="M23 7l-7 5 7 5V7z" /><rect x="1" y="5" width="15" height="14" rx="2" />
         </svg>
       )},
+      { id: 'video-editor', label: 'Video Editor', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+          <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+        </svg>
+      )},
+    ],
+  },
+  {
+    label: 'ASSETS',
+    items: [
+      { id: 'music-library', label: 'Music Library', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 18V5l12-2v13" />
+          <circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+        </svg>
+      )},
+      { id: 'stock-library', label: 'Stock Footage', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="2" y="2" width="20" height="20" rx="2" />
+          <circle cx="8.5" cy="8.5" r="1.5" />
+          <path d="M21 15l-5-5L5 21" />
+        </svg>
+      )},
     ],
   },
   {
@@ -147,6 +174,9 @@ const navGroups = [
 
 const pageMeta: Record<string, { title: string; description: string }> = {
   'campaign-studio': { title: 'Campaign Studio', description: 'End-to-end video ad creation: brief → script → storyboard → generate → edit → review' },
+  'video-editor': { title: 'Video Editor', description: 'Upload any video — add captions, color grade, background music, export in 9:16 / 1:1 / 16:9' },
+  'music-library': { title: 'Music Library', description: 'Search Pixabay CC0 music by mood — free for commercial use, no attribution required' },
+  'stock-library': { title: 'Stock Footage', description: 'Search Pexels free B-roll clips — hover to preview, download in any aspect ratio' },
   generate: { title: 'Generate Images', description: 'Create high-performing ad images for affiliate campaigns' },
   gallery: { title: 'Gallery', description: 'Browse and manage your generated images' },
   scripts: { title: 'Script Generator', description: 'Generate persuasive ad scripts for your campaigns' },
@@ -516,6 +546,9 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
             {activeTab === 'landing-page' && <LandingPageStudio />}
 
             {activeTab === 'campaign-studio' && <CampaignStudio />}
+            {activeTab === 'video-editor' && <VideoEditor />}
+            {activeTab === 'music-library' && <MusicLibrary />}
+            {activeTab === 'stock-library' && <StockLibrary />}
 
             {activeTab === 'admin' && hasPermission('admin_panel') && (
               <AdminPanel />
