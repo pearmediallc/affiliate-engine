@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import {
   createCampaign, getCampaign, runBriefing, runScripting, runStoryboarding,
   startGeneration, runEditing, listCharacters, listSceneSettings,
@@ -10,849 +10,1146 @@ import {
 import { VERTICALS } from '../lib/verticals';
 import VariationGrid from './VariationGrid';
 
-// ─────────────────────────────────────── Types
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Campaign {
-  id: string;
-  name: string;
-  vertical: string;
-  status: string;
-  brief_text: string;
-  analyzed_brief: Record<string, any> | null;
-  script: string | null;
-  storyboard: any[] | null;
-  shots: any[];
-  total_cost_usd: number;
-  created_at: string;
+  id: string; name: string; vertical: string; status: string;
+  brief_text: string; analyzed_brief: Record<string, any> | null;
+  script: string | null; storyboard: any[] | null; shots: any[];
+  total_cost_usd: number; created_at: string;
+}
+interface Character {
+  id: string; name: string; description: string;
+  portrait_url: string | null; consistency_prompt: string | null;
+}
+interface SceneSetting {
+  id: string; name: string; description: string;
+  location_type: string; reference_image_url: string | null;
 }
 
-interface Character { id: string; name: string; description: string; portrait_url: string | null; consistency_prompt: string | null; }
-interface SceneSetting { id: string; name: string; description: string; location_type: string; reference_image_url: string | null; }
+// ─── Shared styles (match app design system) ──────────────────────────────────
 
-const STEPS = ['brief', 'script', 'storyboard', 'generate', 'edit', 'review'] as const;
-type Step = typeof STEPS[number];
-
-const STEP_LABELS: Record<Step, string> = {
-  brief: 'Brief',
-  script: 'Script',
-  storyboard: 'Storyboard',
-  generate: 'Generate',
-  edit: 'Edit',
-  review: 'Review',
+const labelStyle: React.CSSProperties = {
+  fontSize: '12px', fontWeight: 600, color: 'rgba(255,255,255,0.45)',
+  textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: '6px', display: 'block',
+};
+const sectionTitle: React.CSSProperties = {
+  fontSize: '16px', fontWeight: 600, color: '#e8e8ed', marginBottom: '4px',
+};
+const subText: React.CSSProperties = {
+  fontSize: '13px', color: 'rgba(255,255,255,0.45)',
 };
 
-const STATUS_TO_STEP: Record<string, Step> = {
-  draft: 'brief',
-  briefing: 'script',
-  scripting: 'storyboard',
-  storyboarding: 'generate',
-  generating: 'generate',
-  editing: 'edit',
-  review: 'review',
-  completed: 'review',
-};
+function tabBtn(active: boolean): React.CSSProperties {
+  return {
+    padding: '8px 18px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+    fontSize: '14px', fontWeight: active ? 600 : 400, transition: 'all 0.15s',
+    background: active ? '#0071e3' : 'rgba(255,255,255,0.07)',
+    color: active ? '#fff' : 'rgba(255,255,255,0.6)',
+  };
+}
 
-// ─────────────────────────────────────── Component
+// ─── Main component ───────────────────────────────────────────────────────────
 
 export default function CampaignStudio() {
+  const [tab, setTab] = useState<'campaigns' | 'characters' | 'locations'>('campaigns');
+
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [selected, setSelected] = useState<Campaign | null>(null);
-  const [step, setStep] = useState<Step>('brief');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [pollTimer, setPollTimer] = useState<NodeJS.Timeout | null>(null);
-
-  // Characters + settings
   const [characters, setCharacters] = useState<Character[]>([]);
   const [sceneSets, setSceneSets] = useState<SceneSetting[]>([]);
-  const [selectedCharIds, setSelectedCharIds] = useState<string[]>([]);
-  const [selectedSettingIds, setSelectedSettingIds] = useState<string[]>([]);
-
-  // New campaign form
-  const [showNewForm, setShowNewForm] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newVertical, setNewVertical] = useState('home_insurance');
-  const [newBrief, setNewBrief] = useState('');
-  const [refVideo, setRefVideo] = useState<File | null>(null);
-  const [refImage, setRefImage] = useState<File | null>(null);
-
-  // Scripting
-  const [targetDuration, setTargetDuration] = useState(30);
-  const [extraInstructions, setExtraInstructions] = useState('');
-
-  // Edit
-  const [colorGrade, setColorGrade] = useState('cinematic');
-  const [musicMood, setMusicMood] = useState('motivational');
-
-  // Variations
   const [variations, setVariations] = useState<any[]>([]);
-  const [variantPlans, setVariantPlans] = useState<any[]>([]);
-  const [showVariantPlanner, setShowVariantPlanner] = useState(false);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => { loadAll(); }, []);
 
+  // Poll when generating
   useEffect(() => {
-    loadCampaigns();
-    loadCharactersAndSettings();
-  }, []);
-
-  useEffect(() => {
-    if (selected) {
-      setStep(STATUS_TO_STEP[selected.status] || 'brief');
-    }
-  }, [selected]);
-
-  // Poll for generation progress
-  useEffect(() => {
-    if (selected?.status === 'generating') {
-      const timer = setInterval(async () => {
-        try {
-          const r = await getCampaign(selected.id);
-          const updated = r.data as Campaign;
-          setSelected(updated);
-          if (updated.status !== 'generating') {
-            clearInterval(timer);
-          }
-        } catch {}
-      }, 8000);
-      setPollTimer(timer);
-      return () => clearInterval(timer);
-    }
+    if (selected?.status !== 'generating') return;
+    const t = setInterval(async () => {
+      try {
+        const r = await getCampaign(selected.id);
+        const up = r.data as Campaign;
+        setSelected(up);
+        setCampaigns(prev => prev.map(c => c.id === up.id ? up : c));
+        if (up.status !== 'generating') clearInterval(t);
+      } catch {}
+    }, 8000);
+    return () => clearInterval(t);
   }, [selected?.status]);
 
-  async function loadCampaigns() {
-    try {
-      const r = await listCampaigns();
-      setCampaigns(r.data?.campaigns || []);
-    } catch {}
+  async function loadAll() {
+    const [cRes, chrRes, sRes] = await Promise.allSettled([
+      listCampaigns(), listCharacters(), listSceneSettings(),
+    ]);
+    if (cRes.status === 'fulfilled') setCampaigns(cRes.value.data?.campaigns || []);
+    if (chrRes.status === 'fulfilled') setCharacters(chrRes.value.data?.characters || []);
+    if (sRes.status === 'fulfilled') setSceneSets(sRes.value.data?.settings || []);
   }
 
-  async function loadCharactersAndSettings() {
-    try {
-      const [cRes, sRes] = await Promise.all([listCharacters(), listSceneSettings()]);
-      setCharacters(cRes.data?.characters || []);
-      setSceneSets(sRes.data?.settings || []);
-    } catch {}
+  async function reloadCampaign(id: string) {
+    const r = await getCampaign(id);
+    const up = r.data as Campaign;
+    setSelected(up);
+    setCampaigns(prev => prev.map(c => c.id === up.id ? up : c));
+    return up;
   }
 
-  async function handleCreate() {
-    if (!newName || !newVertical) return;
-    setLoading(true);
-    setError('');
+  async function reloadVariations(campaignId: string) {
     try {
-      const r = await createCampaign({
-        name: newName, vertical: newVertical,
-        brief_text: newBrief,
-        reference_video: refVideo,
-        reference_image: refImage,
-      });
-      const campaign = r.data as Campaign;
-      setCampaigns(prev => [campaign, ...prev]);
-      setSelected(campaign);
-      setShowNewForm(false);
-      setNewName(''); setNewBrief(''); setRefVideo(null); setRefImage(null);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to create campaign');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleBriefing() {
-    if (!selected) return;
-    setLoading(true); setError('');
-    try {
-      await runBriefing(selected.id);
-      const r = await getCampaign(selected.id);
-      setSelected(r.data);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Briefing failed');
-    } finally { setLoading(false); }
-  }
-
-  async function handleScripting() {
-    if (!selected) return;
-    setLoading(true); setError('');
-    try {
-      await runScripting(selected.id, targetDuration, extraInstructions);
-      const r = await getCampaign(selected.id);
-      setSelected(r.data);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Scripting failed');
-    } finally { setLoading(false); }
-  }
-
-  async function handleStoryboarding() {
-    if (!selected) return;
-    setLoading(true); setError('');
-    try {
-      await runStoryboarding(selected.id, selectedCharIds, selectedSettingIds, targetDuration);
-      const r = await getCampaign(selected.id);
-      setSelected(r.data);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Storyboarding failed');
-    } finally { setLoading(false); }
-  }
-
-  async function handleGenerate() {
-    if (!selected) return;
-    setLoading(true); setError('');
-    try {
-      await startGeneration(selected.id);
-      const r = await getCampaign(selected.id);
-      setSelected(r.data);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Generation failed to start');
-    } finally { setLoading(false); }
-  }
-
-  async function handleEdit() {
-    if (!selected) return;
-    setLoading(true); setError('');
-    try {
-      await runEditing(selected.id, colorGrade, musicMood);
-      const r = await getCampaign(selected.id);
-      setSelected(r.data);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Editing failed');
-    } finally { setLoading(false); }
-  }
-
-  async function loadVariations() {
-    if (!selected) return;
-    try {
-      const r = await listVariations(selected.id);
+      const r = await listVariations(campaignId);
       setVariations(r.data?.variations || []);
     } catch {}
   }
 
-  async function loadVariantPlans() {
-    if (!selected) return;
-    const r = await planVariants(selected.id, ['hook', 'character', 'style'], 2);
-    setVariantPlans(r.data?.plans || []);
-  }
+  return (
+    <div style={{ color: '#e8e8ed', minHeight: '100vh' }}>
 
-  async function handleCreateVariant(plan: any) {
-    if (!selected) return;
-    setLoading(true);
-    try {
-      await createVariation(selected.id, {
-        strategy: plan.strategy,
-        label: plan.label,
-        auto_generate: true,
-      });
-      await loadVariations();
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Variant creation failed');
-    } finally { setLoading(false); }
-  }
+      {/* ── Page header ──────────────────────────────────────── */}
+      <div className="card" style={{ marginBottom: '24px', padding: '20px 24px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px' }}>
+          <div>
+            <h2 style={{ fontSize: '22px', fontWeight: 700, color: '#e8e8ed', margin: 0 }}>Campaign Studio</h2>
+            <p style={{ ...subText, marginTop: '3px' }}>Brief → Script → Storyboard → Generate → Edit → Variations</p>
+          </div>
+          {/* Tab switcher */}
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {(['campaigns', 'characters', 'locations'] as const).map(t => (
+              <button key={t} onClick={() => setTab(t)} style={tabBtn(tab === t)}>
+                {t === 'campaigns' ? 'Campaigns' : t === 'characters' ? 'Characters' : 'Locations'}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
 
-  useEffect(() => {
-    if (selected && step === 'review') {
-      loadVariations();
-    }
-  }, [step, selected?.id]);
+      {/* ── Campaigns tab ───────────────────────────────────── */}
+      {tab === 'campaigns' && (
+        <CampaignsTab
+          campaigns={campaigns}
+          selected={selected}
+          characters={characters}
+          sceneSets={sceneSets}
+          variations={variations}
+          onSelect={c => { setSelected(c); reloadVariations(c.id); }}
+          onCampaignCreated={c => { setCampaigns(prev => [c, ...prev]); setSelected(c); }}
+          onReload={id => reloadCampaign(id)}
+          onVariationsReload={id => reloadVariations(id)}
+        />
+      )}
 
-  const completedShots = selected?.shots?.filter((s: any) => s.status === 'completed').length || 0;
-  const totalShots = selected?.shots?.length || 0;
+      {/* ── Characters tab ──────────────────────────────────── */}
+      {tab === 'characters' && (
+        <CharactersTab
+          characters={characters}
+          onCreated={c => setCharacters(prev => [c, ...prev])}
+        />
+      )}
+
+      {/* ── Locations tab ───────────────────────────────────── */}
+      {tab === 'locations' && (
+        <LocationsTab
+          sceneSets={sceneSets}
+          onCreated={s => setSceneSets(prev => [s, ...prev])}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Campaigns tab ────────────────────────────────────────────────────────────
+
+function CampaignsTab({
+  campaigns, selected, characters, sceneSets, variations,
+  onSelect, onCampaignCreated, onReload, onVariationsReload,
+}: {
+  campaigns: Campaign[]; selected: Campaign | null; characters: Character[]; sceneSets: SceneSetting[];
+  variations: any[]; onSelect: (c: Campaign) => void; onCampaignCreated: (c: Campaign) => void;
+  onReload: (id: string) => Promise<Campaign>; onVariationsReload: (id: string) => void;
+}) {
+  const [showNewForm, setShowNewForm] = useState(false);
 
   return (
-    <div className="h-screen bg-gray-950 text-white flex flex-col overflow-hidden">
-      {/* Header */}
-      <div className="border-b border-gray-800 px-6 py-4 flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-violet-500 rounded-lg flex items-center justify-center text-sm font-bold">C</div>
-          <h1 className="text-lg font-semibold">Campaign Studio</h1>
+    <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '20px', alignItems: 'start' }}>
+
+      {/* Campaign list */}
+      <div className="card" style={{ padding: '12px', minHeight: '300px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px', padding: '0 4px' }}>
+          <span style={{ ...labelStyle, margin: 0 }}>Campaigns ({campaigns.length})</span>
+          <button className="btn-primary" style={{ fontSize: '12px', padding: '5px 10px' }}
+            onClick={() => setShowNewForm(true)}>+ New</button>
         </div>
-        <button
-          onClick={() => setShowNewForm(true)}
-          className="px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm font-medium transition-colors"
-        >
-          + New Campaign
-        </button>
-      </div>
-
-      <div className="flex h-[calc(100vh-65px)]">
-
-        {/* Sidebar — campaign list */}
-        <div className="w-64 border-r border-gray-800 overflow-y-auto flex-shrink-0">
-          {campaigns.length === 0 ? (
-            <div className="p-4 text-gray-500 text-sm">No campaigns yet</div>
-          ) : (
-            campaigns.map(c => (
-              <button
-                key={c.id}
-                onClick={() => setSelected(c)}
-                className={`w-full text-left px-4 py-3 border-b border-gray-800 hover:bg-gray-900 transition-colors ${selected?.id === c.id ? 'bg-gray-900 border-l-2 border-l-violet-500' : ''}`}
-              >
-                <div className="text-sm font-medium truncate">{c.name}</div>
-                <div className="flex items-center gap-2 mt-1">
-                  <StatusBadge status={c.status} />
-                  <span className="text-xs text-gray-500">{c.vertical}</span>
+        {campaigns.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '32px 16px' }}>
+            <p style={subText}>No campaigns yet</p>
+            <button className="btn-primary" style={{ marginTop: '12px', fontSize: '13px' }}
+              onClick={() => setShowNewForm(true)}>Create first</button>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            {campaigns.map(c => (
+              <button key={c.id} onClick={() => onSelect(c)}
+                style={{
+                  width: '100%', textAlign: 'left', padding: '10px 12px', borderRadius: '8px',
+                  border: selected?.id === c.id ? '1px solid #0071e3' : '1px solid transparent',
+                  background: selected?.id === c.id ? 'rgba(0,113,227,0.12)' : 'rgba(255,255,255,0.04)',
+                  cursor: 'pointer', transition: 'all 0.15s',
+                }}>
+                <div style={{ fontSize: '13px', fontWeight: 500, color: '#e8e8ed', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <StatusPill status={c.status} />
+                  <span style={{ fontSize: '11px', color: 'rgba(255,255,255,0.35)' }}>{c.vertical}</span>
                 </div>
               </button>
-            ))
-          )}
-        </div>
-
-        {/* Main area */}
-        <div className="flex-1 overflow-y-auto">
-          {!selected ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-500">
-              <div className="text-5xl mb-4">🎬</div>
-              <p className="text-lg">Select or create a campaign</p>
-              <button
-                onClick={() => setShowNewForm(true)}
-                className="mt-4 px-6 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-white text-sm font-medium"
-              >
-                Create your first campaign
-              </button>
-            </div>
-          ) : (
-            <div className="p-6 max-w-4xl mx-auto">
-
-              {/* Campaign header */}
-              <div className="mb-6">
-                <h2 className="text-xl font-bold">{selected.name}</h2>
-                <div className="flex items-center gap-3 mt-1">
-                  <StatusBadge status={selected.status} />
-                  <span className="text-sm text-gray-400">{selected.vertical}</span>
-                  {selected.total_cost_usd > 0 && (
-                    <span className="text-sm text-green-400">${selected.total_cost_usd.toFixed(3)} spent</span>
-                  )}
-                </div>
-              </div>
-
-              {/* Step indicator */}
-              <StepIndicator currentStep={step} status={selected.status} />
-
-              {error && (
-                <div className="mt-4 p-3 bg-red-900/40 border border-red-700 rounded-lg text-red-300 text-sm">
-                  {error}
-                </div>
-              )}
-
-              {/* Step content */}
-              <div className="mt-6">
-
-                {/* ── BRIEF ── */}
-                {step === 'brief' && (
-                  <div className="space-y-4">
-                    <div className="p-4 bg-gray-900 rounded-xl border border-gray-800">
-                      <h3 className="font-semibold mb-2">Brief</h3>
-                      <p className="text-gray-400 text-sm">{selected.brief_text || '(no brief text)'}</p>
-                    </div>
-                    {selected.analyzed_brief ? (
-                      <div className="p-4 bg-gray-900 rounded-xl border border-gray-800">
-                        <h3 className="font-semibold mb-3">Analyzed Brief</h3>
-                        <BriefDisplay brief={selected.analyzed_brief} />
-                        <button
-                          onClick={() => setStep('script')}
-                          className="mt-4 px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm font-medium"
-                        >
-                          Next: Generate Script →
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleBriefing}
-                        disabled={loading}
-                        className="px-6 py-3 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl font-medium"
-                      >
-                        {loading ? 'Analyzing reference...' : 'Analyze Brief →'}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {/* ── SCRIPT ── */}
-                {step === 'script' && (
-                  <div className="space-y-4">
-                    <div className="flex gap-4 items-end">
-                      <div>
-                        <label className="block text-sm text-gray-400 mb-1">Target duration</label>
-                        <select
-                          value={targetDuration}
-                          onChange={e => setTargetDuration(+e.target.value)}
-                          className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                        >
-                          {[15, 20, 30, 45, 60].map(d => (
-                            <option key={d} value={d}>{d}s</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="flex-1">
-                        <label className="block text-sm text-gray-400 mb-1">Extra instructions</label>
-                        <input
-                          type="text"
-                          value={extraInstructions}
-                          onChange={e => setExtraInstructions(e.target.value)}
-                          placeholder="e.g. Focus on testimonial hook"
-                          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                        />
-                      </div>
-                    </div>
-                    {selected.script ? (
-                      <div className="p-4 bg-gray-900 rounded-xl border border-gray-800">
-                        <div className="flex items-center justify-between mb-2">
-                          <h3 className="font-semibold">Generated Script</h3>
-                          <button
-                            onClick={handleScripting}
-                            className="text-xs text-violet-400 hover:text-violet-300"
-                          >Regenerate</button>
-                        </div>
-                        <pre className="text-sm text-gray-300 whitespace-pre-wrap">{selected.script}</pre>
-                        <button
-                          onClick={() => setStep('storyboard')}
-                          className="mt-4 px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm font-medium"
-                        >
-                          Next: Storyboard →
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleScripting}
-                        disabled={loading}
-                        className="px-6 py-3 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl font-medium"
-                      >
-                        {loading ? 'Writing script...' : 'Generate Script →'}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {/* ── STORYBOARD ── */}
-                {step === 'storyboard' && (
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm text-gray-400 mb-2">Characters</label>
-                        <div className="space-y-2 max-h-40 overflow-y-auto">
-                          {characters.map(c => (
-                            <label key={c.id} className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={selectedCharIds.includes(c.id)}
-                                onChange={e => {
-                                  if (e.target.checked) setSelectedCharIds(p => [...p, c.id]);
-                                  else setSelectedCharIds(p => p.filter(x => x !== c.id));
-                                }}
-                                className="accent-violet-500"
-                              />
-                              <span className="text-sm">{c.name}</span>
-                            </label>
-                          ))}
-                          {characters.length === 0 && <p className="text-xs text-gray-500">No characters yet</p>}
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-sm text-gray-400 mb-2">Settings</label>
-                        <div className="space-y-2 max-h-40 overflow-y-auto">
-                          {sceneSets.map(s => (
-                            <label key={s.id} className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={selectedSettingIds.includes(s.id)}
-                                onChange={e => {
-                                  if (e.target.checked) setSelectedSettingIds(p => [...p, s.id]);
-                                  else setSelectedSettingIds(p => p.filter(x => x !== s.id));
-                                }}
-                                className="accent-violet-500"
-                              />
-                              <span className="text-sm">{s.name}</span>
-                            </label>
-                          ))}
-                          {sceneSets.length === 0 && <p className="text-xs text-gray-500">No settings yet</p>}
-                        </div>
-                      </div>
-                    </div>
-
-                    {selected.storyboard ? (
-                      <div className="space-y-3">
-                        <div className="flex items-center justify-between">
-                          <h3 className="font-semibold">Shot List ({selected.storyboard.length} shots)</h3>
-                          <button onClick={handleStoryboarding} className="text-xs text-violet-400 hover:text-violet-300">Regenerate</button>
-                        </div>
-                        <ShotList shots={selected.storyboard} />
-                        <button
-                          onClick={() => setStep('generate')}
-                          className="px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm font-medium"
-                        >
-                          Next: Generate Videos →
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleStoryboarding}
-                        disabled={loading}
-                        className="px-6 py-3 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl font-medium"
-                      >
-                        {loading ? 'Building storyboard...' : 'Generate Storyboard →'}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {/* ── GENERATE ── */}
-                {step === 'generate' && (
-                  <div className="space-y-4">
-                    {selected.status === 'generating' ? (
-                      <div className="p-6 bg-gray-900 rounded-xl border border-gray-800 text-center">
-                        <div className="text-3xl mb-3 animate-pulse">⚙️</div>
-                        <h3 className="font-semibold mb-1">Generating shots...</h3>
-                        <div className="mt-4 bg-gray-800 rounded-full h-2 overflow-hidden">
-                          <div
-                            className="bg-violet-500 h-full transition-all duration-500"
-                            style={{ width: totalShots ? `${(completedShots / totalShots) * 100}%` : '0%' }}
-                          />
-                        </div>
-                        <p className="text-sm text-gray-400 mt-2">{completedShots} / {totalShots} shots complete</p>
-                        <p className="text-xs text-gray-500 mt-1">Polling every 8s…</p>
-                      </div>
-                    ) : selected.status === 'editing' || selected.status === 'review' || selected.status === 'completed' ? (
-                      <div className="p-4 bg-green-900/30 border border-green-700 rounded-xl">
-                        <p className="text-green-300 font-medium">All {totalShots} shots generated ✓</p>
-                        <button onClick={() => setStep('edit')} className="mt-3 px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm">Next: Edit →</button>
-                      </div>
-                    ) : (
-                      <div className="space-y-4">
-                        <div className="p-4 bg-gray-900 rounded-xl border border-gray-800">
-                          <p className="text-sm text-gray-300 mb-2">{totalShots} shots ready to generate</p>
-                          <p className="text-xs text-gray-500">Estimated cost: ${selected.total_cost_usd?.toFixed(3) || '...'}</p>
-                        </div>
-                        <button
-                          onClick={handleGenerate}
-                          disabled={loading}
-                          className="px-6 py-3 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl font-medium"
-                        >
-                          {loading ? 'Starting...' : 'Start Generation →'}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* ── EDIT ── */}
-                {step === 'edit' && (
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm text-gray-400 mb-1">Color grade</label>
-                        <select
-                          value={colorGrade}
-                          onChange={e => setColorGrade(e.target.value)}
-                          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                        >
-                          {['cinematic', 'warm', 'cool', 'vivid', 'none'].map(g => (
-                            <option key={g} value={g}>{g}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-sm text-gray-400 mb-1">Music mood</label>
-                        <select
-                          value={musicMood}
-                          onChange={e => setMusicMood(e.target.value)}
-                          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                        >
-                          {['motivational', 'upbeat', 'energetic', 'calm', 'dramatic', 'corporate', 'inspiring'].map(m => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-                    {selected.status === 'review' || selected.status === 'completed' ? (
-                      <div className="p-4 bg-green-900/30 border border-green-700 rounded-xl">
-                        <p className="text-green-300 font-medium">Editing complete ✓</p>
-                        <button onClick={() => setStep('review')} className="mt-3 px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm">Review Variations →</button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleEdit}
-                        disabled={loading}
-                        className="px-6 py-3 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-xl font-medium"
-                      >
-                        {loading ? 'Editing...' : 'Run Auto-Edit →'}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {/* ── REVIEW ── */}
-                {step === 'review' && (
-                  <div className="space-y-6">
-                    <div className="flex items-center justify-between">
-                      <h3 className="font-semibold">Variations ({variations.length})</h3>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => { loadVariantPlans(); setShowVariantPlanner(true); }}
-                          className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs"
-                        >
-                          + Create Variants
-                        </button>
-                        <button onClick={loadVariations} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs">
-                          Refresh
-                        </button>
-                      </div>
-                    </div>
-
-                    {showVariantPlanner && (
-                      <VariantPlanner
-                        plans={variantPlans}
-                        onCreateVariant={handleCreateVariant}
-                        onClose={() => setShowVariantPlanner(false)}
-                        loading={loading}
-                      />
-                    )}
-
-                    <VariationGrid
-                      campaignId={selected.id}
-                      variations={variations}
-                      onReload={loadVariations}
-                    />
-                  </div>
-                )}
-
-              </div>
-            </div>
-          )}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* New Campaign Modal */}
+      {/* Campaign detail */}
+      <div>
+        {!selected ? (
+          <div className="card" style={{ textAlign: 'center', padding: '60px 24px' }}>
+            <p style={{ fontSize: '32px', marginBottom: '12px' }}>+</p>
+            <p style={sectionTitle}>Select or create a campaign</p>
+            <p style={{ ...subText, marginBottom: '20px' }}>Each phase is independently testable</p>
+            <button className="btn-primary" onClick={() => setShowNewForm(true)}>Create Campaign</button>
+          </div>
+        ) : (
+          <CampaignDetail
+            campaign={selected}
+            characters={characters}
+            sceneSets={sceneSets}
+            variations={variations}
+            onReload={() => onReload(selected.id)}
+            onVariationsReload={() => onVariationsReload(selected.id)}
+          />
+        )}
+      </div>
+
       {showNewForm && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
-          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-lg mx-4">
-            <h2 className="text-lg font-semibold mb-4">New Campaign</h2>
+        <NewCampaignModal
+          onClose={() => setShowNewForm(false)}
+          onCreated={c => { onCampaignCreated(c); setShowNewForm(false); }}
+        />
+      )}
+    </div>
+  );
+}
 
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Campaign name</label>
-                <input
-                  type="text"
-                  value={newName}
-                  onChange={e => setNewName(e.target.value)}
-                  placeholder="Q2 Insurance — Urgency Hook Test"
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                />
-              </div>
+// ─── Campaign detail — all phases as separate cards ───────────────────────────
 
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Vertical</label>
-                <select
-                  value={newVertical}
-                  onChange={e => setNewVertical(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                >
-                  {VERTICALS.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                </select>
-              </div>
+function CampaignDetail({ campaign, characters, sceneSets, variations, onReload, onVariationsReload }: {
+  campaign: Campaign; characters: Character[]; sceneSets: SceneSetting[];
+  variations: any[]; onReload: () => Promise<Campaign>; onVariationsReload: () => void;
+}) {
+  const completedShots = campaign.shots?.filter((s: any) => s.status === 'completed').length || 0;
+  const totalShots = campaign.shots?.length || 0;
 
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Brief / idea</label>
-                <textarea
-                  value={newBrief}
-                  onChange={e => setNewBrief(e.target.value)}
-                  rows={3}
-                  placeholder="What's the offer? Target emotion? Key benefit?"
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm resize-none"
-                />
-              </div>
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
-              <div className="grid grid-cols-2 gap-4">
-                <FileUploadField
-                  label="Reference video (optional)"
-                  accept="video/*"
-                  onChange={setRefVideo}
-                  current={refVideo}
-                />
-                <FileUploadField
-                  label="Reference image (optional)"
-                  accept="image/*"
-                  onChange={setRefImage}
-                  current={refImage}
-                />
-              </div>
-            </div>
-
-            {error && <p className="mt-3 text-red-400 text-sm">{error}</p>}
-
-            <div className="flex gap-3 mt-6">
-              <button
-                onClick={handleCreate}
-                disabled={loading || !newName}
-                className="flex-1 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 rounded-lg font-medium text-sm"
-              >
-                {loading ? 'Creating...' : 'Create Campaign'}
-              </button>
-              <button
-                onClick={() => { setShowNewForm(false); setError(''); }}
-                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm"
-              >
-                Cancel
-              </button>
+      {/* Campaign header */}
+      <div className="card" style={{ padding: '16px 20px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+          <div>
+            <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#e8e8ed', margin: '0 0 6px' }}>{campaign.name}</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+              <StatusPill status={campaign.status} />
+              <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.4)' }}>{campaign.vertical}</span>
+              {campaign.total_cost_usd > 0 && (
+                <span style={{ fontSize: '13px', color: '#30d158' }}>${campaign.total_cost_usd.toFixed(4)} spent</span>
+              )}
             </div>
           </div>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {campaign.brief_text && (
+              <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {campaign.brief_text}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Phase 1 — Brief Analysis */}
+      <PhaseCard
+        number={1}
+        title="Brief Analysis"
+        description="AI analyzes your reference video/image and extracts creative insights"
+        status={campaign.analyzed_brief ? 'done' : 'pending'}
+      >
+        <BriefPhase campaign={campaign} onReload={onReload} />
+      </PhaseCard>
+
+      {/* Phase 2 — Script */}
+      <PhaseCard
+        number={2}
+        title="Script Generation"
+        description="Gemini writes a direct-response ad script from the brief"
+        status={campaign.script ? 'done' : 'pending'}
+      >
+        <ScriptPhase campaign={campaign} onReload={onReload} />
+      </PhaseCard>
+
+      {/* Phase 3 — Storyboard */}
+      <PhaseCard
+        number={3}
+        title="Storyboard"
+        description="Shot-by-shot breakdown with model routing and cost estimate"
+        status={campaign.storyboard ? 'done' : 'pending'}
+      >
+        <StoryboardPhase campaign={campaign} characters={characters} sceneSets={sceneSets} onReload={onReload} />
+      </PhaseCard>
+
+      {/* Phase 4 — Video Generation */}
+      <PhaseCard
+        number={4}
+        title="Video Generation"
+        description="Multi-provider parallel shot generation (Veo, Higgsfield, Replicate)"
+        status={campaign.status === 'generating' ? 'running' : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? 'done' : 'pending'}
+      >
+        <GeneratePhase campaign={campaign} completedShots={completedShots} totalShots={totalShots} onReload={onReload} />
+      </PhaseCard>
+
+      {/* Phase 5 — Auto-Edit */}
+      <PhaseCard
+        number={5}
+        title="Auto-Edit"
+        description="Stitch shots, color grade, LUFS audio normalization, export 9:16 / 1:1 / 16:9"
+        status={campaign.status === 'editing' ? 'running' : campaign.status === 'review' || campaign.status === 'completed' ? 'done' : 'pending'}
+      >
+        <EditPhase campaign={campaign} onReload={onReload} />
+      </PhaseCard>
+
+      {/* Phase 6 — Variations & Review */}
+      <PhaseCard
+        number={6}
+        title="Variations & Review"
+        description="Create hook/character/style variants, approve or reject each cut"
+        status={variations.length > 0 ? 'done' : 'pending'}
+      >
+        <ReviewPhase campaign={campaign} variations={variations} onVariationsReload={onVariationsReload} />
+      </PhaseCard>
+    </div>
+  );
+}
+
+// ─── Phase wrapper card ───────────────────────────────────────────────────────
+
+function PhaseCard({ number, title, description, status, children }: {
+  number: number; title: string; description: string;
+  status: 'pending' | 'running' | 'done'; children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+
+  const statusColors: Record<string, string> = {
+    pending: 'rgba(255,255,255,0.25)',
+    running: '#ff9f0a',
+    done: '#30d158',
+  };
+
+  return (
+    <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      {/* Header row */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%', textAlign: 'left', padding: '16px 20px',
+          background: 'none', border: 'none', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: '14px',
+        }}
+      >
+        <div style={{
+          width: '28px', height: '28px', borderRadius: '50%', flexShrink: 0,
+          background: status === 'done' ? 'rgba(48,209,88,0.15)' : status === 'running' ? 'rgba(255,159,10,0.15)' : 'rgba(255,255,255,0.07)',
+          border: `1px solid ${statusColors[status]}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: '12px', fontWeight: 700,
+          color: statusColors[status],
+        }}>
+          {status === 'done' ? '✓' : status === 'running' ? '…' : number}
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '15px', fontWeight: 600, color: '#e8e8ed' }}>{title}</span>
+            {status === 'running' && (
+              <span style={{ fontSize: '11px', color: '#ff9f0a', background: 'rgba(255,159,10,0.12)', padding: '2px 8px', borderRadius: '999px' }}>Running</span>
+            )}
+            {status === 'done' && (
+              <span style={{ fontSize: '11px', color: '#30d158', background: 'rgba(48,209,88,0.1)', padding: '2px 8px', borderRadius: '999px' }}>Complete</span>
+            )}
+          </div>
+          <p style={{ ...subText, marginTop: '2px' }}>{description}</p>
+        </div>
+        <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.3)', flexShrink: 0 }}>{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div style={{ padding: '4px 20px 20px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+          {children}
         </div>
       )}
     </div>
   );
 }
 
-// ─────────────────────────────────────── Sub-components
+// ─── Phase 1: Brief ───────────────────────────────────────────────────────────
 
-function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    draft: 'bg-gray-700 text-gray-300',
-    briefing: 'bg-blue-900 text-blue-300',
-    scripting: 'bg-indigo-900 text-indigo-300',
-    storyboarding: 'bg-purple-900 text-purple-300',
-    generating: 'bg-yellow-900 text-yellow-300',
-    editing: 'bg-orange-900 text-orange-300',
-    review: 'bg-violet-900 text-violet-300',
-    completed: 'bg-green-900 text-green-300',
-  };
+function BriefPhase({ campaign, onReload }: { campaign: Campaign; onReload: () => Promise<Campaign> }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function run() {
+    setLoading(true); setError('');
+    try { await runBriefing(campaign.id); await onReload(); }
+    catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  const brief = campaign.analyzed_brief;
+
   return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[status] || 'bg-gray-800 text-gray-400'}`}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+      {/* Input brief */}
+      {campaign.brief_text && (
+        <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '12px 14px' }}>
+          <span style={labelStyle}>Brief text</span>
+          <p style={{ fontSize: '14px', color: '#e8e8ed' }}>{campaign.brief_text}</p>
+        </div>
+      )}
+
+      {/* Analyzed brief */}
+      {brief ? (
+        <div style={{ background: 'rgba(48,209,88,0.05)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '14px' }}>
+          <span style={labelStyle}>AI-analyzed brief</span>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginTop: '8px' }}>
+            {[
+              ['Hook style', brief.hook_style],
+              ['Ad arc', brief.ad_arc],
+              ['Visual rhythm', brief.visual_rhythm],
+              ['Color palette', brief.color_palette],
+              ['Camera style', brief.camera_style],
+              ['CTA style', brief.cta_style],
+            ].filter(([, v]) => v).map(([k, v]) => (
+              <div key={k as string}>
+                <p style={{ ...labelStyle, marginBottom: '2px' }}>{k as string}</p>
+                <p style={{ fontSize: '13px', color: '#e8e8ed' }}>{v as string}</p>
+              </div>
+            ))}
+          </div>
+          {brief.key_insights?.length > 0 && (
+            <div style={{ marginTop: '12px' }}>
+              <p style={labelStyle}>Key insights</p>
+              <ul style={{ margin: 0, paddingLeft: '16px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                {brief.key_insights.map((ins: string, i: number) => (
+                  <li key={i} style={{ fontSize: '13px', color: '#e8e8ed' }}>{ins}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <button className="btn-secondary" style={{ marginTop: '14px', fontSize: '13px', padding: '7px 14px' }}
+            onClick={run} disabled={loading}>
+            {loading ? 'Re-analyzing...' : 'Re-analyze reference'}
+          </button>
+        </div>
+      ) : (
+        <div>
+          <p style={{ ...subText, marginBottom: '12px' }}>
+            Analyzes reference video/image with Pixtral AI to extract hook style, ad arc, visual rhythm, and key insights.
+            {!campaign.brief_text && !campaign.analyzed_brief && ' Add a reference video/image when creating the campaign.'}
+          </p>
+          <button className="btn-primary" onClick={run} disabled={loading} style={{ fontSize: '14px' }}>
+            {loading ? 'Analyzing...' : 'Analyze Brief'}
+          </button>
+        </div>
+      )}
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Phase 2: Script ──────────────────────────────────────────────────────────
+
+function ScriptPhase({ campaign, onReload }: { campaign: Campaign; onReload: () => Promise<Campaign> }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [duration, setDuration] = useState(30);
+  const [extra, setExtra] = useState('');
+
+  async function run() {
+    setLoading(true); setError('');
+    try { await runScripting(campaign.id, duration, extra); await onReload(); }
+    catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: '12px' }}>
+        <div>
+          <label style={labelStyle}>Duration</label>
+          <select value={duration} onChange={e => setDuration(+e.target.value)}
+            className="input" style={{ fontSize: '14px', padding: '8px 12px' }}>
+            {[15, 20, 30, 45, 60].map(d => <option key={d} value={d}>{d} seconds</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={labelStyle}>Extra instructions (optional)</label>
+          <input type="text" value={extra} onChange={e => setExtra(e.target.value)}
+            placeholder="e.g. Focus on a fear-based hook, add 3 testimonial points"
+            className="input" style={{ fontSize: '14px', padding: '8px 12px' }} />
+        </div>
+      </div>
+
+      {campaign.script ? (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+            <span style={labelStyle}>Generated script</span>
+            <button className="btn-secondary" style={{ fontSize: '12px', padding: '5px 10px' }}
+              onClick={run} disabled={loading}>
+              {loading ? 'Writing...' : 'Regenerate'}
+            </button>
+          </div>
+          <pre style={{
+            background: 'rgba(255,255,255,0.04)', borderRadius: '10px',
+            padding: '14px', fontSize: '13px', color: '#e8e8ed',
+            whiteSpace: 'pre-wrap', fontFamily: 'inherit', lineHeight: '1.6',
+            maxHeight: '360px', overflowY: 'auto', margin: 0,
+          }}>{campaign.script}</pre>
+        </div>
+      ) : (
+        <div>
+          <p style={{ ...subText, marginBottom: '12px' }}>
+            Gemini writes a punchy direct-response script with [HOOK], [PROBLEM], [SOLUTION], [PROOF], [CTA] structure.
+          </p>
+          <button className="btn-primary" onClick={run} disabled={loading} style={{ fontSize: '14px' }}>
+            {loading ? 'Writing script...' : 'Generate Script'}
+          </button>
+        </div>
+      )}
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Phase 3: Storyboard ─────────────────────────────────────────────────────
+
+function StoryboardPhase({ campaign, characters, sceneSets, onReload }: {
+  campaign: Campaign; characters: Character[]; sceneSets: SceneSetting[];
+  onReload: () => Promise<Campaign>;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [charIds, setCharIds] = useState<string[]>([]);
+  const [settingIds, setSettingIds] = useState<string[]>([]);
+  const [duration, setDuration] = useState(30);
+
+  async function run() {
+    setLoading(true); setError('');
+    try { await runStoryboarding(campaign.id, charIds, settingIds, duration); await onReload(); }
+    catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  function toggleId(id: string, ids: string[], setIds: (v: string[]) => void) {
+    setIds(ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id]);
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+
+      {/* Controls */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 140px', gap: '12px' }}>
+        <div>
+          <label style={labelStyle}>Characters</label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {characters.length === 0
+              ? <p style={subText}>No characters — add some in the Characters tab</p>
+              : characters.map(c => (
+                <CheckRow key={c.id} label={c.name} checked={charIds.includes(c.id)}
+                  onChange={() => toggleId(c.id, charIds, setCharIds)} />
+              ))}
+          </div>
+        </div>
+        <div>
+          <label style={labelStyle}>Locations</label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {sceneSets.length === 0
+              ? <p style={subText}>No locations — add some in the Locations tab</p>
+              : sceneSets.map(s => (
+                <CheckRow key={s.id} label={s.name} checked={settingIds.includes(s.id)}
+                  onChange={() => toggleId(s.id, settingIds, setSettingIds)} />
+              ))}
+          </div>
+        </div>
+        <div>
+          <label style={labelStyle}>Target duration</label>
+          <select value={duration} onChange={e => setDuration(+e.target.value)}
+            className="input" style={{ fontSize: '14px', padding: '8px 12px' }}>
+            {[15, 20, 30, 45, 60].map(d => <option key={d} value={d}>{d}s</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Shot list */}
+      {campaign.storyboard ? (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+            <span style={labelStyle}>{campaign.storyboard.length} shots — est. ${campaign.total_cost_usd?.toFixed(3) || '...'}</span>
+            <button className="btn-secondary" style={{ fontSize: '12px', padding: '5px 10px' }}
+              onClick={run} disabled={loading}>{loading ? 'Generating...' : 'Regenerate'}</button>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '340px', overflowY: 'auto' }}>
+            {campaign.storyboard.map((shot: any, i: number) => (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'flex-start', gap: '12px',
+                background: 'rgba(255,255,255,0.04)', borderRadius: '8px', padding: '10px 12px',
+              }}>
+                <div style={{
+                  width: '22px', height: '22px', borderRadius: '50%', flexShrink: 0,
+                  background: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center',
+                  justifyContent: 'center', fontSize: '11px', fontWeight: 700, color: 'rgba(255,255,255,0.5)',
+                }}>{i + 1}</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
+                    <ShotTypePill type={shot.shot_type} />
+                    <span style={{ fontSize: '11px', color: 'rgba(255,255,255,0.35)' }}>{shot.duration}s</span>
+                    {shot.routed_model && <span style={{ fontSize: '11px', color: 'rgba(255,255,255,0.25)' }}>{shot.routed_model}</span>}
+                    {shot.estimated_cost_usd && <span style={{ fontSize: '11px', color: '#30d158', marginLeft: 'auto' }}>${shot.estimated_cost_usd.toFixed(3)}</span>}
+                  </div>
+                  <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.55)', margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {shot.prompt || shot.description}
+                  </p>
+                  {shot.on_screen_text && (
+                    <p style={{ fontSize: '11px', color: '#2997ff', marginTop: '3px' }}>"{shot.on_screen_text}"</p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div>
+          <p style={{ ...subText, marginBottom: '12px' }}>
+            Gemini builds a shot list, assigns characters/locations, routes each shot to the best video model, and estimates per-shot cost.
+          </p>
+          <button className="btn-primary" onClick={run} disabled={loading} style={{ fontSize: '14px' }}>
+            {loading ? 'Building storyboard...' : 'Generate Storyboard'}
+          </button>
+        </div>
+      )}
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Phase 4: Generation ──────────────────────────────────────────────────────
+
+function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
+  campaign: Campaign; completedShots: number; totalShots: number;
+  onReload: () => Promise<Campaign>;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function run() {
+    setLoading(true); setError('');
+    try { await startGeneration(campaign.id); await onReload(); }
+    catch (e: any) { setError(e?.response?.data?.detail || 'Failed to start'); }
+    finally { setLoading(false); }
+  }
+
+  const pct = totalShots > 0 ? Math.round((completedShots / totalShots) * 100) : 0;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+      {campaign.status === 'generating' ? (
+        <div style={{ background: 'rgba(255,159,10,0.07)', border: '1px solid rgba(255,159,10,0.25)', borderRadius: '10px', padding: '20px' }}>
+          <p style={{ fontSize: '14px', fontWeight: 600, color: '#ff9f0a', marginBottom: '12px' }}>
+            Generating shots in parallel... ({completedShots}/{totalShots})
+          </p>
+          <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '999px', height: '6px', overflow: 'hidden' }}>
+            <div style={{ height: '100%', background: '#ff9f0a', borderRadius: '999px', width: `${pct}%`, transition: 'width 0.5s' }} />
+          </div>
+          <p style={{ ...subText, marginTop: '8px' }}>Auto-refreshes every 8s</p>
+        </div>
+      ) : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? (
+        <div style={{ background: 'rgba(48,209,88,0.07)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '16px' }}>
+          <p style={{ fontSize: '14px', fontWeight: 600, color: '#30d158' }}>All {totalShots} shots generated</p>
+        </div>
+      ) : (
+        <div>
+          <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '14px', marginBottom: '14px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <p style={{ fontSize: '14px', color: '#e8e8ed', marginBottom: '4px' }}>{totalShots} shots queued</p>
+                <p style={subText}>Each shot generates in parallel via the best available provider</p>
+              </div>
+              {campaign.total_cost_usd > 0 && (
+                <p style={{ fontSize: '16px', fontWeight: 600, color: '#30d158' }}>${campaign.total_cost_usd.toFixed(3)}</p>
+              )}
+            </div>
+          </div>
+          <button className="btn-primary" onClick={run} disabled={loading || !campaign.storyboard} style={{ fontSize: '14px' }}>
+            {loading ? 'Starting...' : 'Start Generation'}
+          </button>
+          {!campaign.storyboard && <p style={{ ...subText, marginTop: '8px' }}>Complete storyboard first</p>}
+        </div>
+      )}
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Phase 5: Edit ────────────────────────────────────────────────────────────
+
+function EditPhase({ campaign, onReload }: { campaign: Campaign; onReload: () => Promise<Campaign> }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [colorGrade, setColorGrade] = useState('cinematic');
+  const [musicMood, setMusicMood] = useState('motivational');
+
+  async function run() {
+    setLoading(true); setError('');
+    try { await runEditing(campaign.id, colorGrade, musicMood); await onReload(); }
+    catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  const done = campaign.status === 'review' || campaign.status === 'completed';
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+        <div>
+          <label style={labelStyle}>Color grade</label>
+          <select value={colorGrade} onChange={e => setColorGrade(e.target.value)}
+            className="input" style={{ fontSize: '14px', padding: '8px 12px' }}>
+            {['cinematic', 'warm', 'cool', 'vivid', 'none'].map(g => <option key={g} value={g}>{g}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={labelStyle}>Music mood (Pixabay CC0)</label>
+          <select value={musicMood} onChange={e => setMusicMood(e.target.value)}
+            className="input" style={{ fontSize: '14px', padding: '8px 12px' }}>
+            {['motivational', 'upbeat', 'energetic', 'calm', 'dramatic', 'corporate', 'inspiring'].map(m => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '12px 14px' }}>
+        <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)' }}>
+          Pipeline: stitch shots → {colorGrade} color grade → filler-word cuts (Whisper) → LUFS audio normalization → export 9:16 + 1:1 + 16:9
+        </p>
+      </div>
+      {done ? (
+        <div style={{ background: 'rgba(48,209,88,0.07)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '14px' }}>
+          <p style={{ fontSize: '14px', fontWeight: 600, color: '#30d158' }}>Auto-edit complete — see variations below</p>
+          <button className="btn-secondary" style={{ marginTop: '10px', fontSize: '13px', padding: '6px 12px' }}
+            onClick={run} disabled={loading}>{loading ? 'Re-editing...' : 'Re-edit'}</button>
+        </div>
+      ) : (
+        <div>
+          <button className="btn-primary" onClick={run}
+            disabled={loading || (campaign.status !== 'editing' && campaign.status !== 'storyboarding')}
+            style={{ fontSize: '14px' }}>
+            {loading ? 'Editing...' : 'Run Auto-Edit'}
+          </button>
+          {campaign.status !== 'editing' && campaign.status !== 'storyboarding' && (
+            <p style={{ ...subText, marginTop: '8px' }}>Complete generation first</p>
+          )}
+        </div>
+      )}
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Phase 6: Review ─────────────────────────────────────────────────────────
+
+function ReviewPhase({ campaign, variations, onVariationsReload }: {
+  campaign: Campaign; variations: any[]; onVariationsReload: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [plans, setPlans] = useState<any[]>([]);
+  const [showPlanner, setShowPlanner] = useState(false);
+
+  async function loadPlans() {
+    try {
+      const r = await planVariants(campaign.id, ['hook', 'character', 'style'], 2);
+      setPlans(r.data?.plans || []);
+    } catch {}
+  }
+
+  async function handleCreate(plan: any) {
+    setLoading(true);
+    try {
+      await createVariation(campaign.id, { strategy: plan.strategy, label: plan.label, auto_generate: true });
+      onVariationsReload();
+    } catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={labelStyle}>{variations.length} variation{variations.length !== 1 ? 's' : ''}</span>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button className="btn-secondary" style={{ fontSize: '12px', padding: '6px 12px' }}
+            onClick={() => { loadPlans(); setShowPlanner(s => !s); }}>
+            {showPlanner ? 'Hide planner' : '+ Create variants'}
+          </button>
+          <button className="btn-secondary" style={{ fontSize: '12px', padding: '6px 12px' }}
+            onClick={onVariationsReload}>Refresh</button>
+        </div>
+      </div>
+
+      {showPlanner && (
+        <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '14px' }}>
+          <p style={{ ...labelStyle, marginBottom: '10px' }}>Variant strategies</p>
+          {plans.length === 0
+            ? <p style={subText}>Loading plans…</p>
+            : plans.map((plan, i) => (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '10px 12px', background: 'rgba(255,255,255,0.04)', borderRadius: '8px', marginBottom: '6px',
+              }}>
+                <div>
+                  <p style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed' }}>{plan.label}</p>
+                  <p style={subText}>{plan.shots_to_regenerate}/{plan.total_shots} shots regenerated · ${plan.estimated_cost_usd?.toFixed(3)}</p>
+                </div>
+                <button className="btn-primary" style={{ fontSize: '12px', padding: '6px 12px' }}
+                  onClick={() => handleCreate(plan)} disabled={loading}>Create</button>
+              </div>
+            ))
+          }
+        </div>
+      )}
+
+      <VariationGrid campaignId={campaign.id} variations={variations} onReload={onVariationsReload} />
+      {error && <ErrorBanner msg={error} />}
+    </div>
+  );
+}
+
+// ─── Characters tab ───────────────────────────────────────────────────────────
+
+function CharactersTab({ characters, onCreated }: { characters: Character[]; onCreated: (c: Character) => void }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [portrait, setPortrait] = useState<File | null>(null);
+
+  async function handleCreate() {
+    if (!name) return;
+    setLoading(true); setError('');
+    try {
+      const r = await createCharacter({ name, description, portrait });
+      onCreated(r.data as Character);
+      setName(''); setDescription(''); setPortrait(null);
+    } catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', alignItems: 'start' }}>
+      {/* Add form */}
+      <div className="card" style={{ padding: '20px' }}>
+        <h3 style={{ ...sectionTitle, marginBottom: '16px' }}>Add Character</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Name</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="Sarah — relatable mom"
+              className="input" style={{ fontSize: '14px', padding: '9px 12px' }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Description</label>
+            <textarea value={description} onChange={e => setDescription(e.target.value)}
+              placeholder="Age, look, clothing, personality — used for image-to-video consistency"
+              rows={3} className="input" style={{ fontSize: '14px', padding: '9px 12px', resize: 'vertical' }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Portrait / reference image</label>
+            <label style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              height: '80px', borderRadius: '10px', cursor: 'pointer',
+              background: 'rgba(255,255,255,0.04)', border: '1px dashed rgba(255,255,255,0.15)',
+            }}>
+              <input type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={e => setPortrait(e.target.files?.[0] || null)} />
+              {portrait
+                ? <span style={{ fontSize: '13px', color: '#30d158' }}>{portrait.name}</span>
+                : <span style={subText}>Click to upload (optional)</span>}
+            </label>
+          </div>
+        </div>
+        {error && <ErrorBanner msg={error} />}
+        <button className="btn-primary" onClick={handleCreate} disabled={loading || !name}
+          style={{ marginTop: '16px', fontSize: '14px' }}>
+          {loading ? 'Adding...' : 'Add Character'}
+        </button>
+      </div>
+
+      {/* List */}
+      <div className="card" style={{ padding: '20px' }}>
+        <h3 style={{ ...sectionTitle, marginBottom: '16px' }}>Characters ({characters.length})</h3>
+        {characters.length === 0 ? (
+          <p style={subText}>No characters yet. Add one to use in storyboarding for consistent faces across shots.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {characters.map(c => (
+              <div key={c.id} style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '12px 14px', display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                {c.portrait_url ? (
+                  <img src={`${API_HOST}${c.portrait_url}`} alt={c.name}
+                    style={{ width: '44px', height: '44px', borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
+                ) : (
+                  <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: 'rgba(255,255,255,0.1)', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', color: 'rgba(255,255,255,0.3)' }}>?</div>
+                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: '14px', fontWeight: 600, color: '#e8e8ed', marginBottom: '3px' }}>{c.name}</p>
+                  {c.description && <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.description}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Locations tab ────────────────────────────────────────────────────────────
+
+function LocationsTab({ sceneSets, onCreated }: { sceneSets: SceneSetting[]; onCreated: (s: SceneSetting) => void }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [locationType, setLocationType] = useState('indoor');
+  const [refImage, setRefImage] = useState<File | null>(null);
+
+  async function handleCreate() {
+    if (!name) return;
+    setLoading(true); setError('');
+    try {
+      const r = await createSceneSetting({ name, description, location_type: locationType, reference_image: refImage });
+      onCreated(r.data as SceneSetting);
+      setName(''); setDescription(''); setRefImage(null);
+    } catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', alignItems: 'start' }}>
+      {/* Add form */}
+      <div className="card" style={{ padding: '20px' }}>
+        <h3 style={{ ...sectionTitle, marginBottom: '16px' }}>Add Location</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <div>
+            <label style={labelStyle}>Name</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="Modern kitchen — bright + natural light"
+              className="input" style={{ fontSize: '14px', padding: '9px 12px' }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Type</label>
+            <select value={locationType} onChange={e => setLocationType(e.target.value)}
+              className="input" style={{ fontSize: '14px', padding: '9px 12px' }}>
+              {['indoor', 'outdoor', 'studio', 'urban', 'nature', 'virtual'].map(t => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Description</label>
+            <textarea value={description} onChange={e => setDescription(e.target.value)}
+              placeholder="Lighting, props, style details — used for visual consistency across shots"
+              rows={3} className="input" style={{ fontSize: '14px', padding: '9px 12px', resize: 'vertical' }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Reference image (optional)</label>
+            <label style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              height: '80px', borderRadius: '10px', cursor: 'pointer',
+              background: 'rgba(255,255,255,0.04)', border: '1px dashed rgba(255,255,255,0.15)',
+            }}>
+              <input type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={e => setRefImage(e.target.files?.[0] || null)} />
+              {refImage
+                ? <span style={{ fontSize: '13px', color: '#30d158' }}>{refImage.name}</span>
+                : <span style={subText}>Click to upload</span>}
+            </label>
+          </div>
+        </div>
+        {error && <ErrorBanner msg={error} />}
+        <button className="btn-primary" onClick={handleCreate} disabled={loading || !name}
+          style={{ marginTop: '16px', fontSize: '14px' }}>
+          {loading ? 'Adding...' : 'Add Location'}
+        </button>
+      </div>
+
+      {/* List */}
+      <div className="card" style={{ padding: '20px' }}>
+        <h3 style={{ ...sectionTitle, marginBottom: '16px' }}>Locations ({sceneSets.length})</h3>
+        {sceneSets.length === 0 ? (
+          <p style={subText}>No locations yet. Add settings to keep consistent visual environments across shots.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {sceneSets.map(s => (
+              <div key={s.id} style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '10px', padding: '12px 14px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                  <p style={{ fontSize: '14px', fontWeight: 600, color: '#e8e8ed' }}>{s.name}</p>
+                  <span style={{ fontSize: '11px', color: 'rgba(255,255,255,0.35)', background: 'rgba(255,255,255,0.07)', padding: '2px 8px', borderRadius: '999px' }}>{s.location_type}</span>
+                </div>
+                {s.description && <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>{s.description}</p>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── New Campaign Modal ───────────────────────────────────────────────────────
+
+function NewCampaignModal({ onClose, onCreated }: {
+  onClose: () => void; onCreated: (c: Campaign) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [name, setName] = useState('');
+  const [vertical, setVertical] = useState('home_insurance');
+  const [brief, setBrief] = useState('');
+  const [refVideo, setRefVideo] = useState<File | null>(null);
+  const [refImage, setRefImage] = useState<File | null>(null);
+
+  async function handleCreate() {
+    if (!name || !vertical) return;
+    setLoading(true); setError('');
+    try {
+      const r = await createCampaign({ name, vertical, brief_text: brief, reference_video: refVideo, reference_image: refImage });
+      onCreated(r.data as Campaign);
+    } catch (e: any) { setError(e?.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: '20px' }}>
+      <div className="card" style={{ width: '100%', maxWidth: '500px', padding: '28px' }}>
+        <h2 style={{ ...sectionTitle, fontSize: '18px', marginBottom: '20px' }}>New Campaign</h2>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div>
+            <label style={labelStyle}>Campaign name</label>
+            <input value={name} onChange={e => setName(e.target.value)} autoFocus
+              placeholder="Q2 Insurance — Urgency Hook Test"
+              className="input" style={{ fontSize: '14px', padding: '9px 12px' }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Vertical</label>
+            <select value={vertical} onChange={e => setVertical(e.target.value)}
+              className="input" style={{ fontSize: '14px', padding: '9px 12px' }}>
+              {VERTICALS.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Brief / idea</label>
+            <textarea value={brief} onChange={e => setBrief(e.target.value)} rows={3}
+              placeholder="What's the offer? Target emotion? Key benefit?"
+              className="input" style={{ fontSize: '14px', padding: '9px 12px', resize: 'vertical' }} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+            <UploadBox label="Reference video (optional)" accept="video/*" file={refVideo} onChange={setRefVideo} />
+            <UploadBox label="Reference image (optional)" accept="image/*" file={refImage} onChange={setRefImage} />
+          </div>
+        </div>
+
+        {error && <ErrorBanner msg={error} />}
+
+        <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
+          <button className="btn-primary" onClick={handleCreate} disabled={loading || !name}
+            style={{ flex: 1, fontSize: '14px' }}>
+            {loading ? 'Creating...' : 'Create Campaign'}
+          </button>
+          <button className="btn-secondary" onClick={onClose} style={{ fontSize: '14px', padding: '10px 16px' }}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tiny helpers ─────────────────────────────────────────────────────────────
+
+function StatusPill({ status }: { status: string }) {
+  const map: Record<string, [string, string]> = {
+    draft:         ['rgba(255,255,255,0.12)', 'rgba(255,255,255,0.5)'],
+    briefing:      ['rgba(10,132,255,0.15)', '#2997ff'],
+    scripting:     ['rgba(94,92,230,0.15)', '#9d9bf5'],
+    storyboarding: ['rgba(191,90,242,0.15)', '#da8fff'],
+    generating:    ['rgba(255,159,10,0.15)', '#ff9f0a'],
+    editing:       ['rgba(255,69,58,0.15)', '#ff6961'],
+    review:        ['rgba(94,92,230,0.15)', '#9d9bf5'],
+    completed:     ['rgba(48,209,88,0.15)', '#30d158'],
+  };
+  const [bg, color] = map[status] || ['rgba(255,255,255,0.08)', 'rgba(255,255,255,0.4)'];
+  return (
+    <span style={{ fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '999px', background: bg, color }}>
       {status}
     </span>
   );
 }
 
-function StepIndicator({ currentStep, status }: { currentStep: Step; status: string }) {
-  const currentIdx = STEPS.indexOf(currentStep);
-  return (
-    <div className="flex items-center gap-1">
-      {STEPS.map((s, i) => (
-        <div key={s} className="flex items-center">
-          <div className={`px-3 py-1 rounded-full text-xs font-medium ${
-            i < currentIdx ? 'bg-green-900 text-green-300' :
-            i === currentIdx ? 'bg-violet-600 text-white' :
-            'bg-gray-800 text-gray-500'
-          }`}>
-            {STEP_LABELS[s]}
-          </div>
-          {i < STEPS.length - 1 && <div className="w-4 h-px bg-gray-700 mx-1" />}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function BriefDisplay({ brief }: { brief: Record<string, any> }) {
-  const fields = [
-    ['Hook style', brief.hook_style],
-    ['Ad arc', brief.ad_arc],
-    ['Visual rhythm', brief.visual_rhythm],
-    ['Color palette', brief.color_palette],
-    ['Camera style', brief.camera_style],
-    ['CTA style', brief.cta_style],
-  ].filter(([, v]) => v);
-  return (
-    <div className="grid grid-cols-2 gap-3">
-      {fields.map(([label, value]) => (
-        <div key={label as string}>
-          <p className="text-xs text-gray-500">{label as string}</p>
-          <p className="text-sm text-gray-200">{value as string}</p>
-        </div>
-      ))}
-      {brief.key_insights?.length > 0 && (
-        <div className="col-span-2">
-          <p className="text-xs text-gray-500 mb-1">Key insights</p>
-          <ul className="text-sm text-gray-300 list-disc list-inside space-y-1">
-            {brief.key_insights.map((i: string, idx: number) => <li key={idx}>{i}</li>)}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ShotList({ shots }: { shots: any[] }) {
-  return (
-    <div className="space-y-2">
-      {shots.map((shot, i) => (
-        <div key={i} className="flex items-start gap-3 p-3 bg-gray-900 rounded-lg border border-gray-800">
-          <div className="w-6 h-6 bg-gray-700 rounded-full flex items-center justify-center text-xs flex-shrink-0">{i + 1}</div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <ShotTypeBadge type={shot.shot_type} />
-              <span className="text-xs text-gray-500">{shot.duration}s</span>
-              {shot.routed_model && <span className="text-xs text-gray-600">{shot.routed_model}</span>}
-            </div>
-            <p className="text-xs text-gray-400 truncate">{shot.prompt || shot.description}</p>
-            {shot.on_screen_text && <p className="text-xs text-violet-400 mt-0.5">"{shot.on_screen_text}"</p>}
-          </div>
-          {shot.estimated_cost_usd && (
-            <span className="text-xs text-gray-600 flex-shrink-0">${shot.estimated_cost_usd.toFixed(3)}</span>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ShotTypeBadge({ type }: { type: string }) {
-  const colors: Record<string, string> = {
-    hero: 'bg-yellow-900 text-yellow-300',
-    spokesperson: 'bg-blue-900 text-blue-300',
-    b_roll: 'bg-gray-700 text-gray-300',
-    transition: 'bg-gray-800 text-gray-400',
+function ShotTypePill({ type }: { type: string }) {
+  const map: Record<string, string> = {
+    hero: '#ff9f0a', spokesperson: '#2997ff', b_roll: 'rgba(255,255,255,0.4)', transition: 'rgba(255,255,255,0.3)',
   };
-  return <span className={`px-1.5 py-0.5 rounded text-xs ${colors[type] || 'bg-gray-800 text-gray-400'}`}>{type}</span>;
+  return (
+    <span style={{ fontSize: '11px', padding: '2px 7px', borderRadius: '999px', background: 'rgba(255,255,255,0.07)', color: map[type] || 'rgba(255,255,255,0.4)' }}>
+      {type}
+    </span>
+  );
 }
 
-function FileUploadField({ label, accept, onChange, current }: {
-  label: string; accept: string; onChange: (f: File | null) => void; current: File | null;
+function CheckRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: () => void }) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+      <input type="checkbox" checked={checked} onChange={onChange}
+        style={{ accentColor: '#0071e3', width: '14px', height: '14px' }} />
+      <span style={{ fontSize: '13px', color: '#e8e8ed' }}>{label}</span>
+    </label>
+  );
+}
+
+function UploadBox({ label, accept, file, onChange }: {
+  label: string; accept: string; file: File | null; onChange: (f: File | null) => void;
 }) {
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
-      <label className="flex items-center justify-center h-16 bg-gray-800 border border-dashed border-gray-600 rounded-lg cursor-pointer hover:border-gray-500 transition-colors">
-        <input type="file" accept={accept} className="hidden" onChange={e => onChange(e.target.files?.[0] || null)} />
-        {current ? (
-          <span className="text-xs text-violet-400 truncate px-2">{current.name}</span>
-        ) : (
-          <span className="text-xs text-gray-500">Click to upload</span>
-        )}
+      <label style={{ ...labelStyle, marginBottom: '6px' }}>{label}</label>
+      <label style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: '64px', borderRadius: '10px', cursor: 'pointer',
+        background: 'rgba(255,255,255,0.04)', border: '1px dashed rgba(255,255,255,0.15)',
+      }}>
+        <input type="file" accept={accept} style={{ display: 'none' }}
+          onChange={e => onChange(e.target.files?.[0] || null)} />
+        {file
+          ? <span style={{ fontSize: '11px', color: '#30d158', padding: '0 8px', textAlign: 'center' }}>{file.name}</span>
+          : <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.3)' }}>Click to upload</span>}
       </label>
     </div>
   );
 }
 
-function VariantPlanner({ plans, onCreateVariant, onClose, loading }: {
-  plans: any[];
-  onCreateVariant: (p: any) => void;
-  onClose: () => void;
-  loading: boolean;
-}) {
+function ErrorBanner({ msg }: { msg: string }) {
   return (
-    <div className="p-4 bg-gray-900 rounded-xl border border-violet-800">
-      <div className="flex items-center justify-between mb-3">
-        <h4 className="font-medium text-sm">Variant Plans</h4>
-        <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-xs">✕</button>
-      </div>
-      {plans.length === 0 ? (
-        <p className="text-xs text-gray-500">Loading plans...</p>
-      ) : (
-        <div className="space-y-2">
-          {plans.map((plan, i) => (
-            <div key={i} className="flex items-center justify-between p-2 bg-gray-800 rounded-lg">
-              <div>
-                <p className="text-sm font-medium">{plan.label}</p>
-                <p className="text-xs text-gray-500">{plan.shots_to_regenerate} / {plan.total_shots} shots regenerated · ${plan.estimated_cost_usd.toFixed(3)}</p>
-              </div>
-              <button
-                onClick={() => onCreateVariant(plan)}
-                disabled={loading}
-                className="px-3 py-1 bg-violet-700 hover:bg-violet-600 disabled:opacity-50 rounded text-xs"
-              >
-                Create
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+    <div style={{ background: 'rgba(255,69,58,0.1)', border: '1px solid rgba(255,69,58,0.3)', borderRadius: '8px', padding: '10px 14px', fontSize: '13px', color: '#ff6961' }}>
+      {msg}
     </div>
   );
 }

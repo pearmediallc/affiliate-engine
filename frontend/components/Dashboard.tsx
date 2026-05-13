@@ -420,21 +420,12 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
 
       {/* Main Content */}
       <main className="lg:ml-[260px] ml-0 flex-1 min-h-screen" style={{
-        backgroundImage: activeTab === 'campaign-studio' ? 'none' : 'url(/herobg.jpg)',
+        backgroundImage: 'url(/herobg.jpg)',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundAttachment: 'fixed',
-        backgroundColor: activeTab === 'campaign-studio' ? '#030712' : undefined,
       }}>
-        {/* Campaign Studio — full-screen, no padding wrapper */}
-        {activeTab === 'campaign-studio' && (
-          <div style={{ height: '100vh', overflow: 'hidden' }}>
-            <CampaignStudio />
-          </div>
-        )}
-
-        {activeTab !== 'campaign-studio' && (
-          <>
+        <>
         {/* Subtle tinted overlay — lets the cosmic image show through */}
         <div style={{
           position: 'fixed',
@@ -524,13 +515,14 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
 
             {activeTab === 'landing-page' && <LandingPageStudio />}
 
+            {activeTab === 'campaign-studio' && <CampaignStudio />}
+
             {activeTab === 'admin' && hasPermission('admin_panel') && (
               <AdminPanel />
             )}
           </div>
         </div>
-          </>
-        )}
+        </>
       </main>
 
       {/* Mobile responsive styles */}
