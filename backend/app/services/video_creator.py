@@ -7,6 +7,7 @@ import base64
 from typing import Optional
 from ..config import settings
 from .pricing import Pricing
+from .storage import StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,9 @@ class VideoCreatorService:
 
                 result["video_path"] = filepath
                 result["video_filename"] = filename
-                result["download_url"] = f"/api/v1/video/download/{filename}"
+
+                s3_url = StorageService.upload_file(filepath, f"videos/{filename}")
+                result["download_url"] = s3_url if s3_url else f"/api/v1/video/download/{filename}"
 
                 logger.info(f"Veo video saved: {filepath}")
             except Exception as e:

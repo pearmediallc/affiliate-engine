@@ -7,6 +7,7 @@ from typing import Optional
 from ..config import settings
 from ..models import Image
 from .pricing import Pricing
+from .storage import StorageService
 from sqlalchemy.orm import Session
 import requests
 import io
@@ -30,6 +31,12 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_image(filepath: str, filename: str) -> str:
+    """Upload to S3 if configured, otherwise return local serve URL."""
+    s3_url = StorageService.upload_file(filepath, f"images/{filename}")
+    return s3_url if s3_url else f"/api/v1/images/serve/{filename}"
 
 
 class ImageGeneratorService:
@@ -231,7 +238,7 @@ class ImageGeneratorService:
 
                         logger.info(f"Image generated with Ideogram 3.0, saved: {filepath}")
                         return {
-                            "url": f"/api/v1/images/serve/{filename}",
+                            "url": _persist_image(filepath, filename),
                             "path": filepath,
                             "model": "ideogram-v3",
                             "seed": uuid.uuid4().hex[:8],
@@ -293,6 +300,18 @@ class ImageGeneratorService:
             image_url = data["data"][0]["url"]
 
             logger.info(f"Image generated successfully with OpenAI DALL-E 3")
+
+            # Download and persist (S3 or local) so the URL doesn't expire
+            try:
+                img_resp = requests.get(image_url, timeout=30)
+                if img_resp.status_code == 200:
+                    filename = f"{uuid.uuid4().hex[:12]}.png"
+                    filepath = os.path.join(IMAGES_DIR, filename)
+                    with open(filepath, "wb") as f:
+                        f.write(img_resp.content)
+                    image_url = _persist_image(filepath, filename)
+            except Exception as dl_err:
+                logger.warning(f"DALL-E download failed, keeping temp URL: {dl_err}")
 
             return {
                 "url": image_url,
@@ -356,7 +375,7 @@ class ImageGeneratorService:
 
                 logger.info(f"Image generated and saved: {filepath}")
                 return {
-                    "url": f"/api/v1/images/serve/{filename}",
+                    "url": _persist_image(filepath, filename),
                     "path": filepath,
                     "model": image_model,
                     "seed": uuid.uuid4().hex[:8],
@@ -397,7 +416,7 @@ class ImageGeneratorService:
 
                             logger.info(f"Image generated with gemini-2.5-flash-image, saved: {filepath}")
                             return {
-                                "url": f"/api/v1/images/serve/{filename}",
+                                "url": _persist_image(filepath, filename),
                                 "path": filepath,
                                 "model": "gemini-2.5-flash-image",
                                 "seed": uuid.uuid4().hex[:8],
@@ -460,6 +479,17 @@ class ImageGeneratorService:
                 image_url = data["images"][0].get("url")
                 if image_url:
                     logger.info(f"Image generated successfully with FAL.ai FLUX")
+                    # Download and persist
+                    try:
+                        img_resp = requests.get(image_url, timeout=30)
+                        if img_resp.status_code == 200:
+                            fname = f"{uuid.uuid4().hex[:12]}.png"
+                            fpath = os.path.join(IMAGES_DIR, fname)
+                            with open(fpath, "wb") as f:
+                                f.write(img_resp.content)
+                            image_url = _persist_image(fpath, fname)
+                    except Exception as dl_err:
+                        logger.warning(f"FAL download failed: {dl_err}")
                     return {
                         "url": image_url,
                         "path": None,

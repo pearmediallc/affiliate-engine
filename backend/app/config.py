@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     pixabay_api_key: Optional[str] = None      # Pixabay free CC0 music
     pexels_api_key: Optional[str] = None       # Pexels free stock footage
 
+    # AWS S3 — persistent storage for generated images/videos
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_region: str = "us-east-1"
+    aws_s3_bucket: Optional[str] = None
+    aws_s3_public_base_url: Optional[str] = None  # CDN or public bucket base URL
+
     # Image Generation
     image_provider: str = "gemini"  # Primary: Gemini 3.1 Flash Image, Fallback: OpenAI DALL-E 3, Then FAL.ai
     gemini_model: str = "gemini-2.5-flash"  # For prompt optimization and vision

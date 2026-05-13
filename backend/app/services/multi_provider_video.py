@@ -23,6 +23,7 @@ import httpx
 from typing import Optional
 from ..config import settings
 from .pricing import Pricing
+from .storage import StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,12 @@ VIDEOS_DIR = os.path.join(
     "generated_videos",
 )
 os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+
+def _persist_video(local_path: str, filename: str) -> str:
+    """Upload to S3 if configured, else return local download URL."""
+    s3_url = StorageService.upload_file(local_path, f"videos/{filename}")
+    return s3_url if s3_url else f"/api/v1/video/download/{filename}"
 
 # Shot-type routing: ordered list of model_ids to try
 _ROUTING = {
@@ -178,7 +185,7 @@ def _generate_replicate(model_id: str, prompt: str, image_url: Optional[str], du
     return {
         "video_path": local_path,
         "video_filename": filename,
-        "download_url": f"/api/v1/video/download/{filename}",
+        "download_url": _persist_video(local_path, filename),
         "model_id": model_id,
         "provider": "replicate",
         "prediction_id": pred_id,
@@ -228,7 +235,7 @@ def _generate_higgsfield(prompt: str, image_url: Optional[str], duration: int) -
             return {
                 "video_path": local_path,
                 "video_filename": filename,
-                "download_url": f"/api/v1/video/download/{filename}",
+                "download_url": _persist_video(local_path, filename),
                 "model_id": "higgsfield-v1",
                 "provider": "higgsfield",
                 "generation_id": gen_id,
