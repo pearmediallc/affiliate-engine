@@ -17,6 +17,7 @@ import LandingPageStudio from './LandingPageStudio';
 import TalkingHead from './TalkingHead';
 import VideoCreator from './VideoCreator';
 import { useAuth } from '@/lib/auth';
+import CampaignStudio from './CampaignStudio';
 
 interface Template {
   [key: string]: unknown;
@@ -27,6 +28,16 @@ interface AnalyticsData {
 }
 
 const navGroups = [
+  {
+    label: 'CAMPAIGN',
+    items: [
+      { id: 'campaign-studio', label: 'Campaign Studio', icon: (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" />
+        </svg>
+      )},
+    ],
+  },
   {
     label: 'CREATIVE',
     items: [
@@ -135,6 +146,7 @@ const navGroups = [
 ];
 
 const pageMeta: Record<string, { title: string; description: string }> = {
+  'campaign-studio': { title: 'Campaign Studio', description: 'End-to-end video ad creation: brief → script → storyboard → generate → edit → review' },
   generate: { title: 'Generate Images', description: 'Create high-performing ad images for affiliate campaigns' },
   gallery: { title: 'Gallery', description: 'Browse and manage your generated images' },
   scripts: { title: 'Script Generator', description: 'Generate persuasive ad scripts for your campaigns' },
@@ -408,11 +420,21 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
 
       {/* Main Content */}
       <main className="lg:ml-[260px] ml-0 flex-1 min-h-screen" style={{
-        backgroundImage: 'url(/herobg.jpg)',
+        backgroundImage: activeTab === 'campaign-studio' ? 'none' : 'url(/herobg.jpg)',
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundAttachment: 'fixed',
+        backgroundColor: activeTab === 'campaign-studio' ? '#030712' : undefined,
       }}>
+        {/* Campaign Studio — full-screen, no padding wrapper */}
+        {activeTab === 'campaign-studio' && (
+          <div style={{ height: '100vh', overflow: 'hidden' }}>
+            <CampaignStudio />
+          </div>
+        )}
+
+        {activeTab !== 'campaign-studio' && (
+          <>
         {/* Subtle tinted overlay — lets the cosmic image show through */}
         <div style={{
           position: 'fixed',
@@ -452,6 +474,7 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
 
           {/* Tab Content */}
           <div>
+
             {activeTab === 'generate' && (
               <ImageGenerator
                 templates={templates}
@@ -506,6 +529,8 @@ export default function Dashboard({ templates, analytics, error, vertical = 'hom
             )}
           </div>
         </div>
+          </>
+        )}
       </main>
 
       {/* Mobile responsive styles */}

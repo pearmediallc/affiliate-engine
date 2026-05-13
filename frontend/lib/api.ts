@@ -22,6 +22,17 @@ const apiClient = axios.create({
   },
 });
 
+// Attach auth token from localStorage on every request
+apiClient.interceptors.request.use((config) => {
+  if (typeof window !== 'undefined') {
+    const token = localStorage.getItem('auth_token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return config;
+});
+
 // Templates
 export const fetchTemplates = async (vertical = 'home_insurance') => {
   const response = await apiClient.get(`/templates/vertical/${vertical}`);
@@ -224,6 +235,149 @@ export const extractTemplate = async (imagesBase64: string[]) => {
     images_base64: imagesBase64,
   });
   return response.data;
+};
+
+// ─────────────────────────────────────── Campaign pipeline API
+
+function authHeaders() {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+// Campaigns
+export const createCampaign = async (data: {
+  name: string;
+  vertical: string;
+  brief_text?: string;
+  reference_video?: File | null;
+  reference_image?: File | null;
+}) => {
+  const form = new FormData();
+  form.append('name', data.name);
+  form.append('vertical', data.vertical);
+  if (data.brief_text) form.append('brief_text', data.brief_text);
+  if (data.reference_video) form.append('reference_video', data.reference_video);
+  if (data.reference_image) form.append('reference_image', data.reference_image);
+  const response = await axios.post(`${API_URL}/campaigns`, form, {
+    headers: { ...authHeaders() },
+  });
+  return response.data;
+};
+
+export const listCampaigns = async () => {
+  const r = await apiClient.get('/campaigns');
+  return r.data;
+};
+
+export const getCampaign = async (id: string) => {
+  const r = await apiClient.get(`/campaigns/${id}`);
+  return r.data;
+};
+
+export const runBriefing = async (id: string) => {
+  const r = await apiClient.post(`/campaigns/${id}/brief`);
+  return r.data;
+};
+
+export const runScripting = async (id: string, target_duration = 30, extra_instructions = '') => {
+  const r = await apiClient.post(`/campaigns/${id}/script`, { target_duration, extra_instructions });
+  return r.data;
+};
+
+export const runStoryboarding = async (id: string, character_ids: string[], setting_ids: string[], target_duration = 30) => {
+  const r = await apiClient.post(`/campaigns/${id}/storyboard`, { character_ids, setting_ids, target_duration });
+  return r.data;
+};
+
+export const startGeneration = async (id: string) => {
+  const r = await apiClient.post(`/campaigns/${id}/generate`);
+  return r.data;
+};
+
+export const runEditing = async (id: string, color_grade = 'cinematic', music_mood = 'motivational') => {
+  const r = await apiClient.post(`/campaigns/${id}/edit`, { color_grade, music_mood });
+  return r.data;
+};
+
+export const getCampaignCost = async (id: string) => {
+  const r = await apiClient.get(`/campaigns/${id}/cost`);
+  return r.data;
+};
+
+// Characters
+export const createCharacter = async (data: { name: string; description?: string; portrait?: File | null }) => {
+  const form = new FormData();
+  form.append('name', data.name);
+  if (data.description) form.append('description', data.description);
+  if (data.portrait) form.append('portrait', data.portrait);
+  const r = await axios.post(`${API_URL}/characters`, form, { headers: { ...authHeaders() } });
+  return r.data;
+};
+
+export const listCharacters = async () => {
+  const r = await apiClient.get('/characters');
+  return r.data;
+};
+
+// Scene settings
+export const createSceneSetting = async (data: { name: string; description?: string; location_type?: string; reference_image?: File | null }) => {
+  const form = new FormData();
+  form.append('name', data.name);
+  if (data.description) form.append('description', data.description);
+  if (data.location_type) form.append('location_type', data.location_type);
+  if (data.reference_image) form.append('reference_image', data.reference_image);
+  const r = await axios.post(`${API_URL}/scene-settings`, form, { headers: { ...authHeaders() } });
+  return r.data;
+};
+
+export const listSceneSettings = async () => {
+  const r = await apiClient.get('/scene-settings');
+  return r.data;
+};
+
+// Variations
+export const planVariants = async (campaignId: string, strategies: string[], num_per_strategy = 3) => {
+  const r = await apiClient.post(`/variations/${campaignId}/plan`, { strategies, num_per_strategy });
+  return r.data;
+};
+
+export const createVariation = async (campaignId: string, data: {
+  strategy: string;
+  label?: string;
+  new_character_id?: string;
+  new_setting_id?: string;
+  style_model?: string;
+  auto_generate?: boolean;
+}) => {
+  const r = await apiClient.post(`/variations/${campaignId}/create`, { auto_generate: true, ...data });
+  return r.data;
+};
+
+export const listVariations = async (campaignId: string) => {
+  const r = await apiClient.get(`/variations/${campaignId}/list`);
+  return r.data;
+};
+
+export const reviewVariation = async (campaignId: string, variationId: string, action: 'approve' | 'reject') => {
+  const r = await apiClient.post(`/variations/${campaignId}/${variationId}/review`, { action });
+  return r.data;
+};
+
+export const editVariation = async (campaignId: string, variationId: string, color_grade = 'cinematic', music_mood = 'motivational') => {
+  const r = await apiClient.post(`/variations/${campaignId}/${variationId}/edit`, { color_grade, music_mood });
+  return r.data;
+};
+
+// Music
+export const searchMusic = async (mood = 'motivational', duration_max = 120) => {
+  const r = await apiClient.get('/music/search', { params: { mood, duration_max } });
+  return r.data;
+};
+
+// Stock footage
+export const searchStock = async (query: string, orientation = 'portrait') => {
+  const r = await apiClient.get('/stock/search', { params: { query, orientation } });
+  return r.data;
 };
 
 export default apiClient;

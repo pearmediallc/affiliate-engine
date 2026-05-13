@@ -8,12 +8,15 @@
     {"id": "flux-schnell", "name": "FLUX Schnell", "provider": "fal", "tier": "fast", "text_accuracy": "low", "photorealism": "good", "requires_key": "FAL_API_KEY"}
   ],
   "video_generation": [
-    {"id": "veo-3.1", "name": "Google Veo 3.1", "provider": "google", "tier": "premium", "duration": "4-8s", "resolution": "720p-1080p", "audio": true, "requires_key": "GEMINI_API_KEY"},
-    {"id": "veo-3.1-fast", "name": "Veo 3.1 Fast", "provider": "google", "tier": "fast", "duration": "4-8s", "resolution": "720p", "audio": true, "requires_key": "GEMINI_API_KEY"},
-    {"id": "kling-v3", "name": "Kling V3", "provider": "kling", "tier": "standard", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "KLING_API_KEY"},
-    {"id": "seedance-v2", "name": "Seedance V2", "provider": "bytedance", "tier": "premium", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "SEEDANCE_API_KEY"},
-    {"id": "runway-gen4", "name": "Runway Gen-4", "provider": "runway", "tier": "premium", "duration": "5-10s", "resolution": "1080p", "audio": false, "requires_key": "RUNWAY_API_KEY"},
-    {"id": "ltx-2", "name": "LTX 2", "provider": "ltx", "tier": "standard", "duration": "6-20s", "resolution": "720p", "audio": false, "requires_key": "LTX_API_KEY"}
+    {"id": "veo-3.1", "name": "Google Veo 3.1", "provider": "google", "tier": "premium", "duration": "4-8s", "resolution": "720p-1080p", "audio": true, "best_for": ["hero", "lip_sync"], "requires_key": "GEMINI_API_KEY"},
+    {"id": "veo-3.1-fast", "name": "Veo 3.1 Fast", "provider": "google", "tier": "fast", "duration": "4-8s", "resolution": "720p", "audio": true, "best_for": ["hero", "b_roll"], "requires_key": "GEMINI_API_KEY"},
+    {"id": "higgsfield-v1", "name": "Higgsfield", "provider": "higgsfield", "tier": "premium", "duration": "3-8s", "resolution": "1080p", "audio": false, "best_for": ["spokesperson", "talking_head"], "requires_key": "HIGGSFIELD_API_KEY"},
+    {"id": "luma-ray-2", "name": "Luma Ray-2", "provider": "replicate", "tier": "standard", "duration": "5-9s", "resolution": "720p-1080p", "audio": false, "best_for": ["spokesperson", "action"], "replicate_model": "luma-ai/ray-2-720p", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "hailuo-02", "name": "Hailuo 02 (MiniMax)", "provider": "replicate", "tier": "standard", "duration": "6s", "resolution": "720p", "audio": false, "best_for": ["b_roll", "transition"], "replicate_model": "minimax/hailuo-02", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "wan-2.2", "name": "Wan 2.2", "provider": "replicate", "tier": "budget", "duration": "4-8s", "resolution": "480p-720p", "audio": false, "best_for": ["b_roll", "transition"], "replicate_model": "wan-ai/wan2.2-t2v-480p", "requires_key": "REPLICATE_API_TOKEN"},
+    {"id": "kling-v3", "name": "Kling V3", "provider": "kling", "tier": "standard", "duration": "5-10s", "resolution": "1080p", "audio": false, "best_for": ["action", "motion"], "requires_key": "KLING_API_KEY"},
+    {"id": "runway-gen4", "name": "Runway Gen-4", "provider": "runway", "tier": "premium", "duration": "5-10s", "resolution": "1080p", "audio": false, "best_for": ["spokesperson", "action"], "requires_key": "RUNWAY_API_KEY"},
+    {"id": "ltx-2", "name": "LTX 2", "provider": "replicate", "tier": "budget", "duration": "6-20s", "resolution": "720p", "audio": false, "best_for": ["transition", "b_roll"], "replicate_model": "Lightricks/LTX-Video", "requires_key": "REPLICATE_API_TOKEN"}
   ],
   "lip_sync": [
     {"id": "sadtalker", "name": "SadTalker", "provider": "replicate", "tier": "standard", "input": "image+audio", "requires_key": "REPLICATE_API_TOKEN"},

@@ -180,6 +180,57 @@ class Pricing:
             return round(per_sec * float(predict_time_sec), 6)
         return cls.REPLICATE_PER_PREDICTION
 
+    # ---------------------------------------------------------------- MULTI-PROVIDER VIDEO
+
+    # Higgsfield — $/second of video (spokesperson/avatar, their API)
+    HIGGSFIELD_PER_SEC = _env_float("PRICE_HIGGSFIELD_PER_SEC", 0.15)
+
+    # Luma Ray-2 — via Replicate, billed per prediction (~15s run = ~$0.014)
+    LUMA_RAY2_PER_PREDICTION = _env_float("PRICE_LUMA_RAY2_PER_PREDICTION", 0.014)
+
+    # Hailuo 02 (MiniMax) — via Replicate
+    HAILUO_PER_PREDICTION = _env_float("PRICE_HAILUO_PER_PREDICTION", 0.010)
+
+    # Wan 2.2 — via Replicate (budget)
+    WAN_PER_PREDICTION = _env_float("PRICE_WAN_PER_PREDICTION", 0.006)
+
+    # Runway Gen-4 — their API, ~$0.05/s
+    RUNWAY_PER_SEC = _env_float("PRICE_RUNWAY_PER_SEC", 0.05)
+
+    # Kling V3 — their API
+    KLING_PER_SEC = _env_float("PRICE_KLING_PER_SEC", 0.10)
+
+    # Replicate vision (Pixtral-12B) — per prediction
+    PIXTRAL_PER_PREDICTION = _env_float("PRICE_PIXTRAL_PER_PREDICTION", 0.005)
+
+    @classmethod
+    def video(cls, model_id: str, duration_seconds: float = 6) -> float:
+        """Cost for any video generation call across all providers."""
+        m = (model_id or "").lower()
+        if "veo" in m:
+            return cls.veo_video(duration_seconds, model_id)
+        if "higgsfield" in m:
+            return round(cls.HIGGSFIELD_PER_SEC * max(0.0, float(duration_seconds)), 4)
+        if "luma" in m or "ray-2" in m:
+            return cls.LUMA_RAY2_PER_PREDICTION
+        if "hailuo" in m or "minimax" in m:
+            return cls.HAILUO_PER_PREDICTION
+        if "wan" in m:
+            return cls.WAN_PER_PREDICTION
+        if "runway" in m:
+            return round(cls.RUNWAY_PER_SEC * max(0.0, float(duration_seconds)), 4)
+        if "kling" in m:
+            return round(cls.KLING_PER_SEC * max(0.0, float(duration_seconds)), 4)
+        if "ltx" in m:
+            return cls.REPLICATE_PER_PREDICTION
+        return cls.REPLICATE_PER_PREDICTION
+
+    # ---------------------------------------------------------------- LIBRARIES
+
+    # Pixabay + Pexels — free APIs, no cost per call
+    PIXABAY_PER_CALL = 0.0
+    PEXELS_PER_CALL = 0.0
+
     # ---------------------------------------------------------------- TEXT (Gemini)
 
     # Gemini 2.5 Flash — $/1M tokens (input/output approximations for ad-script lengths)

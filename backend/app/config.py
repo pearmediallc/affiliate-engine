@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     tiktok_advertiser_id: Optional[str] = None
     replicate_api_token: Optional[str] = None  # Replicate API for lip-sync, upscaling, etc.
 
+    # Video generation providers
+    higgsfield_api_key: Optional[str] = None   # Higgsfield spokesperson/avatar video
+    luma_api_key: Optional[str] = None         # Luma Ray-2 (via Replicate or direct)
+    hailuo_api_key: Optional[str] = None       # Hailuo/MiniMax (via Replicate)
+    wan_api_key: Optional[str] = None          # Wan 2.2 (via Replicate)
+    kling_api_key: Optional[str] = None        # Kling V3 (via their API)
+    runway_api_key: Optional[str] = None       # Runway Gen-4
+
+    # Content libraries
+    pixabay_api_key: Optional[str] = None      # Pixabay free CC0 music
+    pexels_api_key: Optional[str] = None       # Pexels free stock footage
+
     # Image Generation
     image_provider: str = "gemini"  # Primary: Gemini 3.1 Flash Image, Fallback: OpenAI DALL-E 3, Then FAL.ai
     gemini_model: str = "gemini-2.5-flash"  # For prompt optimization and vision
