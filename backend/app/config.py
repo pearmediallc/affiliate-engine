@@ -60,15 +60,16 @@ class Settings(BaseSettings):
     deepgram_api_key: Optional[str] = None  # Deepgram API key for transcription
     tiktok_access_token: Optional[str] = None
     tiktok_advertiser_id: Optional[str] = None
-    replicate_api_token: Optional[str] = None  # Replicate API for lip-sync, upscaling, etc.
+    replicate_api_token: Optional[str] = None  # legacy — no longer primary, kept for compatibility
+    kie_api_key: Optional[str] = None          # Kie.ai API — Runway, FLUX, InfiniteTalk lip-sync
 
     # Video generation providers
-    higgsfield_api_key: Optional[str] = None   # Higgsfield spokesperson/avatar video
-    luma_api_key: Optional[str] = None         # Luma Ray-2 (via Replicate or direct)
-    hailuo_api_key: Optional[str] = None       # Hailuo/MiniMax (via Replicate)
-    wan_api_key: Optional[str] = None          # Wan 2.2 (via Replicate)
-    kling_api_key: Optional[str] = None        # Kling V3 (via their API)
-    runway_api_key: Optional[str] = None       # Runway Gen-4
+    higgsfield_api_key: Optional[str] = None   # Higgsfield — Kling, Wan, Hailuo, Veo, own models
+    luma_api_key: Optional[str] = None         # Luma Ray-2 (via Higgsfield if no direct key)
+    hailuo_api_key: Optional[str] = None       # Hailuo/MiniMax (via Higgsfield)
+    wan_api_key: Optional[str] = None          # Wan 2.2 (via Higgsfield)
+    kling_api_key: Optional[str] = None        # Kling V3 (via Higgsfield)
+    runway_api_key: Optional[str] = None       # Runway Gen-4 (via Kie.ai)
 
     # Content libraries
     pixabay_api_key: Optional[str] = None      # Pixabay free CC0 music

@@ -486,8 +486,16 @@ def _fmt_srt_time(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _fmt_ass_time(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    cs = int(round((sec - int(sec)) * 100))
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
 def _segments_to_captions(segments: list[dict], words_per_line: int = 5) -> list[dict]:
-    """Chunk Whisper segments into short caption lines with proportional timestamps."""
+    """Chunk Whisper segments into caption lines with proportional timestamps."""
     captions = []
     for seg in segments:
         text = (seg.get("text") or "").strip()
@@ -529,6 +537,201 @@ def _burn_srt(input_path: str, output_path: str, srt_path: str, style: str = "su
         "-vf", f"subtitles={safe_path}:force_style='{force_style}'",
         "-c:a", "copy", output_path,
     ])
+
+
+# ─────────────────────────────────────── PROFESSIONAL UGC CAPTION ENGINE
+#
+# Uses Whisper word-level timestamps (timestamp_granularities=["word"]) to
+# build ASS (Advanced SubStation Alpha) subtitles with:
+#   - Per-word karaoke timing (\k tags) so each word lights up exactly when spoken
+#   - TikTok/UGC style: large bold centered text, thick black border, no box
+#   - Proper punctuation preserved from Whisper's output
+#
+# ASS format is far more powerful than SRT: custom fonts, colors, alignment,
+# word-level karaoke highlighting — all in a single file.
+
+_ASS_STYLES = {
+    # TikTok/Instagram Reels style: 1-3 words, huge white text, black border, center screen
+    "tiktok": {
+        "fontname": "Arial",
+        "fontsize": 90,
+        "primary": "&H00FFFFFF",       # white
+        "secondary": "&H0000FFFF",     # yellow (karaoke highlight)
+        "outline": "&H00000000",       # black
+        "back": "&H00000000",
+        "bold": -1,
+        "outline_w": 4,
+        "shadow": 1,
+        "alignment": 5,               # center-middle (ASS alignment 5)
+        "margin_v": 0,
+        "words_per_line": 2,
+    },
+    # Bold center — large white text centered vertically, good for short lines
+    "bold_center": {
+        "fontname": "Arial",
+        "fontsize": 72,
+        "primary": "&H00FFFFFF",
+        "secondary": "&H0000FFFF",
+        "outline": "&H00000000",
+        "back": "&H00000000",
+        "bold": -1,
+        "outline_w": 4,
+        "shadow": 1,
+        "alignment": 5,
+        "margin_v": 0,
+        "words_per_line": 3,
+    },
+    # Bottom subtitle — classic subtitle position, smaller text
+    "subtitle": {
+        "fontname": "Arial",
+        "fontsize": 52,
+        "primary": "&H00FFFFFF",
+        "secondary": "&H0000FFFF",
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "bold": -1,
+        "outline_w": 3,
+        "shadow": 0,
+        "alignment": 2,               # bottom center
+        "margin_v": 60,
+        "words_per_line": 5,
+    },
+    # Karaoke highlight — word-by-word color change (yellow when spoken)
+    "karaoke": {
+        "fontname": "Arial",
+        "fontsize": 80,
+        "primary": "&H00FFFFFF",
+        "secondary": "&H0000FFFF",    # yellow for active word
+        "outline": "&H00000000",
+        "back": "&H00000000",
+        "bold": -1,
+        "outline_w": 4,
+        "shadow": 1,
+        "alignment": 5,
+        "margin_v": 0,
+        "words_per_line": 3,
+    },
+}
+
+
+def _words_from_whisper_result(result) -> list[dict]:
+    """
+    Extract word-level timestamps from a Whisper verbose_json result.
+    Returns list of {word, start, end}.
+    Falls back to segment-level proportional splitting if word timestamps absent.
+    """
+    words = []
+    # New openai-python SDK: result.words attribute
+    if hasattr(result, "words") and result.words:
+        for w in result.words:
+            words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
+        return words
+
+    # Segments with word-level data
+    segments = getattr(result, "segments", None) or []
+    for seg in segments:
+        seg_words = getattr(seg, "words", None)
+        if seg_words:
+            for w in seg_words:
+                words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
+
+    if words:
+        return words
+
+    # Fallback: proportional split within each segment
+    for seg in segments:
+        text = (getattr(seg, "text", "") or "").strip()
+        start = float(getattr(seg, "start", 0))
+        end = float(getattr(seg, "end", start + 1))
+        toks = text.split()
+        if not toks:
+            continue
+        dur = (end - start) / len(toks)
+        for i, tok in enumerate(toks):
+            words.append({"word": tok, "start": round(start + i * dur, 3), "end": round(start + (i + 1) * dur, 3)})
+
+    return words
+
+
+def _group_words_into_lines(words: list[dict], words_per_line: int) -> list[dict]:
+    """
+    Group word-level timestamps into caption lines.
+    Each line has: start, end, words=[{word, start, end}], text
+    """
+    lines = []
+    for i in range(0, len(words), words_per_line):
+        chunk = words[i:i + words_per_line]
+        if not chunk:
+            continue
+        lines.append({
+            "start": chunk[0]["start"],
+            "end": chunk[-1]["end"],
+            "words": chunk,
+            "text": " ".join(w["word"] for w in chunk),
+        })
+    return lines
+
+
+def _build_ass(lines: list[dict], style_name: str = "tiktok", play_res_x: int = 1080, play_res_y: int = 1920) -> str:
+    """
+    Build a complete ASS subtitle file with karaoke word timing.
+    Each word is wrapped in {\k<centiseconds>} so it highlights exactly when spoken.
+    """
+    st = _ASS_STYLES.get(style_name, _ASS_STYLES["tiktok"])
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{st['fontname']},{st['fontsize']},{st['primary']},{st['secondary']},{st['outline']},{st['back']},{st['bold']},0,0,0,100,100,0,0,1,{st['outline_w']},{st['shadow']},{st['alignment']},10,10,{st['margin_v']},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"""
+
+    dialogue_lines = []
+    for line in lines:
+        line_start = _fmt_ass_time(line["start"])
+        line_end = _fmt_ass_time(line["end"])
+
+        # Build karaoke text: {\k<duration_cs>}word {\k<duration_cs>}word ...
+        # \k fills the word color progressively from left over the duration
+        parts = []
+        prev_end = line["start"]
+        for w in line["words"]:
+            # Gap before this word (silence/pause) — consume with zero-visible k
+            gap_cs = max(0, int(round((w["start"] - prev_end) * 100)))
+            word_cs = max(1, int(round((w["end"] - w["start"]) * 100)))
+            if gap_cs > 0:
+                parts.append(f"{{\\k{gap_cs}}}")
+            parts.append(f"{{\\k{word_cs}}}{w['word']}")
+            prev_end = w["end"]
+
+        text = " ".join(parts) if parts else line["text"]
+        dialogue_lines.append(
+            f"Dialogue: 0,{line_start},{line_end},Default,,0,0,0,,{text}"
+        )
+
+    return header + "\n" + "\n".join(dialogue_lines) + "\n"
+
+
+def _burn_ass(input_path: str, output_path: str, ass_path: str) -> bool:
+    """Burn ASS subtitle file onto video using ffmpeg ass= filter."""
+    safe = ass_path.replace("\\", "/").replace(":", "\\:")
+    ok = _run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"ass={safe}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "2",
+        "-c:a", "copy", output_path,
+    ])
+    if ok and os.path.isfile(output_path):
+        return True
+    # Fallback: libass may not be available — use subtitles= filter with force_style
+    logger.warning("ass= filter failed, falling back to subtitles= filter")
+    return _burn_srt(input_path, output_path, ass_path.replace(".ass", ".srt"), style="bold_center")
 
 
 # ─────────────────────────────────────────────── Public API

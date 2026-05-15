@@ -1,190 +1,278 @@
-"""Lip-sync service - generates talking-head videos from portrait + audio using Replicate API.
+"""
+Lip-sync service — generates talking-head videos from portrait + audio.
 
-Uses Replicate's MODEL-NAME prediction endpoint (not version-pinned). This avoids the
-"422 Invalid version or not permitted" failures that happen when Replicate authors rotate
-or archive specific version SHAs. Replicate routes model-name predictions to the latest
-published version automatically.
+Provider routing:
+  1. Higgsfield Visual Effects API (primary) — cinematic quality, native lip-sync
+  2. Kie.ai InfiniteTalk API (fallback) — image-to-talking-video
+  3. Replicate SadTalker (legacy fallback, only if REPLICATE_API_TOKEN set)
 
-Reference: https://replicate.com/docs/reference/http#models.predictions.create
+Replicate is no longer the primary path. HIGGSFIELD_API_KEY or KIE_API_KEY required.
 """
 import os
 import uuid
 import time
 import logging
 import requests
+import httpx
 from typing import Optional
 from ..config import settings
 from .pricing import Pricing
+from .storage import StorageService
 
 logger = logging.getLogger(__name__)
 
-DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "downloads")
+DOWNLOADS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "downloads",
+)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Lip-sync models, keyed by short id. We pin the OWNER/NAME, not a version SHA,
-# so model authors can publish updates without breaking us.
+_HIGGSFIELD_BASE = "https://cloud.higgsfield.ai/api/v1"
+
+
+def _persist(local_path: str, filename: str) -> str:
+    s3 = StorageService.upload_file(local_path, f"videos/{filename}")
+    return s3 if s3 else f"/api/v1/lip-sync/download/{filename}"
+
+
+def _download(url: str, filename: str) -> str:
+    path = os.path.join(DOWNLOADS_DIR, filename)
+    with httpx.stream("GET", url, follow_redirects=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_bytes():
+                f.write(chunk)
+    return path
+
+
+# ── Higgsfield Visual Effects ─────────────────────────────────────────────────
+
+def _start_higgsfield(image_url: str, audio_url: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {settings.higgsfield_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "visual-effects",
+        "image_url": image_url,
+        "audio_url": audio_url,
+        "effect": "lip_sync",
+    }
+    r = httpx.post(f"{_HIGGSFIELD_BASE}/generations", headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("id") or data.get("generation_id") or data.get("taskId")
+
+
+def _check_higgsfield(gen_id: str) -> dict:
+    headers = {"Authorization": f"Bearer {settings.higgsfield_api_key}"}
+    r = httpx.get(f"{_HIGGSFIELD_BASE}/generations/{gen_id}", headers=headers, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    status = (data.get("status") or "").lower()
+    result = {"generation_id": gen_id, "status": status, "provider": "higgsfield"}
+
+    if status in ("completed", "succeeded", "success", "done"):
+        result["status"] = "succeeded"
+        video_url = data.get("video_url") or data.get("videoUrl")
+        if video_url:
+            result["video_url"] = video_url
+            filename = f"lipsync_hf_{uuid.uuid4().hex[:8]}.mp4"
+            local_path = _download(video_url, filename)
+            result["local_path"] = local_path
+            result["download_filename"] = filename
+    elif status in ("failed", "error", "canceled"):
+        result["status"] = "failed"
+        result["error"] = data.get("message") or "Higgsfield generation failed"
+
+    return result
+
+
+# ── Kie.ai InfiniteTalk ───────────────────────────────────────────────────────
+
+def _start_kieai(image_url: str, audio_url: str) -> str:
+    from .kieai_service import KieAIService
+    return KieAIService.start_lip_sync(image_url, audio_url)
+
+
+def _check_kieai(task_id: str) -> dict:
+    from .kieai_service import KieAIService
+    return KieAIService.check_lip_sync(task_id)
+
+
+# ── Replicate legacy (SadTalker / Wav2Lip) ────────────────────────────────────
+
+_REPLICATE_MODELS = {
+    "sadtalker": {"owner": "cjwbw", "model": "sadtalker", "input_keys": {"image": "source_image", "audio": "driven_audio"}, "extras": {"enhancer": "gfpgan"}},
+    "wav2lip":   {"owner": "cjwbw", "model": "wav2lip",   "input_keys": {"image": "face", "audio": "audio"}, "extras": {}},
+}
+
+
+def _start_replicate(image_url: str, audio_url: str, model: str = "sadtalker") -> str:
+    token = settings.replicate_api_token
+    info = _REPLICATE_MODELS.get(model, _REPLICATE_MODELS["sadtalker"])
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    keys = info["input_keys"]
+    payload = {keys["image"]: image_url, keys["audio"]: audio_url, **info.get("extras", {})}
+    owner, name = info["owner"], info["model"]
+    r = requests.post(
+        f"https://api.replicate.com/v1/models/{owner}/{name}/predictions",
+        headers=headers, json={"input": payload}, timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        raise Exception(f"Replicate API error: {r.status_code} - {r.text[:300]}")
+    return r.json().get("id")
+
+
+def _check_replicate(prediction_id: str) -> dict:
+    token = settings.replicate_api_token
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"Replicate status check failed: {r.status_code}")
+    data = r.json()
+    status = data.get("status")
+    result = {"prediction_id": prediction_id, "status": status, "provider": "replicate"}
+
+    if status == "succeeded":
+        output = data.get("output")
+        video_url = output if isinstance(output, str) else (output[0] if isinstance(output, list) else None)
+        if video_url:
+            result["video_url"] = video_url
+            try:
+                resp = requests.get(video_url, timeout=60)
+                if resp.status_code == 200:
+                    filename = f"lipsync_{uuid.uuid4().hex[:8]}.mp4"
+                    filepath = os.path.join(DOWNLOADS_DIR, filename)
+                    with open(filepath, "wb") as f:
+                        f.write(resp.content)
+                    result["local_path"] = filepath
+                    result["download_filename"] = filename
+            except Exception as e:
+                logger.warning(f"Failed to download Replicate lip-sync result: {e}")
+
+    predict_time = (data.get("metrics") or {}).get("predict_time")
+    result["predict_time_sec"] = predict_time
+    result["cost_usd"] = Pricing.lip_sync(predict_time, hardware="t4")
+    return result
+
+
+# ── Available models list ─────────────────────────────────────────────────────
+
 MODELS = {
-    "sadtalker": {
-        "owner": "cjwbw",
-        "model": "sadtalker",
-        "name": "SadTalker",
-        "description": "Audio-driven single image talking face animation",
-        "supports_video_input": False,
-        "input_keys": {"image": "source_image", "audio": "driven_audio"},
-        "extras": {"enhancer": "gfpgan"},
+    "higgsfield": {
+        "name": "Higgsfield Visual Effects",
+        "description": "Cinematic lip-sync and talking-head generation",
+        "provider": "higgsfield",
     },
-    # Fallbacks. If sadtalker is unavailable, the route can switch model id.
+    "infinitalk": {
+        "name": "InfiniteTalk (Kie.ai)",
+        "description": "Image-to-talking-video with accurate lip sync",
+        "provider": "kieai",
+    },
+    "sadtalker": {
+        "name": "SadTalker",
+        "description": "Audio-driven talking face (legacy, via Replicate)",
+        "provider": "replicate",
+    },
     "wav2lip": {
-        "owner": "cjwbw",
-        "model": "wav2lip",
         "name": "Wav2Lip",
-        "description": "Lip-sync model (faster, lower quality than SadTalker)",
-        "supports_video_input": True,
-        "input_keys": {"image": "face", "audio": "audio"},
-        "extras": {},
+        "description": "Fast lip-sync for existing video clips (legacy, via Replicate)",
+        "provider": "replicate",
     },
 }
 
 
 class LipSyncService:
-    """Generates talking-head videos using Replicate API"""
 
     @staticmethod
     def get_available_models() -> list:
-        return [{"id": k, **v} for k, v in MODELS.items()]
-
-    @staticmethod
-    def start_generation(
-        image_url: str,
-        audio_url: str,
-        model: str = "sadtalker",
-    ) -> dict:
-        """Start a lip-sync generation job on Replicate.
-
-        Uses the model-name prediction endpoint, which always routes to the latest
-        published version of `{owner}/{model}`. Returns prediction ID.
-        """
-        token = settings.replicate_api_token
-        if not token:
-            raise ValueError("REPLICATE_API_TOKEN not configured")
-
-        model_info = MODELS.get(model)
-        if not model_info:
-            raise ValueError(f"Unknown model: {model}. Available: {list(MODELS.keys())}")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-        # Build input using each model's expected keys (e.g. SadTalker uses
-        # source_image/driven_audio; Wav2Lip uses face/audio).
-        input_keys = model_info["input_keys"]
-        payload_input = {
-            input_keys["image"]: image_url,
-            input_keys["audio"]: audio_url,
-            **model_info.get("extras", {}),
-        }
-
-        owner = model_info["owner"]
-        name = model_info["model"]
-        url = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
-
-        logger.info(f"Lip-sync request: model={owner}/{name}")
-        r = requests.post(url, headers=headers, json={"input": payload_input}, timeout=30)
-
-        if r.status_code not in (200, 201):
-            raise Exception(f"Replicate API error: {r.status_code} - {r.text[:300]}")
-
-        data = r.json()
-        prediction_id = data.get("id")
-        logger.info(f"Lip-sync job started: {prediction_id} (model={owner}/{name})")
-
-        return {
-            "prediction_id": prediction_id,
-            "status": data.get("status", "starting"),
-            "model": model,
-        }
-
-    @staticmethod
-    def check_status(prediction_id: str) -> dict:
-        """Check the status of a lip-sync generation job."""
-        token = settings.replicate_api_token
-        if not token:
-            raise ValueError("REPLICATE_API_TOKEN not configured")
-
-        headers = {"Authorization": f"Bearer {token}"}
-
-        r = requests.get(
-            f"https://api.replicate.com/v1/predictions/{prediction_id}",
-            headers=headers, timeout=30,
-        )
-
-        if r.status_code != 200:
-            raise Exception(f"Replicate status check failed: {r.status_code}")
-
-        data = r.json()
-        status = data.get("status")  # starting, processing, succeeded, failed, canceled
-        output = data.get("output")
-        error = data.get("error")
-
-        result = {
-            "prediction_id": prediction_id,
-            "status": status,
-            "error": error,
-        }
-
-        if status == "succeeded" and output:
-            # Output is typically a URL to the generated video
-            video_url = output if isinstance(output, str) else output[0] if isinstance(output, list) else None
-            if video_url:
-                result["video_url"] = video_url
-                # Download the video
-                try:
-                    video_response = requests.get(video_url, timeout=60)
-                    if video_response.status_code == 200:
-                        filename = f"lipsync_{uuid.uuid4().hex[:8]}.mp4"
-                        filepath = os.path.join(DOWNLOADS_DIR, filename)
-                        with open(filepath, "wb") as f:
-                            f.write(video_response.content)
-                        result["local_path"] = filepath
-                        result["download_filename"] = filename
-                except Exception as dl_err:
-                    logger.warning(f"Failed to download lip-sync result: {dl_err}")
-
-        # Compute real cost from Replicate's reported predict_time when present.
-        # Replicate exposes runtime under data["metrics"]["predict_time"] (seconds).
-        predict_time = None
-        try:
-            metrics = data.get("metrics") or {}
-            predict_time = metrics.get("predict_time")
-        except Exception:
-            pass
-        result["predict_time_sec"] = predict_time
-        # Hardware tier — SadTalker on Replicate uses T4 by default
-        result["cost_usd"] = Pricing.lip_sync(predict_time, hardware="t4")
-
-        return result
-
-    @staticmethod
-    def upload_file_to_replicate(file_path: str) -> str:
-        """Upload a local file to Replicate's file hosting and return the URL."""
-        token = settings.replicate_api_token
-        if not token:
-            raise ValueError("REPLICATE_API_TOKEN not configured")
-
-        headers = {"Authorization": f"Bearer {token}"}
-
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                "https://api.replicate.com/v1/files",
-                headers=headers,
-                files={"content": (os.path.basename(file_path), f)},
-                timeout=60,
+        available = []
+        for k, v in MODELS.items():
+            p = v["provider"]
+            is_avail = (
+                (p == "higgsfield" and bool(settings.higgsfield_api_key))
+                or (p == "kieai" and bool(settings.kie_api_key))
+                or (p == "replicate" and bool(settings.replicate_api_token))
             )
+            available.append({"id": k, **v, "available": is_avail})
+        return available
 
-        if r.status_code not in (200, 201):
-            raise Exception(f"File upload failed: {r.status_code} - {r.text[:200]}")
+    @staticmethod
+    def _best_provider() -> str:
+        if settings.higgsfield_api_key:
+            return "higgsfield"
+        if settings.kie_api_key:
+            return "kieai"
+        if settings.replicate_api_token:
+            return "replicate"
+        raise ValueError("No lip-sync provider configured — set HIGGSFIELD_API_KEY or KIE_API_KEY")
 
-        data = r.json()
-        return data.get("urls", {}).get("get", "")
+    @staticmethod
+    def start_generation(image_url: str, audio_url: str, model: str = "auto") -> dict:
+        """
+        Start a lip-sync generation job.
+        model: 'auto' | 'higgsfield' | 'infinitalk' | 'sadtalker' | 'wav2lip'
+        Returns dict with provider, job_id (prediction_id or generation_id or task_id).
+        """
+        if model == "auto":
+            provider = LipSyncService._best_provider()
+        elif model == "higgsfield":
+            provider = "higgsfield"
+        elif model == "infinitalk":
+            provider = "kieai"
+        else:
+            provider = "replicate"
+
+        if provider == "higgsfield":
+            gen_id = _start_higgsfield(image_url, audio_url)
+            return {"provider": "higgsfield", "generation_id": gen_id, "status": "starting", "model": "higgsfield"}
+
+        if provider == "kieai":
+            task_id = _start_kieai(image_url, audio_url)
+            return {"provider": "kieai", "task_id": task_id, "status": "starting", "model": "infinitalk"}
+
+        # replicate legacy
+        pred_id = _start_replicate(image_url, audio_url, model=model)
+        return {"provider": "replicate", "prediction_id": pred_id, "status": "starting", "model": model}
+
+    @staticmethod
+    def check_status(job: dict) -> dict:
+        """
+        Poll status. job must contain the dict returned by start_generation.
+        Returns status dict with optional video_url / local_path.
+        """
+        provider = job.get("provider", "replicate")
+
+        if provider == "higgsfield":
+            return _check_higgsfield(job["generation_id"])
+
+        if provider == "kieai":
+            return _check_kieai(job["task_id"])
+
+        return _check_replicate(job["prediction_id"])
+
+    @staticmethod
+    def upload_file_to_provider(file_path: str) -> str:
+        """
+        Upload a local file and return a public URL.
+        Tries S3 first (if configured), then Replicate file hosting as last resort.
+        """
+        s3_url = StorageService.upload_file(file_path, f"uploads/{os.path.basename(file_path)}")
+        if s3_url:
+            return s3_url
+
+        # Legacy: Replicate file hosting
+        if settings.replicate_api_token:
+            headers = {"Authorization": f"Bearer {settings.replicate_api_token}"}
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    "https://api.replicate.com/v1/files",
+                    headers=headers,
+                    files={"content": (os.path.basename(file_path), f)},
+                    timeout=60,
+                )
+            if r.status_code in (200, 201):
+                return r.json().get("urls", {}).get("get", "")
+
+        raise ValueError("Cannot upload file: no S3 configured and no Replicate token")

@@ -380,6 +380,38 @@ export const searchStock = async (query: string, orientation = 'portrait') => {
   return r.data;
 };
 
+// ─────────────────────────────────────── Harness Engine API
+
+export const optimizePrompt = async (params: {
+  raw_prompt: string;
+  feature: 'image' | 'video' | 'speech' | 'caption';
+  vertical?: string;
+  params?: Record<string, unknown>;
+}) => {
+  const r = await apiClient.post('/harness/optimize', {
+    raw_prompt: params.raw_prompt,
+    feature: params.feature,
+    vertical: params.vertical || 'home_insurance',
+    params: params.params || {},
+  });
+  return r.data;
+};
+
+export const recordOutcome = async (params: {
+  event_id: string;
+  outcome: 'downloaded' | 'rejected' | 'regenerated' | 'approved';
+  time_to_action_sec?: number;
+  cost_usd?: number;
+}) => {
+  const r = await apiClient.post('/harness/outcome', params);
+  return r.data;
+};
+
+export const getHarnessProfile = async (vertical = 'home_insurance') => {
+  const r = await apiClient.get(`/harness/profile/${vertical}`);
+  return r.data;
+};
+
 // Auto-caption: transcribe with Whisper + burn timed captions
 export const autoCaptionVideo = async (formData: FormData) => {
   const r = await apiClient.post('/video-edit/auto-caption', formData, {

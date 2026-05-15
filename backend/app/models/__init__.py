@@ -8,6 +8,7 @@ from .learning import LearningRecord, VerticalKnowledge, AISuggestion, Asset
 from .job import Job
 from .audit_log import AuditLog
 from .campaign import Character, SceneSetting, Campaign, Shot, Variation
+from .harness import GenerationEvent, UserPromptProfile
 
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",
@@ -16,4 +17,5 @@ __all__ = [
     "Job",
     "AuditLog",
     "Character", "SceneSetting", "Campaign", "Shot", "Variation",
+    "GenerationEvent", "UserPromptProfile",
 ]

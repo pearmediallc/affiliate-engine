@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef } from 'react';
-import { editVideo, autoCaptionVideo, API_HOST } from '../lib/api';
+import { editVideo, autoCaptionVideo, optimizePrompt, recordOutcome, API_HOST } from '../lib/api';
 
 const labelStyle: React.CSSProperties = {
   fontSize: '12px', fontWeight: 600, color: 'rgba(255,255,255,0.45)',
@@ -10,16 +10,26 @@ const labelStyle: React.CSSProperties = {
 
 const COLOR_GRADES = ['none', 'cinematic', 'warm', 'cool', 'vivid'];
 const CAPTION_STYLES = [
-  { id: 'subtitle', label: 'Subtitle (bottom, white)' },
-  { id: 'bold_center', label: 'Bold center (large)' },
+  { id: 'tiktok', label: 'TikTok / Reels (2 words, center)' },
+  { id: 'karaoke', label: 'Karaoke highlight (word lights up)' },
+  { id: 'bold_center', label: 'Bold center (3 words)' },
+  { id: 'subtitle', label: 'Subtitle (bottom, classic)' },
 ];
 const MUSIC_MOODS = ['', 'motivational', 'upbeat', 'energetic', 'calm', 'dramatic', 'corporate', 'inspiring'];
 const ASPECTS = ['16:9', '9:16', '1:1'];
 
+interface HarnessBlock {
+  feedback: string;
+  suggestions: string[];
+  gate_stopped: string;
+}
+
 interface CaptionResult {
   urls: Record<string, string>;
   srt: string;
+  ass?: string;
   transcript: string;
+  word_count?: number;
   caption_count: number;
 }
 
@@ -27,7 +37,7 @@ export default function VideoEditor() {
   const [file, setFile] = useState<File | null>(null);
   const [colorGrade, setColorGrade] = useState('none');
   const [captionText, setCaptionText] = useState('');
-  const [captionStyle, setCaptionStyle] = useState('subtitle');
+  const [captionStyle, setCaptionStyle] = useState('tiktok');
   const [musicMood, setMusicMood] = useState('');
   const [selectedAspects, setSelectedAspects] = useState<string[]>(['16:9', '9:16', '1:1']);
   const [processing, setProcessing] = useState(false);
@@ -36,12 +46,17 @@ export default function VideoEditor() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Auto-caption state
-  const [acWordsPerLine, setAcWordsPerLine] = useState(5);
-  const [acStyle, setAcStyle] = useState('subtitle');
+  const [acWordsPerLine, setAcWordsPerLine] = useState(2);
+  const [acStyle, setAcStyle] = useState('tiktok');
   const [acAspects, setAcAspects] = useState<string[]>(['9:16']);
   const [acProcessing, setAcProcessing] = useState(false);
   const [acError, setAcError] = useState('');
   const [acResult, setAcResult] = useState<CaptionResult | null>(null);
+  const [acEventId, setAcEventId] = useState<string | null>(null);
+
+  // Harness block state — shown when gate rejects a prompt
+  const [harnessBlock, setHarnessBlock] = useState<HarnessBlock | null>(null);
+  const [harnessChecking, setHarnessChecking] = useState(false);
 
   function toggleAcAspect(a: string) {
     setAcAspects(prev => prev.includes(a) ? prev.filter(x => x !== a) : [...prev, a]);
@@ -49,28 +64,77 @@ export default function VideoEditor() {
 
   async function handleAutoCaption() {
     if (!file) return;
-    setAcProcessing(true); setAcError(''); setAcResult(null);
+    setAcProcessing(true); setAcError(''); setAcResult(null); setHarnessBlock(null);
+
     try {
+      // ── Harness gate: check before spending API budget ──────────────────
+      setHarnessChecking(true);
+      let eventId: string | null = null;
+      try {
+        const harnessRes = await optimizePrompt({
+          raw_prompt: `Auto-caption ${file.name} with ${acStyle} style, ${acWordsPerLine} words per line`,
+          feature: 'caption',
+          vertical: 'general',
+          params: { caption_style: acStyle, words_per_line: acWordsPerLine },
+        });
+        if (!harnessRes.data?.approved) {
+          setHarnessBlock({
+            feedback: harnessRes.data?.feedback || 'Please refine your caption settings.',
+            suggestions: harnessRes.data?.suggestions || [],
+            gate_stopped: harnessRes.data?.gate_stopped || 'unknown',
+          });
+          return;
+        }
+        eventId = harnessRes.data?.event_id || null;
+        setAcEventId(eventId);
+      } catch (_) {
+        // Harness failure is non-fatal — proceed with generation
+      } finally {
+        setHarnessChecking(false);
+      }
+
+      // ── Actual captioning call ──────────────────────────────────────────
+      const startTime = Date.now();
       const fd = new FormData();
       fd.append('video', file);
       fd.append('words_per_line', String(acWordsPerLine));
       fd.append('caption_style', acStyle);
       fd.append('output_aspects', acAspects.join(',') || '9:16');
       const r = await autoCaptionVideo(fd);
+      const elapsed = (Date.now() - startTime) / 1000;
+
       if (r.success && r.data?.urls) {
         const resolved: Record<string, string> = {};
         for (const [k, url] of Object.entries(r.data.urls as Record<string, string>)) {
           resolved[k] = (url as string).startsWith('http') ? url as string : `${API_HOST}${url}`;
         }
         setAcResult({ ...r.data, urls: resolved });
+
+        // Record outcome as approved (result produced)
+        if (eventId) {
+          recordOutcome({ event_id: eventId, outcome: 'approved', generation_time_sec: elapsed }).catch(() => {});
+        }
       } else {
         setAcError(r.message || 'Auto-caption failed');
+        if (eventId) {
+          recordOutcome({ event_id: eventId, outcome: 'rejected' }).catch(() => {});
+        }
       }
     } catch (e: any) {
       setAcError(e?.response?.data?.detail || e.message || 'Failed');
     } finally {
       setAcProcessing(false);
+      setHarnessChecking(false);
     }
+  }
+
+  function handleDownload(url: string, aspect: string) {
+    if (acEventId) {
+      recordOutcome({ event_id: acEventId, outcome: 'downloaded' }).catch(() => {});
+    }
+    const a = document.createElement('a');
+    a.href = url; a.download = `caption_${aspect.replace(':', 'x')}.mp4`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
   }
 
   function toggleAspect(a: string) {
@@ -320,8 +384,8 @@ export default function VideoEditor() {
           {/* Style */}
           <div>
             <label style={labelStyle}>Caption style</label>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              {[{ id: 'subtitle', label: 'Bottom subtitle' }, { id: 'bold_center', label: 'Bold center' }].map(s => (
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {CAPTION_STYLES.map(s => (
                 <button key={s.id} onClick={() => setAcStyle(s.id)}
                   style={{
                     padding: '7px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
@@ -354,16 +418,41 @@ export default function VideoEditor() {
         <button
           className="btn-primary"
           onClick={handleAutoCaption}
-          disabled={!file || acProcessing}
+          disabled={!file || acProcessing || harnessChecking}
           style={{ fontSize: '14px', marginBottom: '12px' }}
         >
-          {acProcessing ? 'Transcribing & burning captions...' : 'Transcribe & Caption'}
+          {harnessChecking ? 'Checking prompt quality...' : acProcessing ? 'Transcribing & burning captions...' : 'Transcribe & Caption'}
         </button>
+
+        {harnessChecking && (
+          <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.35)', marginBottom: '8px' }}>
+            Harness engine validating — ensures quality before spending API budget
+          </p>
+        )}
 
         {acProcessing && (
           <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '8px' }}>
-            Extracting audio → Whisper transcription → burning captions — takes 30–90 seconds
+            Extracting audio → Whisper word-level transcription → burning {acStyle} captions — 30–90s
           </p>
+        )}
+
+        {/* Harness block — gate stopped generation */}
+        {harnessBlock && (
+          <div style={{ background: 'rgba(255,159,10,0.08)', border: '1px solid rgba(255,159,10,0.3)', borderRadius: '12px', padding: '16px', marginBottom: '8px' }}>
+            <p style={{ fontSize: '13px', color: '#ff9f0a', fontWeight: 600, marginBottom: '8px' }}>
+              Prompt Quality Gate — {harnessBlock.gate_stopped}
+            </p>
+            <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)', marginBottom: '12px' }}>
+              {harnessBlock.feedback}
+            </p>
+            {harnessBlock.suggestions.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: '18px' }}>
+                {harnessBlock.suggestions.map((s, i) => (
+                  <li key={i} style={{ fontSize: '12px', color: 'rgba(255,255,255,0.55)', marginBottom: '4px' }}>{s}</li>
+                ))}
+              </ul>
+            )}
+          </div>
         )}
 
         {acError && (
@@ -376,12 +465,12 @@ export default function VideoEditor() {
         {acResult && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             <div style={{ background: 'rgba(48,209,88,0.08)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '8px', padding: '10px 14px', fontSize: '13px', color: '#30d158' }}>
-              {acResult.caption_count} caption lines generated
+              {acResult.word_count ? `${acResult.word_count} words transcribed · ` : ''}{acResult.caption_count} caption lines burned
             </div>
 
             {/* Transcript */}
             <div>
-              <label style={labelStyle}>Transcript</label>
+              <label style={labelStyle}>Full transcript</label>
               <div style={{
                 background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
                 borderRadius: '8px', padding: '12px', fontSize: '13px', color: 'rgba(255,255,255,0.7)',
@@ -391,20 +480,25 @@ export default function VideoEditor() {
               </div>
             </div>
 
-            {/* SRT download */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <label style={{ ...labelStyle, marginBottom: 0 }}>SRT file</label>
+            {/* Download files */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <label style={{ ...labelStyle, marginBottom: 0 }}>Download</label>
               <a
                 href={`data:text/plain;charset=utf-8,${encodeURIComponent(acResult.srt)}`}
                 download="captions.srt"
-                style={{
-                  padding: '5px 12px', borderRadius: '7px', background: 'rgba(255,255,255,0.08)',
-                  color: '#e8e8ed', fontSize: '12px', textDecoration: 'none',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                }}
+                style={{ padding: '5px 12px', borderRadius: '7px', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', fontSize: '12px', textDecoration: 'none', border: '1px solid rgba(255,255,255,0.12)' }}
               >
-                Download .srt
+                .srt
               </a>
+              {acResult.ass && (
+                <a
+                  href={`data:text/plain;charset=utf-8,${encodeURIComponent(acResult.ass)}`}
+                  download="captions.ass"
+                  style={{ padding: '5px 12px', borderRadius: '7px', background: 'rgba(255,255,255,0.08)', color: '#e8e8ed', fontSize: '12px', textDecoration: 'none', border: '1px solid rgba(255,255,255,0.12)' }}
+                >
+                  .ass (karaoke)
+                </a>
+              )}
             </div>
 
             {/* Video outputs */}
@@ -420,10 +514,10 @@ export default function VideoEditor() {
                   </div>
                   <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <span style={{ fontSize: '13px', fontWeight: 600, color: '#e8e8ed' }}>{aspect}</span>
-                    <a href={url} download style={{
+                    <button onClick={() => handleDownload(url, aspect)} style={{
                       padding: '5px 12px', borderRadius: '7px', background: '#0071e3', color: '#fff',
-                      fontSize: '12px', textDecoration: 'none', fontWeight: 500,
-                    }}>Download</a>
+                      fontSize: '12px', border: 'none', cursor: 'pointer', fontWeight: 500,
+                    }}>Download</button>
                   </div>
                 </div>
               ))}

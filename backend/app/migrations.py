@@ -27,6 +27,21 @@ _REQUIRED_COLUMNS = [
     ("users", "rejection_reason", "TEXT"),
     ("users", "approved_at", "TIMESTAMP"),
     ("users", "approved_by", "VARCHAR"),
+    # Harness engine — generation_events table columns (table created by create_all)
+    ("generation_events", "is_retry", "BOOLEAN DEFAULT FALSE"),
+    ("generation_events", "retry_count", "INTEGER DEFAULT 0"),
+    ("generation_events", "prompt_sentiment", "VARCHAR"),
+    ("generation_events", "prompt_complexity", "VARCHAR"),
+    ("generation_events", "cost_usd", "DOUBLE PRECISION"),
+    ("generation_events", "generation_time_sec", "DOUBLE PRECISION"),
+    ("generation_events", "time_to_action_sec", "DOUBLE PRECISION"),
+    ("generation_events", "outcome_recorded_at", "TIMESTAMP"),
+    ("generation_events", "error", "TEXT"),
+    # Harness engine — user_prompt_profiles table columns
+    ("user_prompt_profiles", "frustration_triggers", "TEXT"),
+    ("user_prompt_profiles", "typical_prompt_complexity", "VARCHAR"),
+    ("user_prompt_profiles", "total_spend_usd", "DOUBLE PRECISION DEFAULT 0"),
+    ("user_prompt_profiles", "last_synthesized_at", "TIMESTAMP"),
 ]
 
 

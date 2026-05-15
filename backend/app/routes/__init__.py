@@ -7,6 +7,7 @@ from . import (
     transcription, video_download, feedback, auth, admin, tiktok, lip_sync,
     video_creation, video_enhance, marketing, research, jobs, audit,
     campaigns, characters, scene_settings, variations, music, stock, video_edit,
+    harness,
 )
 
 UPLOAD_DIR = os.path.join(
@@ -53,6 +54,7 @@ def create_router() -> APIRouter:
     router.include_router(music.router, prefix="/music", tags=["music"])
     router.include_router(stock.router, prefix="/stock", tags=["stock"])
     router.include_router(video_edit.router, prefix="/video-edit", tags=["video-edit"])
+    router.include_router(harness.router, prefix="/harness", tags=["harness"])
 
     # Serve uploaded reference files (portraits, setting images)
     @router.get("/uploads/{filename}")

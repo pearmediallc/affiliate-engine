@@ -84,7 +84,7 @@ class ImageGeneratorService:
             elif "ideogram" in model_name:
                 actual_provider = "ideogram"
             elif "flux" in model_name:
-                actual_provider = "fal"
+                actual_provider = "kieai"
             else:
                 actual_provider = self.provider
 
@@ -432,91 +432,48 @@ class ImageGeneratorService:
                 raise
 
     async def _generate_with_fal(self, prompt: str) -> dict:
-        """
-        Generate image using FAL.ai FLUX model
-
-        FLUX is excellent for detailed ad creatives with text overlays, CTAs, and layout specifications
-        """
+        """Generate image using FLUX via Kie.ai (replaces deprecated FAL.ai path)."""
         try:
-            if not settings.fal_api_key:
-                logger.warning("FAL API key not configured. Please add FAL_API_KEY to .env")
-                raise ValueError("FAL_API_KEY not configured")
+            if not settings.kie_api_key:
+                raise ValueError("KIE_API_KEY not configured — required for FLUX image generation")
 
-            # Call FAL.ai FLUX API
-            # FLUX v1.3 is optimized for detailed prompts and text rendering
-            headers = {
-                "Authorization": f"Key {settings.fal_api_key}",
-                "Content-Type": "application/json",
-            }
+            from .kieai_service import KieAIService
+            logger.info(f"Calling Kie.ai FLUX with prompt: {prompt[:100]}...")
 
-            payload = {
-                "prompt": prompt,
-                "image_size": "landscape_16_9",  # 1216x684 which is close to our 1200x628
-                "num_inference_steps": 28,
-                "guidance_scale": 7.5,
-                "num_images": 1,
-                "enable_safety_checker": True,
-            }
-
-            logger.info(f"Calling FAL.ai FLUX with prompt: {prompt[:100]}...")
-
-            response = requests.post(
-                "https://fal.run/fal-ai/flux/dev",
-                json=payload,
-                headers=headers,
-                timeout=120,
+            result = await asyncio.to_thread(
+                KieAIService.generate_image_flux,
+                prompt,
+                1216, 684, "flux-dev", 28,
             )
 
-            if response.status_code not in [200, 201]:
-                error_msg = response.text
-                logger.error(f"FAL API error ({response.status_code}): {error_msg}")
-                raise Exception(f"FAL API error: {error_msg}")
+            image_url = result.get("url")
+            if not image_url:
+                raise Exception("Kie.ai FLUX returned no image URL")
 
-            data = response.json()
+            # Download and persist locally
+            try:
+                img_resp = requests.get(image_url, timeout=30)
+                if img_resp.status_code == 200:
+                    fname = f"{uuid.uuid4().hex[:12]}.png"
+                    fpath = os.path.join(IMAGES_DIR, fname)
+                    with open(fpath, "wb") as f:
+                        f.write(img_resp.content)
+                    image_url = _persist_image(fpath, fname)
+            except Exception as dl_err:
+                logger.warning(f"Kie.ai FLUX download failed: {dl_err}")
 
-            # Extract image URL from response
-            if "images" in data and len(data["images"]) > 0:
-                image_url = data["images"][0].get("url")
-                if image_url:
-                    logger.info(f"Image generated successfully with FAL.ai FLUX")
-                    # Download and persist
-                    try:
-                        img_resp = requests.get(image_url, timeout=30)
-                        if img_resp.status_code == 200:
-                            fname = f"{uuid.uuid4().hex[:12]}.png"
-                            fpath = os.path.join(IMAGES_DIR, fname)
-                            with open(fpath, "wb") as f:
-                                f.write(img_resp.content)
-                            image_url = _persist_image(fpath, fname)
-                    except Exception as dl_err:
-                        logger.warning(f"FAL download failed: {dl_err}")
-                    return {
-                        "url": image_url,
-                        "path": None,
-                        "model": "flux-dev",
-                        "seed": data.get("seed", uuid.uuid4().hex[:8]),
-                        "size": "1216x684",
-                        "quality": "standard",
-                        "cost_usd": Pricing.image("flux-dev", "1216x684", "standard"),
-                    }
-
-            logger.error(f"FAL response missing image data: {data}")
-            raise Exception("FAL API returned no image data")
+            return {
+                "url": image_url,
+                "path": None,
+                "model": "flux-dev",
+                "seed": uuid.uuid4().hex[:8],
+                "size": "1216x684",
+                "quality": "standard",
+                "cost_usd": Pricing.image("flux-dev", "1216x684", "standard"),
+            }
 
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"FAL image generation failed: {error_msg}")
-
-            # If balance is exhausted, return demo image
-            if "Exhausted balance" in error_msg or "locked" in error_msg.lower():
-                logger.info("FAL balance exhausted - returning demo image")
-                return {
-                    "url": f"https://via.placeholder.com/1200x628?text=Demo+Image+(FAL+balance+exhausted)",
-                    "path": None,
-                    "model": "demo",
-                    "seed": uuid.uuid4().hex[:8],
-                }
-
+            logger.error(f"Kie.ai FLUX generation failed: {e}")
             raise
 
     async def generate_batch(

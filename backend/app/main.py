@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from .config import settings
 from .database import init_db
+from .migrations import run_migrations
 from .routes import create_router
 from .services import VerticalTemplatesService
 from .database import SessionLocal
@@ -62,6 +63,7 @@ async def startup_event():
     """Initialize database and load default data on startup"""
     logger.info("Initializing database...")
     init_db()
+    run_migrations()
 
     # Initialize default templates
     db = SessionLocal()
