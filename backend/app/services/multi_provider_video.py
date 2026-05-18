@@ -49,21 +49,22 @@ _ROUTING = {
 
 # Higgsfield endpoint slugs per model — text-to-video (t2v) and image-to-video (i2v)
 # Endpoints: POST https://platform.higgsfield.ai/{slug}
+# NOTE: higgsfield-ai/dop/* is image-to-video ONLY — use kling for t2v
 _HIGGSFIELD_T2V = {
-    "higgsfield-v1": "higgsfield-ai/dop/standard",
+    "higgsfield-v1": "kling-video/v2.1/pro/text-to-video",   # dop is i2v-only; kling is t2v fallback
     "kling-v3":      "kling-video/v2.1/pro/text-to-video",
-    "wan-2.2":       "wan-video/2.1/pro/text-to-video",
-    "hailuo-02":     "hailuo-video/v2/pro/text-to-video",
-    "luma-ray-2":    "luma-ai/ray-2/text-to-video",
+    "wan-2.2":       "kling-video/v2.1/pro/text-to-video",    # wan t2v slug unconfirmed; use kling
+    "hailuo-02":     "kling-video/v2.1/pro/text-to-video",    # hailuo t2v slug unconfirmed; use kling
+    "luma-ray-2":    "kling-video/v2.1/pro/text-to-video",
     "seedance-2":    "bytedance/seedance/v1/pro/text-to-video",
 }
 
 _HIGGSFIELD_I2V = {
     "higgsfield-v1": "higgsfield-ai/dop/standard",
     "kling-v3":      "kling-video/v2.1/pro/image-to-video",
-    "wan-2.2":       "wan-video/2.1/pro/image-to-video",
-    "hailuo-02":     "hailuo-video/v2/pro/image-to-video",
-    "luma-ray-2":    "luma-ai/ray-2/image-to-video",
+    "wan-2.2":       "kling-video/v2.1/pro/image-to-video",   # wan i2v slug unconfirmed; use kling
+    "hailuo-02":     "kling-video/v2.1/pro/image-to-video",   # hailuo i2v slug unconfirmed; use kling
+    "luma-ray-2":    "kling-video/v2.1/pro/image-to-video",
     "seedance-2":    "bytedance/seedance/v1/pro/image-to-video",
 }
 
@@ -163,15 +164,13 @@ def _generate_higgsfield(
     slug = slug_map.get(model_id) or _HIGGSFIELD_T2V.get(model_id, "higgsfield-ai/dop/standard")
     headers = _higgsfield_headers()
 
-    payload: dict = {
-        "prompt": prompt,
-        "duration": duration,
-        "aspect_ratio": "9:16",
-    }
+    payload: dict = {"prompt": prompt, "duration": duration}
     if image_url:
         payload["image_url"] = image_url
 
     r = httpx.post(f"{_HIGGSFIELD_BASE}/{slug}", headers=headers, json=payload, timeout=30)
+    if not r.is_success:
+        logger.error(f"Higgsfield {slug} returned {r.status_code}: {r.text[:500]}")
     r.raise_for_status()
     data = r.json()
     request_id = (
