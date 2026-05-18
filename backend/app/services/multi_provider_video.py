@@ -103,10 +103,8 @@ def _model_provider(model_id: str) -> str:
 
 def _pick_model(shot_type: str, preferred_model: Optional[str] = None) -> str:
     available = _available_keys()
-    candidates = []
-    if preferred_model:
-        candidates.append(preferred_model)
-    candidates.extend(_ROUTING.get(shot_type, _ROUTING["b_roll"]))
+    # Routing table is authoritative — preferred_model from storyboard may be stale
+    candidates = list(_ROUTING.get(shot_type, _ROUTING["b_roll"]))
 
     for model_id in candidates:
         provider = _model_provider(model_id)
