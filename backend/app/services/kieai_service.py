@@ -41,6 +41,15 @@ def _download(url: str, filename: str) -> str:
     return path
 
 
+def _extract_task_id(data: dict) -> Optional[str]:
+    """Extract task ID from Kie.ai response — handles both flat and nested {data:{}} envelopes."""
+    inner = data.get("data") or {}
+    return (
+        data.get("taskId") or data.get("task_id") or data.get("id")
+        or inner.get("taskId") or inner.get("task_id") or inner.get("id")
+    )
+
+
 def _poll(endpoint: str, task_id: str, timeout: int = 300) -> dict:
     """Generic poller — GET endpoint/task_id until status is completed/failed."""
     deadline = time.time() + timeout
@@ -49,11 +58,13 @@ def _poll(endpoint: str, task_id: str, timeout: int = 300) -> dict:
         r = httpx.get(f"{_BASE}{endpoint}/{task_id}", headers=_headers(), timeout=15)
         r.raise_for_status()
         data = r.json()
-        status = (data.get("status") or data.get("state") or "").lower()
+        # Kie.ai wraps results in a nested "data" envelope
+        inner = data.get("data") or data
+        status = (inner.get("status") or inner.get("state") or "").lower()
         if status in ("completed", "succeeded", "success", "done"):
-            return data
+            return inner
         if status in ("failed", "error", "canceled"):
-            raise RuntimeError(f"Kie.ai task failed: {data.get('message') or data}")
+            raise RuntimeError(f"Kie.ai task failed: {inner.get('message') or inner}")
     raise TimeoutError(f"Kie.ai task {task_id} timed out after {timeout}s")
 
 
@@ -88,7 +99,10 @@ class KieAIService:
         r = httpx.post(f"{_BASE}/api/v1/runway/generate", headers=_headers(), json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
-        task_id = data.get("taskId") or data.get("task_id") or data.get("id")
+        logger.debug(f"Kie.ai runway generate response: {data}")
+        task_id = _extract_task_id(data)
+        if not task_id:
+            raise RuntimeError(f"No task_id in Kie.ai Runway response: {data}")
 
         result = _poll("/api/v1/runway/task", task_id, timeout=300)
         video_url = (
@@ -210,7 +224,10 @@ class KieAIService:
         r = httpx.post(f"{_BASE}/api/v1/veo/generate", headers=_headers(), json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
-        task_id = data.get("taskId") or data.get("task_id") or data.get("id")
+        logger.debug(f"Kie.ai veo generate response: {data}")
+        task_id = _extract_task_id(data)
+        if not task_id:
+            raise RuntimeError(f"No task_id in Kie.ai Veo response: {data}")
 
         result = _poll("/api/v1/veo/task", task_id, timeout=600)
         video_url = result.get("videoUrl") or result.get("video_url")
