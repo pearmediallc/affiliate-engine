@@ -130,7 +130,7 @@ export default function CampaignStudio() {
           characters={characters}
           sceneSets={sceneSets}
           variations={variations}
-          onSelect={c => { setSelected(c); reloadVariations(c.id); }}
+          onSelect={c => { setSelected(c); reloadCampaign(c.id); reloadVariations(c.id); }}
           onCampaignCreated={c => { setCampaigns(prev => [c, ...prev]); setSelected(c); }}
           onReload={id => reloadCampaign(id)}
           onVariationsReload={id => reloadVariations(id)}
@@ -306,7 +306,12 @@ function CampaignDetail({ campaign, characters, sceneSets, variations, onReload,
         number={4}
         title="Video Generation"
         description="Multi-provider parallel shot generation (Veo, Higgsfield, Replicate)"
-        status={campaign.status === 'generating' ? 'running' : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? 'done' : 'pending'}
+        status={
+          campaign.status === 'generating' ? 'running'
+          : totalShots > 0 && completedShots === totalShots && completedShots > 0 ? 'done'
+          : campaign.status === 'review' || campaign.status === 'completed' ? 'done'
+          : 'pending'
+        }
       >
         <GeneratePhase campaign={campaign} completedShots={completedShots} totalShots={totalShots} onReload={onReload} />
       </PhaseCard>
@@ -316,7 +321,11 @@ function CampaignDetail({ campaign, characters, sceneSets, variations, onReload,
         number={5}
         title="Auto-Edit"
         description="Stitch shots, color grade, LUFS audio normalization, export 9:16 / 1:1 / 16:9"
-        status={campaign.status === 'editing' ? 'running' : campaign.status === 'review' || campaign.status === 'completed' ? 'done' : 'pending'}
+        status={
+          campaign.status === 'review' || campaign.status === 'completed' ? 'done'
+          : campaign.status === 'editing' && completedShots > 0 ? 'running'
+          : 'pending'
+        }
       >
         <EditPhase campaign={campaign} onReload={onReload} />
       </PhaseCard>
@@ -698,7 +707,7 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
         </div>
       ) : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? (
         <div>
-          {completedShots === totalShots && !hasFailures ? (
+          {totalShots > 0 && completedShots === totalShots && !hasFailures ? (
             <div style={{ background: 'rgba(48,209,88,0.07)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '16px' }}>
               <p style={{ fontSize: '14px', fontWeight: 600, color: '#30d158' }}>All {totalShots} shots generated</p>
             </div>
