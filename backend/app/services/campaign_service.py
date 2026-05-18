@@ -277,13 +277,14 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
         campaign.status = "generating"
         db.commit()
 
-        # Re-trigger pending shots and reset failed shots so they retry
+        # Reset failed + pending shots. Also reset any shots stuck in "generating"
+        # (background task died on Render restart without updating DB).
         shots = (
             db.query(Shot)
             .filter(
                 Shot.campaign_id == campaign.id,
                 Shot.variation_id == None,
-                Shot.status.in_(["pending", "failed"]),
+                Shot.status.in_(["pending", "failed", "generating"]),
             )
             .order_by(Shot.sequence_num)
             .all()

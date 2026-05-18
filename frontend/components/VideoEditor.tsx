@@ -112,7 +112,7 @@ export default function VideoEditor() {
 
         // Record outcome as approved (result produced)
         if (eventId) {
-          recordOutcome({ event_id: eventId, outcome: 'approved', generation_time_sec: elapsed }).catch(() => {});
+          recordOutcome({ event_id: eventId, outcome: 'approved', time_to_action_sec: elapsed }).catch(() => {});
         }
       } else {
         setAcError(r.message || 'Auto-caption failed');

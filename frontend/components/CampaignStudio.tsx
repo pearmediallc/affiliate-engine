@@ -16,7 +16,7 @@ interface Campaign {
   id: string; name: string; vertical: string; status: string;
   brief_text: string; analyzed_brief: Record<string, any> | null;
   script: string | null; storyboard: any[] | null; shots: any[];
-  total_cost_usd: number; created_at: string;
+  total_cost_usd: number; created_at: string; updated_at: string;
 }
 interface Character {
   id: string; name: string; description: string;
@@ -655,6 +655,13 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
   const failedShots = campaign.shots?.filter((s: any) => s.status === 'failed').length || 0;
   const hasFailures = failedShots > 0;
 
+  // Detect stuck: campaign "generating" with no completed shots and last update > 12 min ago
+  const isStuck = campaign.status === 'generating' && (() => {
+    if (!campaign.updated_at) return false;
+    const ageMs = Date.now() - new Date(campaign.updated_at).getTime();
+    return ageMs > 12 * 60 * 1000 && completedShots === 0;
+  })();
+
   async function run() {
     setLoading(true); setError('');
     try { await startGeneration(campaign.id); await onReload(); }
@@ -667,15 +674,27 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
       {campaign.status === 'generating' ? (
-        <div style={{ background: 'rgba(255,159,10,0.07)', border: '1px solid rgba(255,159,10,0.25)', borderRadius: '10px', padding: '20px' }}>
-          <p style={{ fontSize: '14px', fontWeight: 600, color: '#ff9f0a', marginBottom: '12px' }}>
-            Generating shots in parallel... ({completedShots}/{totalShots})
-            {hasFailures && <span style={{ color: '#ff453a', fontWeight: 400, marginLeft: '8px' }}>({failedShots} failed)</span>}
-          </p>
-          <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '999px', height: '6px', overflow: 'hidden' }}>
-            <div style={{ height: '100%', background: '#ff9f0a', borderRadius: '999px', width: `${pct}%`, transition: 'width 0.5s' }} />
+        <div>
+          <div style={{ background: 'rgba(255,159,10,0.07)', border: '1px solid rgba(255,159,10,0.25)', borderRadius: '10px', padding: '20px' }}>
+            <p style={{ fontSize: '14px', fontWeight: 600, color: '#ff9f0a', marginBottom: '12px' }}>
+              Generating shots in parallel... ({completedShots}/{totalShots})
+              {hasFailures && <span style={{ color: '#ff453a', fontWeight: 400, marginLeft: '8px' }}>({failedShots} failed)</span>}
+            </p>
+            <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '999px', height: '6px', overflow: 'hidden' }}>
+              <div style={{ height: '100%', background: '#ff9f0a', borderRadius: '999px', width: `${pct}%`, transition: 'width 0.5s' }} />
+            </div>
+            <p style={{ ...subText, marginTop: '8px' }}>Auto-refreshes every 8s</p>
           </div>
-          <p style={{ ...subText, marginTop: '8px' }}>Auto-refreshes every 8s</p>
+          {isStuck && (
+            <div style={{ background: 'rgba(255,69,58,0.07)', border: '1px solid rgba(255,69,58,0.25)', borderRadius: '10px', padding: '14px', marginTop: '10px' }}>
+              <p style={{ fontSize: '13px', color: '#ff453a', marginBottom: '10px' }}>
+                Generation appears stuck — background task may have died on server restart.
+              </p>
+              <button className="btn-primary" onClick={run} disabled={loading} style={{ fontSize: '13px', background: '#ff453a' }}>
+                {loading ? 'Retrying...' : 'Force retry stuck shots'}
+              </button>
+            </div>
+          )}
         </div>
       ) : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? (
         <div>
