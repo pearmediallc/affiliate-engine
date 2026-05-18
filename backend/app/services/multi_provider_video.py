@@ -80,7 +80,10 @@ def _available_keys() -> set[str]:
     keys = set()
     if settings.gemini_api_key:
         keys.add("google")
-    if settings.higgsfield_api_key:
+    # Higgsfield requires Key key:secret — mark available only when auth is complete
+    hf_key = settings.higgsfield_api_key or ""
+    hf_secret = settings.higgsfield_api_secret or ""
+    if hf_key and (hf_secret or ":" in hf_key):
         keys.add("higgsfield")
     if settings.kie_api_key:
         keys.add("kieai")
