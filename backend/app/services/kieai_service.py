@@ -82,7 +82,7 @@ class KieAIService:
         duration: int = 5,
         image_url: Optional[str] = None,
         ratio: str = "9:16",
-        quality: str = "standard",
+        quality: str = "720p",
     ) -> dict:
         """Submit a Runway Gen-4 video task via Kie.ai. Returns task info with download_url."""
         if not settings.kie_api_key:
