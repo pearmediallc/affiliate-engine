@@ -177,8 +177,8 @@ async def start_generation(
 ):
     """Phase 4: kick off video generation for all shots."""
     campaign = _get_or_404(db, campaign_id, user.id)
-    if campaign.status not in ("storyboarding", "generating"):
-        raise HTTPException(400, detail="Campaign must be in storyboarding status first")
+    if campaign.status not in ("storyboarding", "generating", "editing"):
+        raise HTTPException(400, detail="Campaign must have a storyboard before generating")
     campaign = CampaignService.start_generation(db, campaign, background_tasks=background_tasks)
     return APIResponse(
         success=True,

@@ -64,7 +64,8 @@ class Settings(BaseSettings):
     kie_api_key: Optional[str] = None          # Kie.ai API — Runway, FLUX, InfiniteTalk lip-sync
 
     # Video generation providers
-    higgsfield_api_key: Optional[str] = None   # Higgsfield — Kling, Wan, Hailuo, Veo, own models
+    higgsfield_api_key: Optional[str] = None   # Higgsfield — key (or key:secret combined)
+    higgsfield_api_secret: Optional[str] = None  # Higgsfield API secret (if stored separately from key)
     luma_api_key: Optional[str] = None         # Luma Ray-2 (via Higgsfield if no direct key)
     hailuo_api_key: Optional[str] = None       # Hailuo/MiniMax (via Higgsfield)
     wan_api_key: Optional[str] = None          # Wan 2.2 (via Higgsfield)

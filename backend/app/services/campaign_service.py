@@ -277,12 +277,20 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
         campaign.status = "generating"
         db.commit()
 
+        # Re-trigger pending shots and reset failed shots so they retry
         shots = (
             db.query(Shot)
-            .filter(Shot.campaign_id == campaign.id, Shot.status == "pending")
+            .filter(
+                Shot.campaign_id == campaign.id,
+                Shot.variation_id == None,
+                Shot.status.in_(["pending", "failed"]),
+            )
             .order_by(Shot.sequence_num)
             .all()
         )
+        for shot in shots:
+            shot.status = "pending"
+        db.commit()
 
         for shot in shots:
             if background_tasks:
@@ -356,21 +364,24 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
             logger.error(f"Shot generation failed {shot_id}: {e}", exc_info=True)
             db.query(Shot).filter(Shot.id == shot_id).update({"status": "failed"})
             db.commit()
+            # Still check advancement — all shots may be done (failed counts as done)
+            CampaignService._check_and_advance(db, campaign_id)
         finally:
             db.close()
 
     @staticmethod
     def _check_and_advance(db: Session, campaign_id: str):
-        """After each shot completes, check if all shots are done → move to editing."""
-        pending = (
+        """After each shot finishes (success or failure), advance if nothing is still running."""
+        in_flight = (
             db.query(Shot)
             .filter(
                 Shot.campaign_id == campaign_id,
+                Shot.variation_id == None,
                 Shot.status.in_(["pending", "generating"]),
             )
             .count()
         )
-        if pending == 0:
+        if in_flight == 0:
             db.query(Campaign).filter(Campaign.id == campaign_id).update({"status": "editing"})
             db.commit()
 

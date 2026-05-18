@@ -33,8 +33,8 @@ VIDEOS_DIR = os.path.join(
 )
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 
-# Higgsfield Cloud API base
-_HIGGSFIELD_BASE = "https://cloud.higgsfield.ai/api/v1"
+# Higgsfield Platform API — https://platform.higgsfield.ai
+_HIGGSFIELD_BASE = "https://platform.higgsfield.ai"
 
 # Shot-type routing: ordered list of model_ids to try
 _ROUTING = {
@@ -47,15 +47,24 @@ _ROUTING = {
     "transition":   ["wan-2.2", "hailuo-02"],
 }
 
-# Higgsfield model slugs for each model_id
-_HIGGSFIELD_MODELS = {
-    "higgsfield-v1": "higgsfield",
-    "kling-v3":      "kling-3.0",
-    "wan-2.2":       "wan-2.2",
-    "hailuo-02":     "hailuo-02",
-    "luma-ray-2":    "luma-ray-2",
-    "sora-2":        "sora-2",
-    "seedance-2":    "seedance-2.0",
+# Higgsfield endpoint slugs per model — text-to-video (t2v) and image-to-video (i2v)
+# Endpoints: POST https://platform.higgsfield.ai/{slug}
+_HIGGSFIELD_T2V = {
+    "higgsfield-v1": "higgsfield-ai/dop/standard",
+    "kling-v3":      "kling-video/v2.1/pro/text-to-video",
+    "wan-2.2":       "wan-video/2.1/pro/text-to-video",
+    "hailuo-02":     "hailuo-video/v2/pro/text-to-video",
+    "luma-ray-2":    "luma-ai/ray-2/text-to-video",
+    "seedance-2":    "bytedance/seedance/v1/pro/text-to-video",
+}
+
+_HIGGSFIELD_I2V = {
+    "higgsfield-v1": "higgsfield-ai/dop/standard",
+    "kling-v3":      "kling-video/v2.1/pro/image-to-video",
+    "wan-2.2":       "wan-video/2.1/pro/image-to-video",
+    "hailuo-02":     "hailuo-video/v2/pro/image-to-video",
+    "luma-ray-2":    "luma-ai/ray-2/image-to-video",
+    "seedance-2":    "bytedance/seedance/v1/pro/image-to-video",
 }
 
 
@@ -119,10 +128,21 @@ def _download_video(url: str, filename: str) -> str:
 
 # ── Higgsfield provider ───────────────────────────────────────────────────────
 
+def _higgsfield_auth() -> str:
+    """Build Higgsfield auth string: 'key:secret' or just 'key' if no secret configured."""
+    key = settings.higgsfield_api_key or ""
+    # If key already contains ':' it's stored as 'key:secret' in one env var
+    if ":" in key:
+        return key
+    secret = settings.higgsfield_api_secret or ""
+    return f"{key}:{secret}" if secret else key
+
+
 def _higgsfield_headers() -> dict:
     return {
-        "Authorization": f"Bearer {settings.higgsfield_api_key}",
+        "Authorization": f"Key {_higgsfield_auth()}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
@@ -132,29 +152,41 @@ def _generate_higgsfield(
     image_url: Optional[str],
     duration: int,
 ) -> dict:
-    """Generate video via Higgsfield Cloud API. Handles any model routed through Higgsfield."""
-    slug = _HIGGSFIELD_MODELS.get(model_id, model_id)
+    """Generate video via Higgsfield Platform API.
+
+    Endpoint: POST https://platform.higgsfield.ai/{model_slug}
+    Auth:     Authorization: Key {api_key}:{api_secret}
+    Polling:  GET  https://platform.higgsfield.ai/request/{request_id}
+    """
+    use_i2v = bool(image_url)
+    slug_map = _HIGGSFIELD_I2V if use_i2v else _HIGGSFIELD_T2V
+    slug = slug_map.get(model_id) or _HIGGSFIELD_T2V.get(model_id, "higgsfield-ai/dop/standard")
     headers = _higgsfield_headers()
 
     payload: dict = {
-        "model": slug,
         "prompt": prompt,
         "duration": duration,
-        "resolution": "1080p",
         "aspect_ratio": "9:16",
     }
     if image_url:
         payload["image_url"] = image_url
 
-    r = httpx.post(f"{_HIGGSFIELD_BASE}/generations", headers=headers, json=payload, timeout=30)
+    r = httpx.post(f"{_HIGGSFIELD_BASE}/{slug}", headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
-    gen_id = data.get("id") or data.get("generation_id") or data.get("taskId")
+    request_id = (
+        data.get("request_id")
+        or data.get("id")
+        or data.get("generation_id")
+        or data.get("taskId")
+    )
+    if not request_id:
+        raise RuntimeError(f"No request_id in Higgsfield response: {data}")
 
     deadline = time.time() + 600
     while time.time() < deadline:
         time.sleep(6)
-        poll = httpx.get(f"{_HIGGSFIELD_BASE}/generations/{gen_id}", headers=headers, timeout=15)
+        poll = httpx.get(f"{_HIGGSFIELD_BASE}/request/{request_id}", headers=headers, timeout=15)
         poll.raise_for_status()
         sd = poll.json()
         status = (sd.get("status") or "").lower()
@@ -163,6 +195,7 @@ def _generate_higgsfield(
                 sd.get("video_url")
                 or sd.get("videoUrl")
                 or (sd.get("output") or {}).get("video_url")
+                or (sd.get("output") or {}).get("url")
             )
             if not video_url:
                 raise RuntimeError(f"No video_url in Higgsfield result: {sd}")
@@ -174,13 +207,13 @@ def _generate_higgsfield(
                 "download_url": _persist_video(local_path, filename),
                 "model_id": model_id,
                 "provider": "higgsfield",
-                "generation_id": gen_id,
+                "generation_id": request_id,
                 "cost_usd": Pricing.video(model_id, duration),
             }
         if status in ("failed", "error", "canceled"):
             raise RuntimeError(f"Higgsfield generation failed: {sd}")
 
-    raise TimeoutError(f"Higgsfield generation {gen_id} timed out")
+    raise TimeoutError(f"Higgsfield generation {request_id} timed out")
 
 
 # ── Kie.ai provider ───────────────────────────────────────────────────────────

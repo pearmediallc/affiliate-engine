@@ -102,7 +102,7 @@ export default function CampaignStudio() {
   }
 
   return (
-    <div style={{ color: '#e8e8ed', minHeight: '100vh' }}>
+    <div style={{ color: '#e8e8ed', minHeight: '100vh', overflowX: 'hidden' }}>
 
       {/* ── Page header ──────────────────────────────────────── */}
       <div className="card" style={{ marginBottom: '24px', padding: '20px 24px' }}>
@@ -169,7 +169,7 @@ function CampaignsTab({
   const [showNewForm, setShowNewForm] = useState(false);
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '20px', alignItems: 'start' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: '260px minmax(0, 1fr)', gap: '20px', alignItems: 'start' }}>
 
       {/* Campaign list */}
       <div className="card" style={{ padding: '12px', minHeight: '300px' }}>
@@ -206,7 +206,7 @@ function CampaignsTab({
       </div>
 
       {/* Campaign detail */}
-      <div>
+      <div style={{ minWidth: 0 }}>
         {!selected ? (
           <div className="card" style={{ textAlign: 'center', padding: '60px 24px' }}>
             <p style={{ fontSize: '32px', marginBottom: '12px' }}>+</p>
@@ -652,6 +652,9 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const failedShots = campaign.shots?.filter((s: any) => s.status === 'failed').length || 0;
+  const hasFailures = failedShots > 0;
+
   async function run() {
     setLoading(true); setError('');
     try { await startGeneration(campaign.id); await onReload(); }
@@ -667,6 +670,7 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
         <div style={{ background: 'rgba(255,159,10,0.07)', border: '1px solid rgba(255,159,10,0.25)', borderRadius: '10px', padding: '20px' }}>
           <p style={{ fontSize: '14px', fontWeight: 600, color: '#ff9f0a', marginBottom: '12px' }}>
             Generating shots in parallel... ({completedShots}/{totalShots})
+            {hasFailures && <span style={{ color: '#ff453a', fontWeight: 400, marginLeft: '8px' }}>({failedShots} failed)</span>}
           </p>
           <div style={{ background: 'rgba(255,255,255,0.1)', borderRadius: '999px', height: '6px', overflow: 'hidden' }}>
             <div style={{ height: '100%', background: '#ff9f0a', borderRadius: '999px', width: `${pct}%`, transition: 'width 0.5s' }} />
@@ -674,8 +678,22 @@ function GeneratePhase({ campaign, completedShots, totalShots, onReload }: {
           <p style={{ ...subText, marginTop: '8px' }}>Auto-refreshes every 8s</p>
         </div>
       ) : campaign.status === 'editing' || campaign.status === 'review' || campaign.status === 'completed' ? (
-        <div style={{ background: 'rgba(48,209,88,0.07)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '16px' }}>
-          <p style={{ fontSize: '14px', fontWeight: 600, color: '#30d158' }}>All {totalShots} shots generated</p>
+        <div>
+          {completedShots === totalShots && !hasFailures ? (
+            <div style={{ background: 'rgba(48,209,88,0.07)', border: '1px solid rgba(48,209,88,0.2)', borderRadius: '10px', padding: '16px' }}>
+              <p style={{ fontSize: '14px', fontWeight: 600, color: '#30d158' }}>All {totalShots} shots generated</p>
+            </div>
+          ) : (
+            <div style={{ background: 'rgba(255,69,58,0.07)', border: '1px solid rgba(255,69,58,0.25)', borderRadius: '10px', padding: '16px', marginBottom: '12px' }}>
+              <p style={{ fontSize: '14px', fontWeight: 600, color: '#ff453a', marginBottom: '4px' }}>
+                {completedShots}/{totalShots} shots completed — {failedShots} failed
+              </p>
+              <p style={{ ...subText, marginBottom: '12px' }}>Failed shots will be retried from scratch. Completed shots are preserved.</p>
+              <button className="btn-primary" onClick={run} disabled={loading} style={{ fontSize: '13px', background: '#ff453a' }}>
+                {loading ? 'Retrying...' : `Retry ${failedShots} failed shot${failedShots !== 1 ? 's' : ''}`}
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <div>
