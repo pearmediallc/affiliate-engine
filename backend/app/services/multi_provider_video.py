@@ -37,14 +37,16 @@ os.makedirs(VIDEOS_DIR, exist_ok=True)
 _HIGGSFIELD_BASE = "https://platform.higgsfield.ai"
 
 # Shot-type routing: ordered list of model_ids to try
+# Kie.ai Runway Gen-4 is primary — works for text-to-video and image-to-video.
+# Higgsfield is secondary (needs key:secret auth configured to activate).
 _ROUTING = {
-    "hero":         ["veo-3.1", "higgsfield-v1"],
-    "lip_sync":     ["veo-3.1", "higgsfield-v1"],
-    "spokesperson": ["higgsfield-v1", "veo-3.1"],
-    "action":       ["kling-v3", "higgsfield-v1", "veo-3.1-fast"],
-    "motion":       ["kling-v3", "higgsfield-v1", "veo-3.1-fast"],
-    "b_roll":       ["hailuo-02", "wan-2.2", "veo-3.1-fast"],
-    "transition":   ["wan-2.2", "hailuo-02"],
+    "hero":         ["runway-gen4", "veo-3.1", "higgsfield-v1"],
+    "lip_sync":     ["runway-gen4", "veo-3.1", "higgsfield-v1"],
+    "spokesperson": ["runway-gen4", "higgsfield-v1", "veo-3.1"],
+    "action":       ["runway-gen4", "kling-v3", "higgsfield-v1"],
+    "motion":       ["runway-gen4", "kling-v3", "higgsfield-v1"],
+    "b_roll":       ["runway-gen4", "hailuo-02", "wan-2.2"],
+    "transition":   ["runway-gen4", "wan-2.2", "hailuo-02"],
 }
 
 # Higgsfield endpoint slugs per model — text-to-video (t2v) and image-to-video (i2v)
