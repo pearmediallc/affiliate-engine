@@ -82,19 +82,25 @@ class KieAIService:
         duration: int = 5,
         image_url: Optional[str] = None,
         ratio: str = "9:16",
+        quality: str = "standard",
     ) -> dict:
         """Submit a Runway Gen-4 video task via Kie.ai. Returns task info with download_url."""
         if not settings.kie_api_key:
             raise ValueError("KIE_API_KEY not configured")
 
+        # Runway Gen-4 only accepts 5, 8, or 10 seconds
+        valid_durations = (5, 8, 10)
+        snapped = min(valid_durations, key=lambda x: abs(x - duration))
+
         payload: dict = {
             "prompt": prompt,
-            "duration": duration,
+            "duration": snapped,
             "ratio": ratio,
-            "model": "runway-gen4",
+            "quality": quality,
+            "model": "gen4_turbo",
         }
         if image_url:
-            payload["image_url"] = image_url
+            payload["imageUrl"] = image_url
 
         r = httpx.post(f"{_BASE}/api/v1/runway/generate", headers=_headers(), json=payload, timeout=30)
         r.raise_for_status()
