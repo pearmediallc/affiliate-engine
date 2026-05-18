@@ -90,7 +90,7 @@ def _model_provider(model_id: str) -> str:
         return "google"
     if "runway" in m:
         return "kieai"
-    if model_id in _HIGGSFIELD_MODELS:
+    if model_id in _HIGGSFIELD_T2V or model_id in _HIGGSFIELD_I2V:
         return "higgsfield"
     return "higgsfield"  # default to higgsfield for unknown models
 
