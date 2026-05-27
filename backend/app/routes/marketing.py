@@ -73,8 +73,8 @@ async def generate_angles(request: AngleRequest, user=Depends(get_optional_user)
                     input_data={"product_name": request.product_name, "target_audience": request.target_audience},
                     result_data=result, vertical=request.vertical, provider="gemini",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(f"Failed to persist job result: {e}")
         return APIResponse(success=True, message=f"Generated {len(result.get('angles', []))} angles", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -108,8 +108,8 @@ async def generate_ad_copy(request: AdCopyRequest, user=Depends(get_optional_use
                     input_data={"product_name": request.product_name, "angle": request.angle, "platforms": request.platforms},
                     result_data=result, vertical=request.vertical, provider="gemini",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(f"Failed to persist job result: {e}")
         return APIResponse(success=True, message="Ad copy generated", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -138,8 +138,8 @@ async def generate_landing_page(request: LandingPageRequest, user=Depends(get_op
                     input_data={"product_name": request.product_name, "vertical": request.vertical, "page_type": request.page_type},
                     result_data=result, vertical=request.vertical, provider="gemini", cost_usd=0.02,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(f"Failed to persist job result: {e}")
         return APIResponse(success=True, message="Landing page generated", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -171,8 +171,8 @@ async def analyze_landing_page(request: LPAnalyzeRequest, user=Depends(get_optio
                     input_data={"lp_url": request.lp_url},
                     result_data=result, provider="gemini",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(f"Failed to persist job result: {e}")
         return APIResponse(success=True, message="Landing page analyzed", data=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -145,22 +145,31 @@ def _to_dict(s: SceneSetting) -> dict:
 
 
 def _analyze_setting_bg(setting_id: str, image_path: str):
+    """Background task: analyze setting reference image to extract style_tags + description.
+    Retries once on transient failure."""
     from ..database import SessionLocal
     from ..services.reference_analyzer import ReferenceAnalyzerService
+    import time
 
-    db = SessionLocal()
-    try:
-        setting = db.query(SceneSetting).filter(SceneSetting.id == setting_id).first()
-        if not setting:
+    last_err = None
+    for attempt in range(2):
+        db = SessionLocal()
+        try:
+            setting = db.query(SceneSetting).filter(SceneSetting.id == setting_id).first()
+            if not setting:
+                return
+            analysis = ReferenceAnalyzerService.analyze_image(image_path, context="location/setting reference")
+            setting_data = analysis.get("setting", {})
+            if setting_data.get("style_tags"):
+                setting.style_tags = setting_data["style_tags"]
+            if setting_data.get("description") and not setting.description:
+                setting.description = setting_data["description"]
+            db.commit()
             return
-        analysis = ReferenceAnalyzerService.analyze_image(image_path, context="location/setting reference")
-        setting_data = analysis.get("setting", {})
-        if setting_data.get("style_tags"):
-            setting.style_tags = setting_data["style_tags"]
-        if setting_data.get("description") and not setting.description:
-            setting.description = setting_data["description"]
-        db.commit()
-    except Exception as e:
-        logger.error(f"Setting analysis failed {setting_id}: {e}")
-    finally:
-        db.close()
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Setting analysis attempt {attempt+1} failed {setting_id}: {e}")
+        finally:
+            db.close()
+        time.sleep(3)
+    logger.error(f"Setting analysis gave up for {setting_id} after 2 attempts: {last_err}")

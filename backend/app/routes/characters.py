@@ -148,22 +148,30 @@ def _to_dict(char: Character) -> dict:
 
 
 def _analyze_portrait_bg(char_id: str, portrait_path: str):
-    """Background task: analyze portrait with Pixtral to generate consistency_prompt."""
+    """Background task: analyze portrait with Pixtral to generate consistency_prompt.
+    Retries once on transient failure (network, rate limit)."""
     from ..database import SessionLocal
     from ..services.reference_analyzer import ReferenceAnalyzerService
+    import time
 
-    db = SessionLocal()
-    try:
-        char = db.query(Character).filter(Character.id == char_id).first()
-        if not char:
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        db = SessionLocal()
+        try:
+            char = db.query(Character).filter(Character.id == char_id).first()
+            if not char:
+                return
+            analysis = ReferenceAnalyzerService.analyze_image(portrait_path, context="character portrait")
+            char_data = analysis.get("character", {})
+            consistency = char_data.get("consistency_prompt") or analysis.get("description", "")
+            if consistency:
+                char.consistency_prompt = consistency
+                db.commit()
             return
-        analysis = ReferenceAnalyzerService.analyze_image(portrait_path, context="character portrait")
-        char_data = analysis.get("character", {})
-        consistency = char_data.get("consistency_prompt") or analysis.get("description", "")
-        if consistency:
-            char.consistency_prompt = consistency
-            db.commit()
-    except Exception as e:
-        logger.error(f"Portrait analysis failed for char {char_id}: {e}")
-    finally:
-        db.close()
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Portrait analysis attempt {attempt+1} failed for char {char_id}: {e}")
+        finally:
+            db.close()
+        time.sleep(3)
+    logger.error(f"Portrait analysis gave up for char {char_id} after 2 attempts: {last_err}")
