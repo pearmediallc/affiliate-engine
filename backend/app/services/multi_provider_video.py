@@ -49,23 +49,16 @@ _ROUTING = {
     "transition":   ["runway-gen4", "wan-2.2", "hailuo-02"],
 }
 
-# Higgsfield endpoint slugs per model — text-to-video (t2v) and image-to-video (i2v)
-# Endpoints: POST https://platform.higgsfield.ai/{slug}
-# NOTE: higgsfield-ai/dop/* is image-to-video ONLY — use kling for t2v
-_HIGGSFIELD_T2V = {
-    "higgsfield-v1": "kling-video/v2.1/pro/text-to-video",   # dop is i2v-only; kling is t2v fallback
-    "kling-v3":      "kling-video/v2.1/pro/text-to-video",
-    "wan-2.2":       "kling-video/v2.1/pro/text-to-video",    # wan t2v slug unconfirmed; use kling
-    "hailuo-02":     "kling-video/v2.1/pro/text-to-video",    # hailuo t2v slug unconfirmed; use kling
-    "luma-ray-2":    "kling-video/v2.1/pro/text-to-video",
-    "seedance-2":    "bytedance/seedance/v1/pro/text-to-video",
-}
+# Higgsfield endpoint slugs per model — POST https://platform.higgsfield.ai/{slug}
+# T2V: only Seedance is confirmed on the official REST API. Kling T2V returns 404.
+# I2V: kling-video, seedance, and dop are all confirmed slugs.
+_HIGGSFIELD_T2V_SLUG = "bytedance/seedance/v1/pro/text-to-video"
 
 _HIGGSFIELD_I2V = {
     "higgsfield-v1": "higgsfield-ai/dop/standard",
     "kling-v3":      "kling-video/v2.1/pro/image-to-video",
-    "wan-2.2":       "kling-video/v2.1/pro/image-to-video",   # wan i2v slug unconfirmed; use kling
-    "hailuo-02":     "kling-video/v2.1/pro/image-to-video",   # hailuo i2v slug unconfirmed; use kling
+    "wan-2.2":       "kling-video/v2.1/pro/image-to-video",
+    "hailuo-02":     "kling-video/v2.1/pro/image-to-video",
     "luma-ray-2":    "kling-video/v2.1/pro/image-to-video",
     "seedance-2":    "bytedance/seedance/v1/pro/image-to-video",
 }
@@ -96,7 +89,7 @@ def _model_provider(model_id: str) -> str:
         return "google"
     if "runway" in m:
         return "kieai"
-    if model_id in _HIGGSFIELD_T2V or model_id in _HIGGSFIELD_I2V:
+    if model_id in _HIGGSFIELD_I2V:
         return "higgsfield"
     return "higgsfield"  # default to higgsfield for unknown models
 
@@ -158,13 +151,15 @@ def _generate_higgsfield(
 ) -> dict:
     """Generate video via Higgsfield Platform API.
 
-    Endpoint: POST https://platform.higgsfield.ai/{model_slug}
+    Endpoint: POST https://platform.higgsfield.ai/{slug}
     Auth:     Authorization: Key {api_key}:{api_secret}
-    Polling:  GET  https://platform.higgsfield.ai/request/{request_id}
+    Polling:  GET  https://platform.higgsfield.ai/requests/{request_id}/status
     """
     use_i2v = bool(image_url)
-    slug_map = _HIGGSFIELD_I2V if use_i2v else _HIGGSFIELD_T2V
-    slug = slug_map.get(model_id) or _HIGGSFIELD_T2V.get(model_id, "higgsfield-ai/dop/standard")
+    if use_i2v:
+        slug = _HIGGSFIELD_I2V.get(model_id, "higgsfield-ai/dop/standard")
+    else:
+        slug = _HIGGSFIELD_T2V_SLUG
     headers = _higgsfield_headers()
 
     payload: dict = {"prompt": prompt, "duration": duration}
@@ -173,14 +168,16 @@ def _generate_higgsfield(
 
     r = httpx.post(f"{_HIGGSFIELD_BASE}/{slug}", headers=headers, json=payload, timeout=30)
     if not r.is_success:
-        logger.error(f"Higgsfield {slug} returned {r.status_code}: {r.text[:500]}")
+        logger.error(f"Higgsfield POST {slug} returned {r.status_code}: {r.text[:500]}")
     r.raise_for_status()
     data = r.json()
+    logger.debug(f"Higgsfield submit response: {data}")
+
+    inner = data.get("data") or data
     request_id = (
-        data.get("request_id")
-        or data.get("id")
-        or data.get("generation_id")
-        or data.get("taskId")
+        inner.get("request_id") or inner.get("id")
+        or inner.get("generation_id") or inner.get("taskId")
+        or data.get("request_id") or data.get("id")
     )
     if not request_id:
         raise RuntimeError(f"No request_id in Higgsfield response: {data}")
@@ -188,16 +185,20 @@ def _generate_higgsfield(
     deadline = time.time() + 600
     while time.time() < deadline:
         time.sleep(6)
-        poll = httpx.get(f"{_HIGGSFIELD_BASE}/request/{request_id}", headers=headers, timeout=15)
+        poll = httpx.get(f"{_HIGGSFIELD_BASE}/requests/{request_id}/status", headers=headers, timeout=15)
+        if not poll.is_success:
+            logger.error(f"Higgsfield poll {request_id} returned {poll.status_code}: {poll.text[:300]}")
         poll.raise_for_status()
-        sd = poll.json()
-        status = (sd.get("status") or "").lower()
+        sd_raw = poll.json()
+        sd = sd_raw.get("data") or sd_raw
+        status = (sd.get("status") or sd.get("state") or "").lower()
         if status in ("completed", "succeeded", "success", "done"):
+            output = sd.get("output") or sd.get("result") or {}
             video_url = (
-                sd.get("video_url")
-                or sd.get("videoUrl")
-                or (sd.get("output") or {}).get("video_url")
-                or (sd.get("output") or {}).get("url")
+                sd.get("video_url") or sd.get("videoUrl") or sd.get("url")
+                or (output.get("video_url") if isinstance(output, dict) else None)
+                or (output.get("url") if isinstance(output, dict) else None)
+                or (output[0].get("url") if isinstance(output, list) and output else None)
             )
             if not video_url:
                 raise RuntimeError(f"No video_url in Higgsfield result: {sd}")
@@ -212,7 +213,7 @@ def _generate_higgsfield(
                 "generation_id": request_id,
                 "cost_usd": Pricing.video(model_id, duration),
             }
-        if status in ("failed", "error", "canceled"):
+        if status in ("failed", "error", "canceled", "nsfw", "cancelled"):
             raise RuntimeError(f"Higgsfield generation failed: {sd}")
 
     raise TimeoutError(f"Higgsfield generation {request_id} timed out")

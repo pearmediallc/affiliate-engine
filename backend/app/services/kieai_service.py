@@ -51,20 +51,24 @@ def _extract_task_id(data: dict) -> Optional[str]:
 
 
 def _poll(endpoint: str, task_id: str, timeout: int = 300) -> dict:
-    """Generic poller — GET endpoint/task_id until status is completed/failed."""
+    """Poll Kie.ai task status. `endpoint` is the full polling path (e.g. /api/v1/runway/record-detail).
+    Kie.ai uses taskId as a query parameter, NOT a path parameter."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(5)
-        r = httpx.get(f"{_BASE}{endpoint}/{task_id}", headers=_headers(), timeout=15)
+        r = httpx.get(f"{_BASE}{endpoint}", params={"taskId": task_id}, headers=_headers(), timeout=15)
+        if not r.is_success:
+            logger.error(f"Kie.ai poll {endpoint}?taskId={task_id} returned {r.status_code}: {r.text[:300]}")
         r.raise_for_status()
         data = r.json()
-        # Kie.ai wraps results in a nested "data" envelope
         inner = data.get("data") or data
+        # Kie.ai uses "successFlag": 0=processing, 1=success, 2=failed, OR string "status"
+        success_flag = inner.get("successFlag")
         status = (inner.get("status") or inner.get("state") or "").lower()
-        if status in ("completed", "succeeded", "success", "done"):
+        if success_flag == 1 or status in ("completed", "succeeded", "success", "done"):
             return inner
-        if status in ("failed", "error", "canceled"):
-            raise RuntimeError(f"Kie.ai task failed: {inner.get('message') or inner}")
+        if success_flag in (2, 3) or status in ("failed", "error", "canceled"):
+            raise RuntimeError(f"Kie.ai task failed: {inner.get('errorMessage') or inner.get('message') or inner}")
     raise TimeoutError(f"Kie.ai task {task_id} timed out after {timeout}s")
 
 
@@ -110,10 +114,14 @@ class KieAIService:
         if not task_id:
             raise RuntimeError(f"No task_id in Kie.ai Runway response: {data}")
 
-        result = _poll("/api/v1/runway/task", task_id, timeout=300)
+        result = _poll("/api/v1/runway/record-detail", task_id, timeout=600)
+        # Runway results may put the URL inside response.videoUrl or videoInfo.videoUrl
+        response_data = result.get("response") or result.get("videoInfo") or {}
         video_url = (
             result.get("videoUrl")
             or result.get("video_url")
+            or response_data.get("videoUrl")
+            or response_data.get("video_url")
             or (result.get("output") or {}).get("video_url")
         )
         if not video_url:
@@ -155,14 +163,18 @@ class KieAIService:
         data = r.json()
 
         # Some endpoints return image directly, others use task polling
-        image_url = data.get("imageUrl") or data.get("image_url") or data.get("url")
+        inner = data.get("data") or data
+        image_url = inner.get("imageUrl") or inner.get("image_url") or inner.get("url")
         if not image_url:
-            task_id = data.get("taskId") or data.get("task_id") or data.get("id")
-            result = _poll("/api/v1/flux/task", task_id, timeout=120)
+            task_id = _extract_task_id(data)
+            if not task_id:
+                raise RuntimeError(f"No image_url or task_id in Kie.ai FLUX response: {data}")
+            result = _poll("/api/v1/flux/record-info", task_id, timeout=120)
+            response_data = result.get("response") or {}
             image_url = (
-                result.get("imageUrl")
-                or result.get("image_url")
-                or result.get("url")
+                result.get("imageUrl") or result.get("image_url") or result.get("url")
+                or response_data.get("imageUrl")
+                or (response_data.get("resultUrls") or [None])[0]
             )
 
         return {
@@ -184,7 +196,10 @@ class KieAIService:
         r = httpx.post(f"{_BASE}/api/v1/infinitalk/generate", headers=_headers(), json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
-        return data.get("taskId") or data.get("task_id") or data.get("id")
+        task_id = _extract_task_id(data)
+        if not task_id:
+            raise RuntimeError(f"No task_id in Kie.ai InfiniteTalk response: {data}")
+        return task_id
 
     @staticmethod
     def check_lip_sync(task_id: str) -> dict:
@@ -192,23 +207,30 @@ class KieAIService:
         if not settings.kie_api_key:
             raise ValueError("KIE_API_KEY not configured")
 
-        r = httpx.get(f"{_BASE}/api/v1/infinitalk/task/{task_id}", headers=_headers(), timeout=15)
+        r = httpx.get(f"{_BASE}/api/v1/infinitalk/record-info", params={"taskId": task_id}, headers=_headers(), timeout=15)
         r.raise_for_status()
         data = r.json()
-        status = (data.get("status") or "").lower()
+        inner = data.get("data") or data
+        success_flag = inner.get("successFlag")
+        status = (inner.get("status") or "").lower()
+        response_data = inner.get("response") or {}
 
         result: dict = {"task_id": task_id, "status": status, "provider": "kieai"}
-        if status in ("completed", "succeeded", "success", "done"):
+        if success_flag == 1 or status in ("completed", "succeeded", "success", "done"):
             result["status"] = "succeeded"
-            video_url = data.get("videoUrl") or data.get("video_url")
+            video_url = (
+                inner.get("videoUrl") or inner.get("video_url")
+                or response_data.get("videoUrl")
+                or (response_data.get("resultUrls") or [None])[0]
+            )
             if video_url:
                 result["video_url"] = video_url
                 filename = f"infinitalk_{uuid.uuid4().hex[:8]}.mp4"
                 result["local_path"] = _download(video_url, filename)
                 result["download_filename"] = filename
-        elif status in ("failed", "error"):
+        elif success_flag in (2, 3) or status in ("failed", "error"):
             result["status"] = "failed"
-            result["error"] = data.get("message") or "InfiniteTalk generation failed"
+            result["error"] = inner.get("errorMessage") or inner.get("message") or "InfiniteTalk generation failed"
 
         return result
 
@@ -235,8 +257,14 @@ class KieAIService:
         if not task_id:
             raise RuntimeError(f"No task_id in Kie.ai Veo response: {data}")
 
-        result = _poll("/api/v1/veo/task", task_id, timeout=600)
-        video_url = result.get("videoUrl") or result.get("video_url")
+        result = _poll("/api/v1/veo/record-info", task_id, timeout=600)
+        response_data = result.get("response") or {}
+        video_url = (
+            result.get("videoUrl")
+            or result.get("video_url")
+            or response_data.get("videoUrl")
+            or (response_data.get("resultUrls") or [None])[0]
+        )
         if not video_url:
             raise RuntimeError(f"No video_url in Kie.ai Veo result: {result}")
 
