@@ -74,7 +74,34 @@ def _call_gemini(prompt: str, system: str) -> str:
             max_output_tokens=4096,
         ),
     )
-    return response.text
+    return response.text or ""
+
+
+def _call_openai_json(prompt: str, system: str) -> str:
+    """Fallback to OpenAI with guaranteed JSON output."""
+    from openai import OpenAI
+
+    if not settings.openai_api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    client = OpenAI(api_key=settings.openai_api_key)
+    # Force JSON object output. Wrap shot array inside {"shots": [...]} since the
+    # OpenAI json_object mode requires a top-level object.
+    sys_with_wrap = (
+        system
+        + "\n\nWrap the array in a top-level JSON object: {\"shots\": [...]}. "
+          "Respond with valid JSON only."
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.7,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": sys_with_wrap},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return resp.choices[0].message.content or ""
 
 
 def _parse_shot_list(raw: str) -> list[dict]:
@@ -141,6 +168,23 @@ class StoryboardService:
 
         raw = _call_gemini(user_prompt, _SYSTEM_PROMPT)
         shots = _parse_shot_list(raw)
+        if not shots:
+            logger.warning(
+                "Gemini returned no parseable shots (len=%d) — falling back to OpenAI",
+                len(raw or ""),
+            )
+            try:
+                raw_oai = _call_openai_json(user_prompt, _SYSTEM_PROMPT)
+                shots = _parse_shot_list(raw_oai)
+                if not shots:
+                    logger.error("OpenAI fallback also produced no parseable shots")
+            except Exception as e:
+                logger.error("OpenAI fallback failed: %s", e)
+
+        if not shots:
+            raise ValueError(
+                "Storyboard generation produced no shots from either Gemini or OpenAI"
+            )
 
         # Enrich with routing + cost
         total_cost = 0.0

@@ -183,7 +183,39 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
                 max_output_tokens=2048,
             ),
         )
-        script_text = response.text or ""
+        script_text = (response.text or "").strip()
+
+        # Gemini 2.5 Flash sometimes returns truncated text when thinking tokens
+        # consume the output budget. Detect short/empty results and fall back to
+        # OpenAI so the pipeline does not silently advance with a broken script.
+        if len(script_text) < 400:
+            import logging as _l
+            _logger = _l.getLogger(__name__)
+            _logger.warning(
+                "Gemini script suspiciously short (len=%d) — falling back to OpenAI",
+                len(script_text),
+            )
+            try:
+                from openai import OpenAI
+
+                if not settings.openai_api_key:
+                    raise ValueError("OPENAI_API_KEY not configured")
+                oai = OpenAI(api_key=settings.openai_api_key)
+                oai_resp = oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0.8,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                script_text = (oai_resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                import logging as _l
+                _l.getLogger(__name__).error("OpenAI script fallback failed: %s", e)
+
+        if len(script_text) < 200:
+            raise ValueError("Script generation produced too short a result from both providers")
 
         campaign.script = script_text
         campaign.status = "scripting"
