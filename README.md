@@ -1,211 +1,268 @@
-# Affiliate Marketing Image Generation Engine - MVP
+# Affiliate Engine
 
-A production-ready MVP for generating high-performing home insurance ad images using AI-optimized prompts.
+AI creative platform for direct-response advertising. Generates ad creatives end-to-end — research, scripts, voiceovers, images, multi-shot videos, captions, lip-sync, and a final stitched ad — across multiple AI providers, with full campaign persistence.
 
-## Features
+This is **not** a single-tool app. It's a multi-feature platform with a campaign pipeline (brief → script → storyboard → video generation → auto-edit) plus standalone tools (marketing copy, image generator, lip-sync, transcription, etc.).
 
-- **Home Insurance Focus**: 5 pre-built, conversion-optimized templates
-- **Gemini-Powered Prompts**: Uses Google's Gemini API to optimize prompts for conversions
-- **Image Generation**: Multi-provider support (Gemini, FAL.ai FLUX)
-- **Cost Tracking**: Automatic tracking of generation costs per image
-- **Performance Analytics**: Dashboard for tracking CTR, ROI, and other metrics
-- **Database**: SQLite for MVP, easily migrates to PostgreSQL
+---
 
-## Architecture
+## Two main workflows
 
-### Backend (FastAPI)
-- **Framework**: FastAPI with async support
-- **Database**: SQLAlchemy ORM with SQLite (production-ready for PostgreSQL migration)
-- **API**: RESTful endpoints at `/api/v1`
-- **Services**: Modular services for templates, prompt optimization, image generation, and analytics
+### 1. Campaign Studio (video production pipeline)
+A multi-phase, stateful pipeline that produces a finished video ad from a brief or reference. Each phase persists to Postgres and can be replayed independently.
 
-### Frontend (Next.js)
-- **Framework**: Next.js 14 with React 18
-- **Styling**: Tailwind CSS
-- **Components**: Modular, reusable components
-- **API Client**: Axios with typed endpoints
+```
+draft → briefing → scripting → storyboarding → generating → editing → review → completed
+```
 
-## Quick Start
+| Phase | What happens | Backed by |
+|---|---|---|
+| **Briefing** | Analyze uploaded reference video/image OR text brief → extract style, palette, audience, ad arc | `ReferenceAnalyzerService` (Gemini Vision) |
+| **Scripting** | Generate full ad script with hook/problem/solution/proof/CTA labels | `CampaignService.run_scripting` (Gemini) |
+| **Storyboarding** | Generate shot list (hero, b-roll, action, transition, etc.) with per-shot prompts | `StoryboardService` (Gemini) |
+| **Generating** | Parallel background tasks generate each shot; routed across providers by shot type | `MultiProviderVideoService` |
+| **Editing** | Stitch shots, color grade, mix voiceover + music, burn captions, export | `AutoEditorService` (ffmpeg) |
+| **Review** | One or more Variations produced; user picks the winner | `VariationEngine` |
+
+### 2. Marketing Hub (text/strategy toolkit)
+Six standalone tools — text outputs, no video. Cheap (Gemini text calls) and useful for cold-start research.
+
+| Tab | What it does |
+|---|---|
+| **Angle Generator** | 10 marketing angles per offer using frameworks (AIDA, PAS, curiosity-gap, etc.) |
+| **Ad Copy** | Platform-specific (Meta, TikTok) ad copy variations from a chosen angle |
+| **Landing Page** | Generate full landing page HTML + section copy from offer details |
+| **Program Finder** | Affiliate program directory search with reward/cookie/tag filters |
+| **Performance** | Manual KPI tracker — input spend/clicks/conversions, get CTR, CPC, CPA, ROAS, EPC vs benchmarks |
+| **Hook Library** | Stored high-performing hooks per vertical/platform with effectiveness scores |
+
+---
+
+## All standalone features
+
+| Feature | Purpose | Key providers |
+|---|---|---|
+| **Video Creator** | Single-clip text/image-to-video via Veo 3.1 (Google AI) | Google Gemini |
+| **UGC Videos** | TikTok-style avatar UGC creation | TikTok Symphony API |
+| **Talking Head / Lip-Sync** | Image + audio → talking head video | Kie.ai InfiniteTalk, Replicate fallback |
+| **Video Editor** | Standalone ffmpeg editor + auto-caption (Whisper) | OpenAI Whisper |
+| **Video Downloader** | TikTok / YouTube downloads | yt-dlp |
+| **Image Generator** | Multi-provider AI image gen | Gemini Imagen, FAL FLUX, Ideogram, OpenAI |
+| **Script Generator** | Standalone ad script writer | Gemini |
+| **Script to Audio** | Text-to-speech with 10 voices, multi-language | OpenAI TTS, Google Cloud TTS |
+| **Transcription** | Audio/video to text | OpenAI Whisper, Deepgram |
+| **Hook Analyzer** | Score and explain a video hook | Gemini Vision |
+| **Video Script Analyzer** | Analyze a transcript for hooks, structure, weaknesses | Gemini |
+| **Music Library** | Royalty-free music search | Pixabay |
+| **Stock Footage** | Stock clip search | Pexels |
+| **Characters / Scene Settings** | Reusable assets — character portraits + locations with consistency prompts | Gemini Vision (auto-analysis on upload) |
+| **Variations** | Create alternate edits/styles of a finished campaign | `VariationEngine` |
+| **Analytics** | Cost tracking, generation history, per-vertical metrics | Internal DB |
+| **Admin Panel** | User management, AI suggestion review, model registry | Internal DB |
+| **Auth** | JWT-based auth, role-based permissions, audit log | Internal DB |
+
+---
+
+## Provider stack & routing
+
+Video shots are routed to the best provider per shot type. Each shot type has an ordered fallback chain — first available provider wins.
+
+| Shot type | Primary | Fallbacks |
+|---|---|---|
+| hero, lip_sync | runway-gen4 | veo-3.1, higgsfield-v1 |
+| spokesperson | runway-gen4 | higgsfield-v1, veo-3.1 |
+| action, motion | runway-gen4 | kling-v3, higgsfield-v1 |
+| b_roll | runway-gen4 | hailuo-02, wan-2.2 |
+| transition | runway-gen4 | wan-2.2, hailuo-02 |
+
+**Provider mapping:**
+- `runway-gen4` → Kie.ai (`/api/v1/runway/generate`, poll at `/api/v1/runway/record-detail`)
+- `veo-3.1` / `veo-3.1-fast` → Google AI Studio via `VideoCreatorService`
+- `higgsfield-v1`, `kling-v3`, `wan-2.2`, `hailuo-02`, `seedance-2` → Higgsfield platform (`https://platform.higgsfield.ai`)
+- Text-to-video on Higgsfield is routed to `bytedance/seedance/v1/pro/text-to-video` (only confirmed T2V slug on the official REST API)
+- Image-to-video on Higgsfield uses model-specific slugs (`kling-video/v2.1/pro/image-to-video`, `higgsfield-ai/dop/standard`, etc.)
+
+---
+
+## Tech stack
+
+**Backend** — FastAPI (Python 3.12), SQLAlchemy + Alembic, PostgreSQL, httpx, ffmpeg, pydub. Sync HTTP via `httpx` (provider calls run inside async background tasks).
+
+**Frontend** — Next.js 14, React 18, TypeScript, Tailwind CSS, Axios.
+
+**Storage** — Local filesystem for generated assets (`generated_videos/`, `generated_images/`, `uploads/`) with S3 upload via `StorageService` for production.
+
+**Deployment** — Render (web service for backend, separate static deploy for frontend). Postgres database also on Render.
+
+---
+
+## Quick start
 
 ### Prerequisites
-- Python 3.10+
+- Python 3.12+
 - Node.js 18+
-- Gemini API key
+- ffmpeg installed on PATH
+- Postgres (or sqlite for local dev)
+- At minimum: `GEMINI_API_KEY` and `OPENAI_API_KEY`
 
-### Backend Setup
+### Backend
 
 ```bash
 cd backend
-
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate
 pip install -r requirements.txt
-
-# Create .env file
-cp .env.example .env
-# Edit .env with your GEMINI_API_KEY
-
-# Run the server
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+cp .env.example .env       # then edit
+alembic upgrade head        # run migrations
+uvicorn app.main:app --reload --port 8000
 ```
 
-Backend will be available at: http://localhost:8000
-API Docs: http://localhost:8000/docs
+API docs: http://localhost:8000/docs
 
-### Frontend Setup
+### Frontend
 
 ```bash
 cd frontend
-
-# Install dependencies
 npm install
-
-# Create .env.local (optional, defaults to localhost:8000)
 echo "NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1" > .env.local
-
-# Run development server
 npm run dev
 ```
 
-Frontend will be available at: http://localhost:3000
+App: http://localhost:3000
 
-## API Endpoints
+---
 
-### Templates
-- `GET /api/v1/templates/home-insurance` - Get all home insurance templates
-- `GET /api/v1/templates/{template_id}` - Get specific template
-- `GET /api/v1/templates/vertical/{vertical}` - Get templates by vertical
+## Environment variables
 
-### Images
-- `POST /api/v1/images/generate` - Generate images from template
-- `GET /api/v1/images/list` - List generated images
-- `GET /api/v1/images/{image_id}` - Get specific image
+### Critical (system fails without these)
+| Var | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string |
+| `JWT_SECRET_KEY` | Auth token signing |
+| `GEMINI_API_KEY` | Scripts, briefs, image gen, vision analysis, marketing hub |
+| `OPENAI_API_KEY` | TTS, Whisper transcription, fallback image gen |
 
-### Analytics
-- `GET /api/v1/analytics/overview` - Overall client analytics
-- `GET /api/v1/analytics/vertical/{vertical}` - Vertical-specific analytics
-- `GET /api/v1/analytics/top-templates` - Best performing templates
-- `GET /api/v1/analytics/time-series` - Analytics over time
+### High-impact (unlocks major features)
+| Var | Unlocks |
+|---|---|
+| `KIE_API_KEY` | Runway Gen-4 video, Veo via Kie.ai, FLUX images, InfiniteTalk lip-sync |
+| `HIGGSFIELD_API_KEY` + `HIGGSFIELD_API_SECRET` | Higgsfield video models (Kling, Seedance, Hailuo, Wan, DoP) |
+| `REPLICATE_API_TOKEN` | Lip-sync fallback when Kie.ai unavailable |
+| `TIKTOK_ACCESS_TOKEN` | TikTok UGC video creation (OAuth, not a simple key) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_S3_BUCKET`, `AWS_REGION` | S3 upload for generated assets |
 
-## Database Schema
+### Optional (graceful fallback if missing)
+| Var | Unlocks |
+|---|---|
+| `PIXABAY_API_KEY` | Music Library (returns empty if missing) |
+| `PEXELS_API_KEY` | Stock Footage (returns empty if missing) |
+| `FAL_API_KEY` | FAL FLUX image fallback |
+| `IDEOGRAM_API_KEY` | Ideogram image fallback |
+| `DEEPGRAM_API_KEY` | Deepgram transcription alternative |
 
-### Core Tables
-- **clients** - Client/user accounts
-- **templates** - Template definitions per vertical
-- **images** - Generated images with metadata
-- **performance_metrics** - Campaign performance tracking
+### Frontend
+| Var | Purpose |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | Backend base URL — defaults to `http://localhost:8000/api/v1` |
 
-All migrations handled via SQLAlchemy ORM. No separate migration tool needed for MVP.
+---
 
-## Production Readiness
+## Database schema (high level)
 
-This MVP is designed to scale to production with minimal changes:
+- **users**, **roles**, **permissions** — auth
+- **campaigns** — campaign metadata, analyzed_brief, script, storyboard, status
+- **shots** — per-shot prompt, model_id, duration, video_path, video_url, status, cost
+- **variations** — alternate edits of a campaign
+- **characters**, **scene_settings** — reusable creative assets with consistency prompts
+- **images** — generated images with prompt + provider + cost
+- **job_results** — sync job history (scripts, angles, ad copy, etc.)
+- **learning_records** — feedback + performance metrics for the learning engine
+- **audit_logs** — all auth + admin actions
+- **ai_suggestions** — admin-reviewable AI improvement proposals
 
-### Database Migration
-```python
-# Change in backend/app/config.py
-DATABASE_URL = "postgresql://user:password@localhost:5432/affiliate_images"
-```
+Migrations via Alembic. See `backend/alembic/versions/`.
 
-### Image Provider Switch
-```python
-# In backend/app/config.py
-IMAGE_PROVIDER = "fal"  # or "gemini"
-# Or implement new providers by extending ImageGeneratorService
-```
+---
 
-### Deployment
-- **Backend**: FastAPI can be deployed to Any cloud (AWS, GCP, Azure, etc.) with Gunicorn/Uvicorn
-- **Frontend**: Next.js deploys easily to Vercel, Netlify, or any static host
-- **Database**: SQLite .db file can be replaced with PostgreSQL connection string
+## API surface
 
-## Configuration
-
-### Environment Variables
-
-**Backend** (`.env`):
-```
-GEMINI_API_KEY=xxx
-FAL_API_KEY=xxx
-DATABASE_URL=sqlite:///./affiliate_images.db
-IMAGE_PROVIDER=gemini
-IMAGE_GENERATION_COST=0.02
-DEBUG=False
-```
-
-**Frontend** (`.env.local`):
-```
-NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
-```
-
-## Project Structure
+29 route files, ~150 endpoints, all mounted under `/api/v1`. Highlights:
 
 ```
-affiliate-image-engine/
+POST   /api/v1/auth/register, /login
+GET/POST /api/v1/campaigns         # full pipeline
+POST   /api/v1/campaigns/{id}/brief, /script, /storyboard, /generate, /edit
+GET/POST /api/v1/characters, /scene-settings
+POST   /api/v1/marketing/angles/generate
+POST   /api/v1/marketing/ad-copy/generate
+POST   /api/v1/marketing/landing-page/generate
+GET    /api/v1/research/affiliate-search
+GET/POST /api/v1/research/hooks
+POST   /api/v1/research/performance/record
+POST   /api/v1/video/generate, /video/long/create
+POST   /api/v1/lip-sync/generate
+POST   /api/v1/speech/generate
+POST   /api/v1/transcription/transcribe-file
+POST   /api/v1/images/generate
+POST   /api/v1/video-edit/edit, /auto-caption
+POST   /api/v1/tiktok/videos/create
+GET    /api/v1/analytics/overview, /billing, /time-series
+GET    /api/v1/admin/dashboard
+```
+
+Full OpenAPI docs at `/docs` when backend is running.
+
+---
+
+## Project structure
+
+```
+affiliate-engine/
 ├── backend/
 │   ├── app/
-│   │   ├── models/          # Database models
-│   │   ├── schemas/         # Pydantic schemas
-│   │   ├── routes/          # API routes
-│   │   ├── services/        # Business logic
-│   │   └── main.py          # FastAPI app
-│   ├── requirements.txt
-│   └── .env.example
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── middleware/         # auth, CORS, audit
+│   │   ├── models/             # SQLAlchemy models
+│   │   ├── routes/             # 29 route files
+│   │   ├── services/           # 46 service modules
+│   │   └── schemas.py
+│   ├── alembic/                # DB migrations
+│   ├── generated_videos/       # output (gitignored)
+│   ├── generated_images/
+│   ├── uploads/
+│   └── requirements.txt
 ├── frontend/
-│   ├── app/                 # Next.js pages
-│   ├── components/          # React components
-│   ├── lib/                 # Utilities & API client
-│   ├── styles/              # CSS
+│   ├── app/
+│   ├── components/             # 23 feature components
 │   └── package.json
 └── README.md
 ```
 
-## Next Steps (Post-MVP)
+---
 
-1. **Image Generation Provider Integration**
-   - Implement actual Google Imagen API call
-   - Add FAL.ai FLUX integration
-   - Add error handling and retries
+## Production deployment
 
-2. **Additional Verticals**
-   - GLP/Weight Loss templates
-   - Refinance/Personal Loans
-   - Auto Insurance
-   - etc.
+Currently deployed to Render:
+- Backend web service (Python, Postgres-backed)
+- Frontend static deploy
+- Postgres managed database
 
-3. **Enhanced Analytics**
-   - Real performance data integration
-   - Dashboard visualizations
-   - Export reports
+Background tasks run in-process via FastAPI's `BackgroundTasks`. Long-running video generation polls survive instance restarts because shot status is persisted to DB; on restart, `start_generation` resets stuck `generating` shots back to `pending` and re-queues them.
 
-4. **Authentication & Multi-Client**
-   - User accounts and authentication
-   - Per-client API keys
-   - Usage quotas and billing
+---
 
-5. **Advanced Features**
-   - A/B testing framework
-   - Template optimization suggestions
-   - Batch processing
-   - Webhook integrations for ad platforms
+## Known limitations & runbook
 
-## Cost Model
+- **Video generation is provider-dependent.** Code is correct against documented provider contracts (Kie.ai docs, Higgsfield JS SDK), but each provider has its own credit/quota system. A 402 on Kie.ai means top up balance; a 404 on a Higgsfield slug means try a different model.
+- **Higgsfield text-to-video** has limited model coverage on the official REST API — only Seedance T2V is confirmed. All other Higgsfield T2V routes either fall back to Seedance or 404.
+- **TikTok UGC** requires a full OAuth flow, not just an API key. Setting `TIKTOK_ACCESS_TOKEN` to a hand-issued token works for short-lived testing only.
+- **No automated competitor ad scraping.** `ReferenceAnalyzerService` analyzes ONE uploaded reference; bulk competitor discovery (Facebook Ad Library, etc.) is not built in.
+- **Marketing Hub job persistence** wraps `JobService.save_sync_result` with explicit error logging — DB write failures no longer disappear silently.
 
-- **Google Imagen**: ~$0.01-0.03 per image
-- **FAL.ai FLUX**: ~$0.01-0.02 per image
-- **Gemini Prompt Optimization**: ~$0.0001 per call
-
-**Estimated MVP cost**: ~$0.02 per image
-
-## Support & Development
-
-For issues, feature requests, or improvements:
-1. Check the AGENT_GUIDE.md in the parent OpenMontage directory
-2. Review the spec in AFFILIATE_MARKETING_IMAGE_ENGINE.md
+---
 
 ## License
 
-Proprietary - Pear Media LLC
+Proprietary — Pear Media LLC.
