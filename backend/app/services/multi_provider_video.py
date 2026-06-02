@@ -42,7 +42,7 @@ _HIGGSFIELD_BASE = "https://platform.higgsfield.ai"
 _ROUTING = {
     "hero":         ["runway-gen4", "veo-3.1", "higgsfield-v1"],
     "lip_sync":     ["runway-gen4", "veo-3.1", "higgsfield-v1"],
-    "spokesperson": ["runway-gen4", "higgsfield-v1", "veo-3.1"],
+    "spokesperson": ["higgsfield-v1", "runway-gen4", "veo-3.1"],
     "action":       ["runway-gen4", "kling-v3", "higgsfield-v1"],
     "motion":       ["runway-gen4", "kling-v3", "higgsfield-v1"],
     "b_roll":       ["runway-gen4", "hailuo-02", "wan-2.2"],
