@@ -50,17 +50,22 @@ _ROUTING = {
 }
 
 # Higgsfield endpoint slugs per model — POST https://platform.higgsfield.ai/{slug}
-# T2V: only Seedance is confirmed on the official REST API. Kling T2V returns 404.
-# I2V: kling-video, seedance, and dop are all confirmed slugs.
-_HIGGSFIELD_T2V_SLUG = "bytedance/seedance/v1/pro/text-to-video"
+# Higgsfield has no native text-to-video endpoint; for T2V we chain
+# T2I (Soul) → I2V (DoP). The 'v1/' prefixed paths below come from the official
+# higgsfield-js SDK. Older slugs (bytedance/seedance/...) return 404.
+_HIGGSFIELD_T2I_SOUL_SLUG = "v1/text2image/soul"
+_HIGGSFIELD_I2V_DOP_SLUG  = "v1/image2video/dop"
 
+# I2V path per model_id. Models other than higgsfield-v1 aren't currently
+# exercised by the iteration engine; leave them mapped to the DoP slug so any
+# accidental call still hits a real endpoint instead of 404.
 _HIGGSFIELD_I2V = {
-    "higgsfield-v1": "higgsfield-ai/dop/standard",
-    "kling-v3":      "kling-video/v2.1/pro/image-to-video",
-    "wan-2.2":       "kling-video/v2.1/pro/image-to-video",
-    "hailuo-02":     "kling-video/v2.1/pro/image-to-video",
-    "luma-ray-2":    "kling-video/v2.1/pro/image-to-video",
-    "seedance-2":    "bytedance/seedance/v1/pro/image-to-video",
+    "higgsfield-v1": _HIGGSFIELD_I2V_DOP_SLUG,
+    "kling-v3":      _HIGGSFIELD_I2V_DOP_SLUG,
+    "wan-2.2":       _HIGGSFIELD_I2V_DOP_SLUG,
+    "hailuo-02":     _HIGGSFIELD_I2V_DOP_SLUG,
+    "luma-ray-2":    _HIGGSFIELD_I2V_DOP_SLUG,
+    "seedance-2":    _HIGGSFIELD_I2V_DOP_SLUG,
 }
 
 
@@ -143,36 +148,15 @@ def _higgsfield_headers() -> dict:
     }
 
 
-def _generate_higgsfield(
-    model_id: str,
-    prompt: str,
-    image_url: Optional[str],
-    duration: int,
-) -> dict:
-    """Generate video via Higgsfield Platform API.
-
-    Endpoint: POST https://platform.higgsfield.ai/{slug}
-    Auth:     Authorization: Key {api_key}:{api_secret}
-    Polling:  GET  https://platform.higgsfield.ai/requests/{request_id}/status
-    """
-    use_i2v = bool(image_url)
-    if use_i2v:
-        slug = _HIGGSFIELD_I2V.get(model_id, "higgsfield-ai/dop/standard")
-    else:
-        slug = _HIGGSFIELD_T2V_SLUG
-    headers = _higgsfield_headers()
-
-    payload: dict = {"prompt": prompt, "duration": duration}
-    if image_url:
-        payload["image_url"] = image_url
-
-    r = httpx.post(f"{_HIGGSFIELD_BASE}/{slug}", headers=headers, json=payload, timeout=30)
+def _higgsfield_submit(slug: str, payload: dict, headers: dict) -> str:
+    """POST to platform.higgsfield.ai/{slug}, return request_id."""
+    url = f"{_HIGGSFIELD_BASE}/{slug.lstrip('/')}"
+    r = httpx.post(url, headers=headers, json=payload, timeout=30)
     if not r.is_success:
         logger.error(f"Higgsfield POST {slug} returned {r.status_code}: {r.text[:500]}")
     r.raise_for_status()
     data = r.json()
-    logger.debug(f"Higgsfield submit response: {data}")
-
+    logger.debug(f"Higgsfield submit {slug} response: {data}")
     inner = data.get("data") or data
     request_id = (
         inner.get("request_id") or inner.get("id")
@@ -181,11 +165,18 @@ def _generate_higgsfield(
     )
     if not request_id:
         raise RuntimeError(f"No request_id in Higgsfield response: {data}")
+    return request_id
 
-    deadline = time.time() + 600
+
+def _higgsfield_poll(request_id: str, headers: dict, timeout: int = 600) -> dict:
+    """Poll until the request reaches a terminal state; return the result dict."""
+    deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(6)
-        poll = httpx.get(f"{_HIGGSFIELD_BASE}/requests/{request_id}/status", headers=headers, timeout=15)
+        poll = httpx.get(
+            f"{_HIGGSFIELD_BASE}/requests/{request_id}/status",
+            headers=headers, timeout=15,
+        )
         if not poll.is_success:
             logger.error(f"Higgsfield poll {request_id} returned {poll.status_code}: {poll.text[:300]}")
         poll.raise_for_status()
@@ -193,30 +184,99 @@ def _generate_higgsfield(
         sd = sd_raw.get("data") or sd_raw
         status = (sd.get("status") or sd.get("state") or "").lower()
         if status in ("completed", "succeeded", "success", "done"):
-            output = sd.get("output") or sd.get("result") or {}
-            video_url = (
-                sd.get("video_url") or sd.get("videoUrl") or sd.get("url")
-                or (output.get("video_url") if isinstance(output, dict) else None)
-                or (output.get("url") if isinstance(output, dict) else None)
-                or (output[0].get("url") if isinstance(output, list) and output else None)
-            )
-            if not video_url:
-                raise RuntimeError(f"No video_url in Higgsfield result: {sd}")
-            filename = f"hf_{model_id.replace('-','_')}_{uuid.uuid4().hex[:8]}.mp4"
-            local_path = _download_video(video_url, filename)
-            return {
-                "video_path": local_path,
-                "video_filename": filename,
-                "download_url": _persist_video(local_path, filename),
-                "model_id": model_id,
-                "provider": "higgsfield",
-                "generation_id": request_id,
-                "cost_usd": Pricing.video(model_id, duration),
-            }
+            return sd
         if status in ("failed", "error", "canceled", "nsfw", "cancelled"):
-            raise RuntimeError(f"Higgsfield generation failed: {sd}")
+            raise RuntimeError(f"Higgsfield request {request_id} failed: {sd}")
+    raise TimeoutError(f"Higgsfield request {request_id} timed out")
 
-    raise TimeoutError(f"Higgsfield generation {request_id} timed out")
+
+def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
+    """Pull image_url / video_url out of a Higgsfield completed payload.
+    Higgsfield response shapes vary by model — walk the common spots."""
+    primary = ["video_url", "videoUrl"] if prefer == "video" else ["image_url", "imageUrl"]
+    candidates = primary + ["url"]
+    for k in candidates:
+        v = sd.get(k)
+        if v: return v
+    container = sd.get("output") or sd.get("result") or sd.get("results") or {}
+    if isinstance(container, dict):
+        for k in candidates:
+            v = container.get(k)
+            if v: return v
+        raw = container.get("raw")
+        if isinstance(raw, dict) and raw.get("url"):
+            return raw["url"]
+    if isinstance(container, list) and container:
+        first = container[0]
+        if isinstance(first, dict):
+            for k in candidates:
+                v = first.get(k)
+                if v: return v
+            raw = first.get("raw")
+            if isinstance(raw, dict) and raw.get("url"):
+                return raw["url"]
+    return None
+
+
+def _higgsfield_t2i(prompt: str, headers: dict, aspect_ratio: str = "9:16") -> str:
+    """Generate a still image via Soul T2I; return the resulting image URL.
+    Used as step 1 of the T2I → I2V chain when no reference image is supplied."""
+    payload = {"input": {"prompt": prompt, "aspect_ratio": aspect_ratio}}
+    rid = _higgsfield_submit(_HIGGSFIELD_T2I_SOUL_SLUG, payload, headers)
+    sd = _higgsfield_poll(rid, headers, timeout=180)
+    image_url = _higgsfield_extract_url(sd, prefer="image")
+    if not image_url:
+        raise RuntimeError(f"No image_url in Higgsfield Soul T2I result: {sd}")
+    return image_url
+
+
+def _generate_higgsfield(
+    model_id: str,
+    prompt: str,
+    image_url: Optional[str],
+    duration: int,
+) -> dict:
+    """Generate video via Higgsfield Platform API.
+
+    Platform has no native text-to-video. If no reference image is provided,
+    we chain: T2I (Soul) → I2V (DoP). With an image we go straight to DoP I2V.
+
+    Endpoints: POST https://platform.higgsfield.ai/{slug}
+    Auth:      Authorization: Key {api_key}:{api_secret}
+    Polling:   GET  https://platform.higgsfield.ai/requests/{request_id}/status
+    """
+    headers = _higgsfield_headers()
+
+    if not image_url:
+        logger.info(f"Higgsfield T2V-via-chain: Soul T2I first for model={model_id}")
+        image_url = _higgsfield_t2i(prompt, headers)
+
+    slug = _HIGGSFIELD_I2V.get(model_id, _HIGGSFIELD_I2V_DOP_SLUG)
+    payload = {
+        "input": {
+            "model": "dop-turbo",
+            "prompt": prompt,
+            "duration": duration,
+            "input_images": [{"type": "image_url", "image_url": image_url}],
+        }
+    }
+    rid = _higgsfield_submit(slug, payload, headers)
+    sd = _higgsfield_poll(rid, headers, timeout=600)
+    video_url = _higgsfield_extract_url(sd, prefer="video")
+    if not video_url:
+        raise RuntimeError(f"No video_url in Higgsfield DoP I2V result: {sd}")
+
+    filename = f"hf_{model_id.replace('-','_')}_{uuid.uuid4().hex[:8]}.mp4"
+    local_path = _download_video(video_url, filename)
+    return {
+        "video_path": local_path,
+        "video_filename": filename,
+        "download_url": _persist_video(local_path, filename),
+        "model_id": model_id,
+        "provider": "higgsfield",
+        "generation_id": rid,
+        "cost_usd": Pricing.video(model_id, duration),
+    }
 
 
 # ── Kie.ai provider ───────────────────────────────────────────────────────────
