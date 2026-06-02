@@ -218,7 +218,7 @@ def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
     return None
 
 
-def _higgsfield_t2i(prompt: str, headers: dict, size: str = "1080x1920") -> str:
+def _higgsfield_t2i(prompt: str, headers: dict, size: str = "1152x2048") -> str:
     """Generate a still image via Soul T2I; return the resulting image URL.
     Used as step 1 of the T2I → I2V chain when no reference image is supplied.
     Higgsfield Soul wants `width_and_height` as 'WxH', not `aspect_ratio`."""
