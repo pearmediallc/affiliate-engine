@@ -221,7 +221,7 @@ def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
 def _higgsfield_t2i(prompt: str, headers: dict, aspect_ratio: str = "9:16") -> str:
     """Generate a still image via Soul T2I; return the resulting image URL.
     Used as step 1 of the T2I → I2V chain when no reference image is supplied."""
-    payload = {"input": {"prompt": prompt, "aspect_ratio": aspect_ratio}}
+    payload = {"params": {"prompt": prompt, "aspect_ratio": aspect_ratio}}
     rid = _higgsfield_submit(_HIGGSFIELD_T2I_SOUL_SLUG, payload, headers)
     sd = _higgsfield_poll(rid, headers, timeout=180)
     image_url = _higgsfield_extract_url(sd, prefer="image")
@@ -253,7 +253,7 @@ def _generate_higgsfield(
 
     slug = _HIGGSFIELD_I2V.get(model_id, _HIGGSFIELD_I2V_DOP_SLUG)
     payload = {
-        "input": {
+        "params": {
             "model": "dop-turbo",
             "prompt": prompt,
             "duration": duration,
