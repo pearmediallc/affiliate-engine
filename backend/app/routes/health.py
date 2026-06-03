@@ -45,11 +45,32 @@ async def storage_health() -> APIResponse:
         content_type="text/plain",
     )
     info["test_key"] = test_key
-    if url:
-        info["uploaded_url"] = url
+    info["uploaded_url"] = url
+    info["upload_ok"] = bool(url)
+
+    # Test GetObject — this is the action the AutoEditor needs after a
+    # Render restart wipes /tmp. The AWSCompromisedKeyQuarantineV3 policy
+    # denies s3:GetObject while allowing s3:PutObject, so we test both.
+    import tempfile as _tf
+    download_ok = False
+    download_err = None
+    try:
+        tmp = _tf.NamedTemporaryFile(suffix=".txt", delete=False)
+        tmp.close()
+        download_ok = StorageService.download_file(test_key, tmp.name)
+    except Exception as e:
+        download_err = str(e)
+    info["download_ok"] = download_ok
+    if download_err:
+        info["download_err"] = download_err
+
+    if url and download_ok:
+        return APIResponse(success=True, message="S3 upload + download OK", data=info)
+    if url and not download_ok:
         return APIResponse(
-            success=True,
-            message="S3 upload OK",
+            success=False,
+            message="S3 upload OK but download FAILED — IAM user is missing s3:GetObject "
+                    "(likely AWSCompromisedKeyQuarantineV3 still attached, or bucket policy denies GetObject)",
             data=info,
         )
     return APIResponse(
