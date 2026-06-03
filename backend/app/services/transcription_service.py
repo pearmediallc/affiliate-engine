@@ -9,11 +9,14 @@ from .cost_tracker import estimate_audio_seconds_from_path
 
 logger = logging.getLogger(__name__)
 
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
+
+def _get_openai():
+    """Lazy import — the openai SDK is ~50MB on first import."""
+    try:
+        import openai
+        return openai
+    except ImportError:
+        return None
 
 
 class TranscriptionService:
@@ -22,13 +25,19 @@ class TranscriptionService:
     def __init__(self):
         self.openai_key = settings.openai_api_key
         self.deepgram_key = getattr(settings, 'deepgram_api_key', None)
+        # Client is built lazily on first transcribe call (see property below).
+        self._openai_client = None
 
-        if OPENAI_AVAILABLE and self.openai_key:
-            openai.api_key = self.openai_key
-            self.openai_client = openai.OpenAI(api_key=self.openai_key)
-        else:
-            self.openai_client = None
-            logger.warning("OpenAI not available for Whisper transcription")
+    @property
+    def openai_client(self):
+        if self._openai_client is None:
+            openai = _get_openai()
+            if openai and self.openai_key:
+                openai.api_key = self.openai_key
+                self._openai_client = openai.OpenAI(api_key=self.openai_key)
+            else:
+                logger.warning("OpenAI not available for Whisper transcription")
+        return self._openai_client
 
     async def transcribe_audio(
         self,

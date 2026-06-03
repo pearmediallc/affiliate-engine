@@ -1,11 +1,15 @@
 """Service for generating high-converting affiliate scripts using copywriting frameworks"""
 import logging
 from typing import Optional
-import google.generativeai as genai
 from ..config import settings
 from .knowledge_service import KnowledgeService
 
 logger = logging.getLogger(__name__)
+
+
+def _get_genai():
+    import google.generativeai as genai
+    return genai
 
 # Proven copywriting frameworks
 COPYWRITING_FRAMEWORKS = {
@@ -120,13 +124,17 @@ class ScriptGeneratorService:
     """Generates high-converting affiliate scripts using proven copywriting frameworks"""
 
     def __init__(self):
-        if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            # Use the latest available model
-            self.model = genai.GenerativeModel("gemini-2.5-flash")
-        else:
-            self.model = None
+        self._model = None
+        if not settings.gemini_api_key:
             logger.warning("Gemini not configured for script generation")
+
+    @property
+    def model(self):
+        if self._model is None and settings.gemini_api_key:
+            genai = _get_genai()
+            genai.configure(api_key=settings.gemini_api_key)
+            self._model = genai.GenerativeModel("gemini-2.5-flash")
+        return self._model
 
     async def generate_script(
         self,

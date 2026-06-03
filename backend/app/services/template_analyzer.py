@@ -2,22 +2,31 @@
 import logging
 import base64
 from typing import Optional
-import google.generativeai as genai
 from ..config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _get_genai():
+    import google.generativeai as genai
+    return genai
 
 
 class TemplateAnalyzerService:
     """Analyzes winning images to extract ad patterns and create templates"""
 
     def __init__(self):
-        if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel("gemini-2.5-flash")
-        else:
-            self.model = None
+        self._model = None
+        if not settings.gemini_api_key:
             logger.warning("Gemini not configured for template analysis")
+
+    @property
+    def model(self):
+        if self._model is None and settings.gemini_api_key:
+            genai = _get_genai()
+            genai.configure(api_key=settings.gemini_api_key)
+            self._model = genai.GenerativeModel("gemini-2.5-flash")
+        return self._model
 
     async def analyze_winning_image(self, image_base64: str) -> dict:
         """

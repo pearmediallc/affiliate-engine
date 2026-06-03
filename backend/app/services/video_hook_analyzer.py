@@ -8,32 +8,46 @@ import time
 from typing import Optional
 from ..config import settings
 
-try:
-    from google import genai
-    GEMMA_AVAILABLE = True
-except ImportError:
-    GEMMA_AVAILABLE = False
-
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
+# google.genai and cv2 are deferred to first use — combined they pull
+# ~300MB of native libs (gRPC + libopencv) which idle workers never need.
 
 logger = logging.getLogger(__name__)
+
+
+def _get_genai():
+    try:
+        from google import genai
+        return genai
+    except ImportError:
+        return None
+
+
+def _get_cv2():
+    try:
+        import cv2
+        return cv2
+    except ImportError:
+        return None
 
 
 class VideoHookAnalyzerService:
     """Analyzes video hooks using Gemma model for conversion optimization"""
 
     def __init__(self):
-        if GEMMA_AVAILABLE and settings.gemini_api_key:
-            # Use the new google.genai client with Gemini Flash for multimodal analysis
-            self.client = genai.Client(api_key=settings.gemini_api_key)
-            self.gemma_model = "gemini-2.5-flash"
-        else:
-            self.client = None
-            logger.warning("Gemini model not available")
+        # Defer the genai import + client construction until a call actually
+        # needs it. Avoids loading google.genai at module load (~150MB).
+        self._client = None
+        self.gemma_model = "gemini-2.5-flash"
+
+    @property
+    def client(self):
+        if self._client is None:
+            genai = _get_genai()
+            if genai and settings.gemini_api_key:
+                self._client = genai.Client(api_key=settings.gemini_api_key)
+            else:
+                logger.warning("Gemini model not available")
+        return self._client
 
     def _download_video_url(self, video_url: str) -> str:
         """
@@ -364,7 +378,7 @@ Format the response as clear, actionable insights that can be used to create sim
         Returns:
             List of base64-encoded frames
         """
-        if not OPENCV_AVAILABLE:
+        if _get_cv2() is None:
             logger.warning("OpenCV not available, skipping frame extraction")
             return []
 

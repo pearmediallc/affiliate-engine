@@ -1,5 +1,4 @@
 """Service for analyzing reference images using Gemini Vision"""
-import google.generativeai as genai
 from ..config import settings
 import logging
 import base64
@@ -8,17 +7,27 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _get_genai():
+    import google.generativeai as genai
+    return genai
+
+
 class VisionAnalyzerService:
     """Uses Gemini Vision to analyze reference images and generate variations"""
 
     def __init__(self):
-        if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            # Use latest Gemini model with vision capabilities
-            self.vision_model = genai.GenerativeModel("gemini-2.5-flash")
-        else:
+        # Defer model construction to first vision call.
+        self._vision_model = None
+        if not settings.gemini_api_key:
             logger.warning("Gemini API key not configured. Vision analysis unavailable.")
-            self.vision_model = None
+
+    @property
+    def vision_model(self):
+        if self._vision_model is None and settings.gemini_api_key:
+            genai = _get_genai()
+            genai.configure(api_key=settings.gemini_api_key)
+            self._vision_model = genai.GenerativeModel("gemini-2.5-flash")
+        return self._vision_model
 
     def analyze_reference_image(
         self,

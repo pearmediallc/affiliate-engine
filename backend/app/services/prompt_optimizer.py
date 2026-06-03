@@ -1,21 +1,43 @@
 """Service for optimizing prompts using Gemini API"""
-import google.generativeai as genai
 from ..config import settings
 import logging
 
 logger = logging.getLogger(__name__)
+
+# google.generativeai is deferred — it's deprecated AND ~80MB to import.
+
+
+def _get_genai():
+    import google.generativeai as genai
+    return genai
 
 
 class PromptOptimizerService:
     """Service for enhancing and optimizing image prompts using Gemini"""
 
     def __init__(self):
-        if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")  # Latest Gemini for optimization
-            self.gemma_model = genai.GenerativeModel("gemma-4-26b-a4b-it")  # Gemma for fast variations
-        else:
+        # Defer model creation to first use; avoids importing google.generativeai
+        # at module load.
+        self._gemini_model = None
+        self._gemma_model = None
+        if not settings.gemini_api_key:
             logger.warning("Gemini API key not configured. Prompt optimization will be limited.")
+
+    @property
+    def gemini_model(self):
+        if self._gemini_model is None and settings.gemini_api_key:
+            genai = _get_genai()
+            genai.configure(api_key=settings.gemini_api_key)
+            self._gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        return self._gemini_model
+
+    @property
+    def gemma_model(self):
+        if self._gemma_model is None and settings.gemini_api_key:
+            genai = _get_genai()
+            genai.configure(api_key=settings.gemini_api_key)
+            self._gemma_model = genai.GenerativeModel("gemma-4-26b-a4b-it")
+        return self._gemma_model
 
     def optimize_prompt(
         self,

@@ -7,20 +7,27 @@ import uuid
 import base64
 import requests
 
-try:
-    from google.cloud import texttospeech
-    GOOGLE_TTS_AVAILABLE = True
-except ImportError:
-    GOOGLE_TTS_AVAILABLE = False
-    logging.warning("google-cloud-texttospeech not installed - using OpenAI TTS instead")
-
-try:
-    import google.generativeai as genai
-    GOOGLE_GENAI_AVAILABLE = True
-except ImportError:
-    GOOGLE_GENAI_AVAILABLE = False
+# google.cloud.texttospeech (~70-100MB grpc stack) and the deprecated
+# google.generativeai (~80MB) are both deferred to the call that actually needs
+# them. Most worker requests never hit TTS at all.
 
 logger = logging.getLogger(__name__)
+
+
+def _get_texttospeech():
+    try:
+        from google.cloud import texttospeech
+        return texttospeech
+    except ImportError:
+        return None
+
+
+def _get_legacy_genai():
+    try:
+        import google.generativeai as genai
+        return genai
+    except ImportError:
+        return None
 
 # Available voices in Gemini TTS
 AVAILABLE_VOICES = {
@@ -41,12 +48,20 @@ class SpeechGeneratorService:
     """Generates speech/audio from text using Gemini models"""
 
     def __init__(self):
-        if settings.gemini_api_key and GOOGLE_GENAI_AVAILABLE:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel("gemini-2.5-flash-lite")
-        else:
-            self.model = None
-            logger.warning("Gemini TTS not available")
+        # Defer Gemini model construction — most calls go through OpenAI TTS
+        # first and never need the legacy genai SDK at all.
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None and settings.gemini_api_key:
+            genai = _get_legacy_genai()
+            if genai is not None:
+                genai.configure(api_key=settings.gemini_api_key)
+                self._model = genai.GenerativeModel("gemini-2.5-flash-lite")
+            else:
+                logger.warning("Gemini TTS not available")
+        return self._model
 
     async def generate_speech(
         self,
@@ -81,7 +96,7 @@ class SpeechGeneratorService:
             logger.warning(f"OpenAI TTS failed: {str(openai_e)}, trying Google Cloud TTS")
 
         # Fallback to Google Cloud TTS
-        if GOOGLE_TTS_AVAILABLE and settings.google_api_key:
+        if _get_texttospeech() is not None and settings.google_api_key:
             logger.info(f"Attempting Google Cloud TTS")
             return self._generate_with_google_tts(text, voice, language, output_format)
 
