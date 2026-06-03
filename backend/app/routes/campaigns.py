@@ -308,12 +308,29 @@ def _run_editing_bg(campaign_id: str, color_grade: str, music_mood: str, music_v
         variation.status = "editing"
         db.commit()
 
-        AutoEditorService.render_variation(
-            variation_id=variation.id,
-            color_grade=color_grade,
-            music_mood=music_mood,
-            music_volume=music_volume,
-        )
+        # Phase 2 rescue pipeline: TTS narration + lip-sync spokesperson
+        # shots + Whisper captions burned in. Replaces the silent-stitch
+        # AutoEditor flow with a full UGC ad render.
+        from ..services.rescue_pipeline import render_full_video
+        try:
+            render_full_video(
+                campaign_id=campaign_id,
+                variation_id=variation.id,
+                lip_sync_spokesperson=True,
+            )
+        except Exception as pipeline_err:
+            logger.error(
+                f"rescue_pipeline failed for {campaign_id}: {pipeline_err}",
+                exc_info=True,
+            )
+            # Fall back to the silent stitch so the campaign at least has
+            # something playable while the user investigates.
+            AutoEditorService.render_variation(
+                variation_id=variation.id,
+                color_grade=color_grade,
+                music_mood=music_mood,
+                music_volume=music_volume,
+            )
 
         campaign.status = "review"
         db.commit()
