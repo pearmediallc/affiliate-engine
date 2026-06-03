@@ -33,11 +33,22 @@ class StorageService:
             and settings.aws_s3_bucket
         )
 
+    # Files at or below this size use put_object (read-into-memory) instead
+    # of upload_file. put_object is more reliable under concurrency because
+    # there's no streaming/checksum-rewind issue ("Need to rewind the stream,
+    # but stream is not seekable"). 25MB is plenty for shot videos, audio,
+    # stills, and the final stitched output.
+    _SMALL_FILE_THRESHOLD_BYTES = 25 * 1024 * 1024
+
     @staticmethod
     def upload_file(local_path: str, s3_key: str) -> str | None:
         """
         Upload a local file to S3.
         Returns the public URL, or None if S3 is not configured / upload fails.
+
+        Files under _SMALL_FILE_THRESHOLD_BYTES are read into memory and
+        put_object'd to dodge boto3's chunked-transfer retry bug. Larger
+        files fall through to the streaming upload_file().
         """
         if not StorageService.is_configured():
             return None
@@ -47,16 +58,31 @@ class StorageService:
             logger.warning("boto3 not installed — skipping S3 upload")
             return None
 
-        try:
-            content_type, _ = mimetypes.guess_type(local_path)
-            content_type = content_type or "application/octet-stream"
+        content_type, _ = mimetypes.guess_type(local_path)
+        content_type = content_type or "application/octet-stream"
 
-            client.upload_file(
-                local_path,
-                settings.aws_s3_bucket,
-                s3_key,
-                ExtraArgs={"ContentType": content_type},
-            )
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            size = StorageService._SMALL_FILE_THRESHOLD_BYTES + 1  # force streaming
+
+        try:
+            if size <= StorageService._SMALL_FILE_THRESHOLD_BYTES:
+                with open(local_path, "rb") as fh:
+                    body = fh.read()
+                client.put_object(
+                    Bucket=settings.aws_s3_bucket,
+                    Key=s3_key,
+                    Body=body,
+                    ContentType=content_type,
+                )
+            else:
+                client.upload_file(
+                    local_path,
+                    settings.aws_s3_bucket,
+                    s3_key,
+                    ExtraArgs={"ContentType": content_type},
+                )
 
             base = (
                 settings.aws_s3_public_base_url.rstrip("/")
@@ -64,7 +90,7 @@ class StorageService:
                 else f"https://{settings.aws_s3_bucket}.s3.{settings.aws_region}.amazonaws.com"
             )
             url = f"{base}/{s3_key}"
-            logger.info(f"Uploaded {local_path} → {url}")
+            logger.info(f"Uploaded {local_path} ({size}B) → {url}")
             return url
 
         except Exception as e:

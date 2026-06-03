@@ -200,13 +200,17 @@ class LipSyncService:
 
     @staticmethod
     def _best_provider() -> str:
-        if settings.higgsfield_api_key:
-            return "higgsfield"
+        # Kie.ai InfiniteTalk is preferred — Higgsfield's lip-sync endpoint
+        # (cloud.higgsfield.ai/api/v1/generations) returns 404 in current
+        # production. Their actual speak endpoint is on platform.higgsfield.ai
+        # but uses a different request shape; not yet wired here.
         if settings.kie_api_key:
             return "kieai"
+        if settings.higgsfield_api_key:
+            return "higgsfield"
         if settings.replicate_api_token:
             return "replicate"
-        raise ValueError("No lip-sync provider configured — set HIGGSFIELD_API_KEY or KIE_API_KEY")
+        raise ValueError("No lip-sync provider configured — set KIE_API_KEY or HIGGSFIELD_API_KEY")
 
     @staticmethod
     def start_generation(image_url: str, audio_url: str, model: str = "auto") -> dict:
