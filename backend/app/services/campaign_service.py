@@ -337,6 +337,70 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
         return campaign
 
     @staticmethod
+    def _ensure_character_portrait(db, campaign, s3_prefix):
+        """Generate (and cache) a single spokesperson portrait per campaign.
+
+        Stored on campaign.analyzed_brief['character_portrait_url']. All shots
+        in the campaign pass this URL as image_url to the video provider so
+        Runway/etc render the same face every time instead of inventing a
+        new person per shot.
+
+        Idempotent — if already cached, returns the URL without an API call.
+        On any failure returns None so the caller falls back to plain
+        text-to-video (no consistency, but the shot still generates).
+        """
+        try:
+            brief = dict(campaign.analyzed_brief or {})
+            cached = brief.get("character_portrait_url")
+            if cached:
+                return cached
+
+            # Build the portrait prompt from analyzed brief, falling back to
+            # a generic vertical-spokesperson description.
+            desc = (
+                brief.get("character_description")
+                or brief.get("spokesperson_description")
+                or "Photorealistic portrait of a friendly grey-haired female spokesperson, "
+                   "warm professional smile, direct to camera, vertical 9:16 framing, "
+                   "soft natural studio lighting, neutral clean background, head and shoulders"
+            )
+
+            from .multi_provider_video import (
+                _higgsfield_headers, _higgsfield_t2i, _slugify,
+            )
+            from .storage import StorageService
+            headers = _higgsfield_headers()
+            soul_url = _higgsfield_t2i(desc, headers)
+
+            # Re-host on our own S3 bucket — Higgsfield URLs are short-lived.
+            import httpx as _httpx, tempfile as _tempfile, os as _os
+            tmp = _tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            try:
+                with _httpx.stream("GET", soul_url, follow_redirects=True, timeout=60) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes():
+                        tmp.write(chunk)
+                tmp.close()
+                portrait_key = f"campaigns/{_slugify(s3_prefix)}/character/portrait.jpg"
+                final_url = StorageService.upload_file(tmp.name, portrait_key)
+            finally:
+                try: _os.unlink(tmp.name)
+                except FileNotFoundError: pass
+
+            if not final_url:
+                logger.warning("character portrait upload returned no URL")
+                return None
+
+            brief["character_portrait_url"] = final_url
+            campaign.analyzed_brief = brief
+            db.commit()
+            logger.info(f"character portrait cached for campaign {campaign.id}: {final_url}")
+            return final_url
+        except Exception as e:
+            logger.warning(f"character portrait generation failed: {e}", exc_info=True)
+            return None
+
+    @staticmethod
     def _generate_shot_bg(campaign_id: str, shot_id: str):
         """Background task: generate one shot."""
         from ..database import SessionLocal
@@ -358,17 +422,27 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
                 if char and char.portrait_path:
                     image_path = char.portrait_path
 
-            # Pass the campaign name so shot videos land under
-            # s3://<bucket>/campaigns/<campaign-slug>/<filename> — keeps per-
-            # request artefacts grouped + makes cleanup trivial.
+            # Look up the campaign once (used for S3 prefix + character portrait).
             campaign_for_prefix = db.query(Campaign).filter(Campaign.id == campaign_id).first()
             s3_prefix = (campaign_for_prefix.name if campaign_for_prefix else None) or campaign_id
+
+            # Character consistency: generate ONE Soul portrait per campaign
+            # and reuse it as the image_url for every Runway shot. Without
+            # this, each text-to-video call invents a fresh face and the
+            # final video flips characters every 5s. Cached on
+            # campaign.analyzed_brief['character_portrait_url'].
+            image_url = None
+            if campaign_for_prefix is not None:
+                image_url = CampaignService._ensure_character_portrait(
+                    db, campaign_for_prefix, s3_prefix,
+                )
 
             result = MultiProviderVideoService.generate(
                 prompt=shot.prompt,
                 shot_type=shot.shot_type or "b_roll",
                 preferred_model=shot.model_id,
                 image_path=image_path,
+                image_url=image_url,
                 duration=shot.duration or 6,
                 s3_prefix=s3_prefix,
             )

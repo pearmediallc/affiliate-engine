@@ -282,10 +282,18 @@ async def _process_one_shot(
     slug: str,
     workdir: str,
     seq: int,
-    lip_sync_spokesperson: bool,
+    lip_sync_spokesperson: bool = False,
 ) -> dict:
-    """Run TTS + (lipsync OR mux) for a single shot. Returns dict with
-    {url, duration_sec, narration} for the caption builder downstream."""
+    """Run TTS + audio-mux for a single shot. Returns dict with
+    {url, duration_sec, narration} for the caption builder downstream.
+
+    Lip-sync was removed — every supported provider (Kie.ai InfiniteTalk,
+    Higgsfield Speak) returned 404 or rejected the model identifier. The
+    rescue pipeline now relies on Runway shots already producing a
+    consistent character (via the image_url passed to Runway in
+    _generate_shot_bg) and just lays TTS audio over them. The
+    lip_sync_spokesperson kwarg is kept for API compat but ignored.
+    """
     narration = (scene.get("narration_text") or "").strip()
     if not narration:
         # No narration — keep the silent shot as-is. Probe its duration so
@@ -304,20 +312,8 @@ async def _process_one_shot(
     logger.info(f"rescue_pipeline: TTS scene {seq} ({len(narration)} chars)")
     tts = await _tts_one_scene(narration, tts_key)
 
-    # 2. lipsync OR mux
-    shot_type = (shot.shot_type or "").lower()
-    if lip_sync_spokesperson and shot_type in ("spokesperson", "hero"):
-        logger.info(f"rescue_pipeline: lip-sync scene {seq} (shot_type={shot_type})")
-        still_local = os.path.join(workdir, f"still_{seq:02d}.jpg")
-        await _extract_first_frame_async(shot.video_url, still_local)
-        still_key = f"campaigns/{slug}/stills/scene_{seq:02d}.jpg"
-        still_url = await asyncio.to_thread(_upload_to_s3, still_local, still_key)
-        if not still_url:
-            raise RuntimeError(f"failed to upload still for scene {seq}")
-        synced_url = await _lip_sync_one(still_url, tts["url"])
-        return {"url": synced_url, "duration_sec": tts["duration_sec"], "narration": narration}
-
-    logger.info(f"rescue_pipeline: audio overlay scene {seq} (shot_type={shot_type})")
+    # 2. Audio overlay onto Runway shot
+    logger.info(f"rescue_pipeline: audio overlay scene {seq}")
     muxed_local = os.path.join(workdir, f"muxed_{seq:02d}.mp4")
     await _mux_audio_onto_video_async(shot.video_url, tts["url"], muxed_local)
     muxed_key = f"campaigns/{slug}/shots-with-audio/scene_{seq:02d}.mp4"
