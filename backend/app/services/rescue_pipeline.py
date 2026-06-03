@@ -104,7 +104,7 @@ def _upload_to_s3(local_path: str, key: str) -> Optional[str]:
 
 # ── stage 1: TTS (one scene; parallelized by caller via asyncio.gather) ──────
 
-async def _tts_one_scene(narration: str, s3_key: str, voice: str = "Kore") -> dict:
+async def _tts_one_scene(narration: str, s3_key: str, voice: str = "Nova") -> dict:
     """TTS one scene's narration. Returns {url, duration_sec, narration}.
     Duration is measured from the downloaded MP3 via ffprobe (accurate
     even when OpenAI doesn't return it).
@@ -176,6 +176,15 @@ async def _lip_sync_one(image_url: str, audio_url: str, timeout: int = 600) -> s
 # ── stage 2b: audio overlay (b-roll; parallelized) ───────────────────────────
 
 async def _mux_audio_onto_video_async(video_url: str, audio_url: str, out_local: str):
+    """Mux the TTS audio onto the Runway shot video.
+
+    If the narration audio is longer than the shot (common — Runway clips
+    are 5-6s, TTS for a sentence often runs 7-9s), we extend the video by
+    freezing its last frame via the ffmpeg tpad filter so the full
+    narration plays. Otherwise -shortest trims the video to the audio so
+    we don't get trailing silence. Either way the output duration ≈ audio
+    duration, which keeps the script-driven captions perfectly in sync.
+    """
     def _do():
         with tempfile.TemporaryDirectory() as td:
             v = os.path.join(td, "v.mp4")
@@ -184,12 +193,29 @@ async def _mux_audio_onto_video_async(video_url: str, audio_url: str, out_local:
                 raise RuntimeError(f"could not fetch video {video_url}")
             if not _ensure_local(audio_url, a):
                 raise RuntimeError(f"could not fetch audio {audio_url}")
-            _ffmpeg(
-                "-i", v, "-i", a,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-shortest",
-                out_local, timeout=120,
-            )
+            v_dur = _ffprobe_duration(v)
+            a_dur = _ffprobe_duration(a)
+            if a_dur > v_dur and v_dur > 0:
+                # Extend video by holding the last frame so audio plays in full.
+                # +0.5s slack so -shortest still cuts cleanly at audio length.
+                pad_secs = (a_dur - v_dur) + 0.5
+                _ffmpeg(
+                    "-i", v, "-i", a,
+                    "-vf", f"tpad=stop_mode=clone:stop_duration={pad_secs:.2f}",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-pix_fmt", "yuv420p", "-shortest",
+                    out_local, timeout=180,
+                )
+            else:
+                # Video already covers / exceeds audio — just stream-copy
+                # video and trim to audio with -shortest. Fastest path.
+                _ffmpeg(
+                    "-i", v, "-i", a,
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-shortest",
+                    out_local, timeout=120,
+                )
     await asyncio.to_thread(_do)
 
 
@@ -316,11 +342,15 @@ async def _process_one_shot(
     logger.info(f"rescue_pipeline: audio overlay scene {seq}")
     muxed_local = os.path.join(workdir, f"muxed_{seq:02d}.mp4")
     await _mux_audio_onto_video_async(shot.video_url, tts["url"], muxed_local)
+    # Re-probe the muxed file: this is the duration the caption builder must
+    # use, NOT the raw TTS duration (mux can clip or pad). Keeps subtitles
+    # locked to whatever actually plays.
+    actual_dur = _ffprobe_duration(muxed_local) or tts["duration_sec"]
     muxed_key = f"campaigns/{slug}/shots-with-audio/scene_{seq:02d}.mp4"
     muxed_url = await asyncio.to_thread(_upload_to_s3, muxed_local, muxed_key)
     if not muxed_url:
         raise RuntimeError(f"failed to upload muxed scene {seq}")
-    return {"url": muxed_url, "duration_sec": tts["duration_sec"], "narration": narration}
+    return {"url": muxed_url, "duration_sec": actual_dur, "narration": narration}
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
