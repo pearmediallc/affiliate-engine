@@ -847,7 +847,35 @@ class AutoEditorService:
                 .all()
             )
 
-            shot_paths = [s.video_path for s in shots if s.video_path and os.path.isfile(s.video_path)]
+            # Resolve a usable local path for each shot. Prefer the on-disk
+            # video_path; if that file has been wiped (Render restart wipes
+            # /tmp/videos), fall back to downloading from the shot's video_url
+            # (S3 once the AWS_S3_* env vars are configured, otherwise the
+            # proxy URL which itself depends on local disk and will fail).
+            import tempfile as _tempfile
+            import httpx as _httpx
+            _dl_tmp = _tempfile.mkdtemp(prefix="ae_edit_")
+
+            def _ensure_local(shot) -> Optional[str]:
+                if shot.video_path and os.path.isfile(shot.video_path):
+                    return shot.video_path
+                url = shot.video_url or ""
+                if not url.startswith("http"):
+                    # Proxy URL pointing at a file we already know is gone.
+                    return None
+                try:
+                    out = os.path.join(_dl_tmp, f"shot_{shot.id[:8]}.mp4")
+                    with _httpx.stream("GET", url, follow_redirects=True, timeout=120) as r:
+                        r.raise_for_status()
+                        with open(out, "wb") as fh:
+                            for chunk in r.iter_bytes():
+                                fh.write(chunk)
+                    return out
+                except Exception as e:
+                    logger.warning(f"AutoEditor: failed to fetch shot {shot.id} from {url}: {e}")
+                    return None
+
+            shot_paths = [p for p in (_ensure_local(s) for s in shots) if p]
             if not shot_paths:
                 raise ValueError("No completed shot videos found for variation")
 
