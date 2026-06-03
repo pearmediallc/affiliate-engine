@@ -81,6 +81,60 @@ async def storage_health() -> APIResponse:
     )
 
 
+@router.get("/probe-infinitetalk")
+async def probe_infinitetalk() -> APIResponse:
+    """Probe Kie.ai's createTask endpoint with multiple candidate InfiniteTalk
+    model identifiers — returns which one Kie.ai accepts.
+
+    Tries each model name with placeholder URLs. A 200 / valid task_id means
+    that model identifier is real. 404 / 'model not found' means it isn't.
+    """
+    import httpx as _httpx
+    if not settings.kie_api_key:
+        raise HTTPException(500, detail="KIE_API_KEY not configured")
+    headers = {
+        "Authorization": f"Bearer {settings.kie_api_key}",
+        "Content-Type": "application/json",
+    }
+    # Public test assets so Kie.ai doesn't reject for invalid input
+    image_url = "https://affiliate-engine-videos.s3.us-east-1.amazonaws.com/_healthcheck/storage_probe.txt"
+    audio_url = image_url
+    candidates = [
+        "infinitalk",
+        "infinitetalk",
+        "infinitalk/image-to-video",
+        "infinitetalk/image-to-video",
+        "meigen-ai/infinitetalk",
+        "meigen/infinitetalk",
+        "MeiGen-AI/InfiniteTalk",
+        "infinitalk-kieai",
+        "infinitalk/v1",
+        "infinitetalk/v1",
+    ]
+    results = []
+    url = "https://api.kie.ai/api/v1/jobs/createTask"
+    for model in candidates:
+        payload = {
+            "model": model,
+            "input": {
+                "image_url": image_url, "audio_url": audio_url,
+                "imageUrl": image_url, "audioUrl": audio_url,
+                "prompt": "test", "resolution": "480p",
+            },
+        }
+        try:
+            r = _httpx.post(url, headers=headers, json=payload, timeout=10)
+            body = r.text[:300]
+            results.append({"model": model, "status": r.status_code, "body": body})
+        except Exception as e:
+            results.append({"model": model, "status": -1, "body": str(e)[:200]})
+    return APIResponse(
+        success=True,
+        message="probe results",
+        data={"results": results},
+    )
+
+
 @router.get("/presign")
 async def presign(
     key: str = Query(..., description="S3 object key, e.g. 'videos/runway_xxx.mp4'"),
