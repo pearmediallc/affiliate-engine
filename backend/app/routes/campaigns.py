@@ -258,10 +258,18 @@ def _run_editing_bg(campaign_id: str, color_grade: str, music_mood: str, music_v
         if not campaign:
             return
 
-        # Create a "base" variation if none exists
-        existing = db.query(Variation).filter(Variation.campaign_id == campaign_id).count()
-        if existing == 0:
-            # Create base variation that reuses all shots as-is
+        # Create a "base" variation if none exists, OR refresh an existing one
+        # whose shot copies are stale. Staleness happens when /storyboard is
+        # re-run after a failed edit — the base shots get deleted + recreated
+        # while the variation's shot copies survive with dead video_paths
+        # pointing at files that never existed.
+        variation = (
+            db.query(Variation)
+            .filter(Variation.campaign_id == campaign_id)
+            .order_by(Variation.created_at.desc())
+            .first()
+        )
+        if variation is None:
             variation = Variation(
                 campaign_id=campaign_id,
                 variation_type="base",
@@ -271,26 +279,34 @@ def _run_editing_bg(campaign_id: str, color_grade: str, music_mood: str, music_v
             db.add(variation)
             db.flush()
 
-            shots = db.query(Shot).filter(Shot.campaign_id == campaign_id, Shot.variation_id == None).order_by(Shot.sequence_num).all()
-            for shot in shots:
-                from ..models.campaign import Shot as ShotModel
-                vs = ShotModel(
-                    campaign_id=campaign_id,
-                    variation_id=variation.id,
-                    sequence_num=shot.sequence_num,
-                    shot_type=shot.shot_type,
-                    prompt=shot.prompt,
-                    model_id=shot.model_id,
-                    duration=shot.duration,
-                    video_path=shot.video_path,
-                    video_url=shot.video_url,
-                    status=shot.status,
-                    cost_usd=shot.cost_usd,
-                )
-                db.add(vs)
-            db.commit()
-        else:
-            variation = db.query(Variation).filter(Variation.campaign_id == campaign_id).first()
+        # Always refresh the variation's shot copies from current base shots.
+        # Cheap (the variation row + shot rows are small) and guarantees the
+        # AutoEditor sees video_paths matching what /generate actually produced.
+        db.query(Shot).filter(Shot.variation_id == variation.id).delete()
+        base_shots = (
+            db.query(Shot)
+            .filter(Shot.campaign_id == campaign_id, Shot.variation_id == None)
+            .order_by(Shot.sequence_num)
+            .all()
+        )
+        from ..models.campaign import Shot as ShotModel
+        for shot in base_shots:
+            vs = ShotModel(
+                campaign_id=campaign_id,
+                variation_id=variation.id,
+                sequence_num=shot.sequence_num,
+                shot_type=shot.shot_type,
+                prompt=shot.prompt,
+                model_id=shot.model_id,
+                duration=shot.duration,
+                video_path=shot.video_path,
+                video_url=shot.video_url,
+                status=shot.status,
+                cost_usd=shot.cost_usd,
+            )
+            db.add(vs)
+        variation.status = "editing"
+        db.commit()
 
         AutoEditorService.render_variation(
             variation_id=variation.id,
