@@ -69,8 +69,27 @@ _HIGGSFIELD_I2V = {
 }
 
 
-def _persist_video(local_path: str, filename: str) -> str:
-    s3_url = StorageService.upload_file(local_path, f"videos/{filename}")
+def _slugify(name: Optional[str]) -> str:
+    """Lowercase, keep [a-z0-9-_], collapse other chars to '-'. Used to group
+    each campaign's generated videos under its own S3 prefix so segregation
+    + cleanup are trivial later."""
+    import re as _re
+    if not name:
+        return "unknown"
+    out = _re.sub(r"[^a-zA-Z0-9._-]+", "-", name.strip().lower())
+    return out.strip("-") or "unknown"
+
+
+def _persist_video(local_path: str, filename: str, s3_prefix: Optional[str] = None) -> str:
+    """Upload to S3 (or fall back to local proxy URL). When s3_prefix is set,
+    objects land under campaigns/<prefix>/<filename> so we can list / delete
+    per-campaign cleanly. Legacy callers pass None and continue to write to
+    the flat videos/ root."""
+    if s3_prefix:
+        key = f"campaigns/{_slugify(s3_prefix)}/{filename}"
+    else:
+        key = f"videos/{filename}"
+    s3_url = StorageService.upload_file(local_path, key)
     return s3_url if s3_url else f"/api/v1/video/download/{filename}"
 
 
@@ -236,6 +255,7 @@ def _generate_higgsfield(
     prompt: str,
     image_url: Optional[str],
     duration: int,
+    s3_prefix: Optional[str] = None,
 ) -> dict:
     """Generate video via Higgsfield Platform API.
 
@@ -272,7 +292,7 @@ def _generate_higgsfield(
     return {
         "video_path": local_path,
         "video_filename": filename,
-        "download_url": _persist_video(local_path, filename),
+        "download_url": _persist_video(local_path, filename, s3_prefix=s3_prefix),
         "model_id": model_id,
         "provider": "higgsfield",
         "generation_id": rid,
@@ -286,6 +306,7 @@ def _generate_kieai_runway(
     prompt: str,
     image_url: Optional[str],
     duration: int,
+    s3_prefix: Optional[str] = None,
 ) -> dict:
     from .kieai_service import KieAIService
     result = KieAIService.generate_video_runway(prompt, duration=duration, image_url=image_url)
@@ -294,7 +315,7 @@ def _generate_kieai_runway(
     return {
         "video_path": local_path,
         "video_filename": filename,
-        "download_url": _persist_video(local_path, filename),
+        "download_url": _persist_video(local_path, filename, s3_prefix=s3_prefix),
         "model_id": "runway-gen4",
         "provider": "kieai",
         "cost_usd": Pricing.video("runway-gen4", duration),
@@ -305,6 +326,7 @@ def _generate_kieai_veo(
     prompt: str,
     duration: int,
     fast: bool = False,
+    s3_prefix: Optional[str] = None,
 ) -> dict:
     from .kieai_service import KieAIService
     result = KieAIService.generate_video_veo(prompt, duration=duration, fast=fast)
@@ -314,7 +336,7 @@ def _generate_kieai_veo(
     return {
         "video_path": local_path,
         "video_filename": filename,
-        "download_url": _persist_video(local_path, filename),
+        "download_url": _persist_video(local_path, filename, s3_prefix=s3_prefix),
         "model_id": model_id,
         "provider": "kieai",
         "cost_usd": Pricing.video(model_id, duration),
@@ -356,10 +378,11 @@ class MultiProviderVideoService:
         image_path: Optional[str] = None,
         image_url: Optional[str] = None,
         duration: int = 6,
+        s3_prefix: Optional[str] = None,
     ) -> dict:
         model_id = _pick_model(shot_type, preferred_model)
         provider = _model_provider(model_id)
-        logger.info(f"Generating shot type={shot_type} model={model_id} provider={provider} duration={duration}s")
+        logger.info(f"Generating shot type={shot_type} model={model_id} provider={provider} duration={duration}s prefix={s3_prefix}")
 
         if provider == "google":
             fast = "fast" in model_id
@@ -367,12 +390,12 @@ class MultiProviderVideoService:
 
         if provider == "kieai":
             if "runway" in model_id:
-                return _generate_kieai_runway(prompt, image_url or image_path, duration)
+                return _generate_kieai_runway(prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
             fast = "fast" in model_id
-            return _generate_kieai_veo(prompt, duration, fast=fast)
+            return _generate_kieai_veo(prompt, duration, fast=fast, s3_prefix=s3_prefix)
 
         # higgsfield covers everything else
-        return _generate_higgsfield(model_id, prompt, image_url or image_path, duration)
+        return _generate_higgsfield(model_id, prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
 
     @staticmethod
     def estimate_cost(shot_type: str, duration: int = 6, preferred_model: Optional[str] = None) -> dict:

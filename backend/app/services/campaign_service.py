@@ -358,12 +358,19 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
                 if char and char.portrait_path:
                     image_path = char.portrait_path
 
+            # Pass the campaign name so shot videos land under
+            # s3://<bucket>/campaigns/<campaign-slug>/<filename> — keeps per-
+            # request artefacts grouped + makes cleanup trivial.
+            campaign_for_prefix = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+            s3_prefix = (campaign_for_prefix.name if campaign_for_prefix else None) or campaign_id
+
             result = MultiProviderVideoService.generate(
                 prompt=shot.prompt,
                 shot_type=shot.shot_type or "b_roll",
                 preferred_model=shot.model_id,
                 image_path=image_path,
                 duration=shot.duration or 6,
+                s3_prefix=s3_prefix,
             )
 
             if result.get("async"):
