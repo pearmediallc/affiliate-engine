@@ -365,18 +365,22 @@ Target {target_duration} seconds of spoken narration. Each scene should have cle
                    "soft natural studio lighting, neutral clean background, head and shoulders"
             )
 
-            from .multi_provider_video import (
-                _higgsfield_headers, _higgsfield_t2i, _slugify,
-            )
+            # Kie.ai image generation replaces Higgsfield Soul T2I — the
+            # Higgsfield account hit "Not enough credits" on its workspace
+            # while Kie.ai has plenty.
+            from .kieai_service import KieAIService
+            from .multi_provider_video import _slugify
             from .storage import StorageService
-            headers = _higgsfield_headers()
-            soul_url = _higgsfield_t2i(desc, headers)
+            portrait = KieAIService.generate_image_portrait(desc, aspect_ratio="9:16")
+            kie_url = portrait.get("url")
+            if not kie_url:
+                raise RuntimeError(f"Kie.ai portrait returned no URL: {portrait}")
 
-            # Re-host on our own S3 bucket — Higgsfield URLs are short-lived.
+            # Re-host on our own S3 bucket — Kie.ai URLs are short-lived.
             import httpx as _httpx, tempfile as _tempfile, os as _os
             tmp = _tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
             try:
-                with _httpx.stream("GET", soul_url, follow_redirects=True, timeout=60) as r:
+                with _httpx.stream("GET", kie_url, follow_redirects=True, timeout=60) as r:
                     r.raise_for_status()
                     for chunk in r.iter_bytes():
                         tmp.write(chunk)

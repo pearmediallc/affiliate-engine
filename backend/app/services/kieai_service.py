@@ -137,7 +137,56 @@ class KieAIService:
             "task_id": task_id,
         }
 
-    # ── Image (FLUX) ──────────────────────────────────────────────────────────
+    # ── Image (FLUX / Market createTask) ──────────────────────────────────────
+
+    @staticmethod
+    def generate_image_portrait(prompt: str, aspect_ratio: str = "9:16") -> dict:
+        """Generate a portrait via Kie.ai's market createTask.
+
+        Used for the character-consistency Soul T2I replacement now that
+        Higgsfield is out of credits. Tries the documented qwen2 image
+        model first (we know createTask + qwen2/* works from Kie.ai docs),
+        then falls back to the legacy /flux/generate endpoint.
+        """
+        if not settings.kie_api_key:
+            raise ValueError("KIE_API_KEY not configured")
+
+        # Try Market createTask first (documented + actively maintained)
+        market_url = f"{_BASE}/api/v1/jobs/createTask"
+        for model_name in ("qwen2/text-to-image", "qwen2/image-edit"):
+            payload = {
+                "model": model_name,
+                "input": {
+                    "prompt": prompt,
+                    "image_size": aspect_ratio,
+                    "output_format": "jpeg",
+                    "nsfw_checker": False,
+                },
+            }
+            try:
+                r = httpx.post(market_url, headers=_headers(), json=payload, timeout=30)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if data.get("code") and data["code"] not in (0, 200):
+                    # 422 model not supported, 402 not enough credits, etc.
+                    continue
+                task_id = _extract_task_id(data)
+                if not task_id:
+                    continue
+                result = _poll("/api/v1/jobs/recordInfo", task_id, timeout=180)
+                image_url = (
+                    result.get("resultUrls", [None])[0] if isinstance(result.get("resultUrls"), list) else None
+                ) or result.get("imageUrl") or result.get("image_url") or result.get("url")
+                if image_url:
+                    logger.info(f"Kie.ai portrait via Market createTask model={model_name}")
+                    return {"url": image_url, "model": model_name, "provider": "kieai"}
+            except Exception as e:
+                logger.warning(f"Kie.ai Market createTask {model_name} failed: {e}")
+                continue
+
+        # Fall back to legacy FLUX endpoint
+        return KieAIService.generate_image_flux(prompt)
 
     @staticmethod
     def generate_image_flux(
