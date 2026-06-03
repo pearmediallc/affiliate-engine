@@ -107,13 +107,25 @@ def _upload_to_s3(local_path: str, key: str) -> Optional[str]:
 async def _tts_one_scene(narration: str, s3_key: str, voice: str = "Kore") -> dict:
     """TTS one scene's narration. Returns {url, duration_sec, narration}.
     Duration is measured from the downloaded MP3 via ffprobe (accurate
-    even when OpenAI doesn't return it)."""
+    even when OpenAI doesn't return it).
+
+    Note: SpeechGeneratorService returns 'audio_data' as raw bytes AND
+    'audio_base64' as the base64-encoded version. Prefer raw bytes.
+    """
     svc = SpeechGeneratorService()
     result = await svc.generate_speech(text=narration, voice=voice, output_format="mp3")
-    audio_b64 = result.get("audio_data") or result.get("audio_base64")
-    if not audio_b64:
-        raise RuntimeError(f"TTS returned no audio_data: {list(result.keys())}")
-    audio_bytes = base64.b64decode(audio_b64)
+    audio_data = result.get("audio_data")
+    if isinstance(audio_data, bytes):
+        audio_bytes = audio_data
+    elif isinstance(audio_data, str) and audio_data:
+        audio_bytes = base64.b64decode(audio_data)
+    else:
+        b64 = result.get("audio_base64")
+        if not b64:
+            raise RuntimeError(f"TTS returned no audio data: keys={list(result.keys())}")
+        audio_bytes = base64.b64decode(b64)
+    if len(audio_bytes) < 1000:
+        raise RuntimeError(f"TTS audio suspiciously small ({len(audio_bytes)}B) for {len(narration)}ch narration")
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     try:

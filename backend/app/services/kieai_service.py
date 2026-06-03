@@ -192,8 +192,11 @@ class KieAIService:
         if not settings.kie_api_key:
             raise ValueError("KIE_API_KEY not configured")
 
+        # NOTE: endpoint slug is `infinitetalk` (the model name has an 'e' in
+        # 'infinite'). Older internal docs/code used the typo `infinitalk` which
+        # 404s in production.
         payload = {"imageUrl": image_url, "audioUrl": audio_url}
-        r = httpx.post(f"{_BASE}/api/v1/infinitalk/generate", headers=_headers(), json=payload, timeout=30)
+        r = httpx.post(f"{_BASE}/api/v1/infinitetalk/generate", headers=_headers(), json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
         task_id = _extract_task_id(data)
@@ -207,7 +210,7 @@ class KieAIService:
         if not settings.kie_api_key:
             raise ValueError("KIE_API_KEY not configured")
 
-        r = httpx.get(f"{_BASE}/api/v1/infinitalk/record-info", params={"taskId": task_id}, headers=_headers(), timeout=15)
+        r = httpx.get(f"{_BASE}/api/v1/infinitetalk/record-info", params={"taskId": task_id}, headers=_headers(), timeout=15)
         r.raise_for_status()
         data = r.json()
         inner = data.get("data") or data
