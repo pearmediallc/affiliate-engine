@@ -849,11 +849,13 @@ class AutoEditorService:
 
             # Resolve a usable local path for each shot. Prefer the on-disk
             # video_path; if that file has been wiped (Render restart wipes
-            # /tmp/videos), fall back to downloading from the shot's video_url
-            # (S3 once the AWS_S3_* env vars are configured, otherwise the
-            # proxy URL which itself depends on local disk and will fail).
+            # /tmp/videos), fall back to downloading from S3 via authenticated
+            # boto3 (the bucket is private — unauth HTTP GET returns 403).
+            # Last resort: try plain httpx for any non-bucket URL (older shots
+            # may carry external CDN URLs that were public).
             import tempfile as _tempfile
             import httpx as _httpx
+            from .storage import StorageService as _Storage
             _dl_tmp = _tempfile.mkdtemp(prefix="ae_edit_")
 
             def _ensure_local(shot) -> Optional[str]:
@@ -863,8 +865,15 @@ class AutoEditorService:
                 if not url.startswith("http"):
                     # Proxy URL pointing at a file we already know is gone.
                     return None
+                out = os.path.join(_dl_tmp, f"shot_{shot.id[:8]}.mp4")
+                # Preferred path: our own S3 bucket via authenticated boto3.
+                s3_key = _Storage.parse_s3_key(url)
+                if s3_key:
+                    if _Storage.download_file(s3_key, out):
+                        return out
+                    logger.warning(f"AutoEditor: S3 download_file failed for shot {shot.id} key={s3_key}")
+                # Fallback: unauthenticated HTTP (external public URLs).
                 try:
-                    out = os.path.join(_dl_tmp, f"shot_{shot.id[:8]}.mp4")
                     with _httpx.stream("GET", url, follow_redirects=True, timeout=120) as r:
                         r.raise_for_status()
                         with open(out, "wb") as fh:
