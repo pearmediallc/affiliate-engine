@@ -99,41 +99,18 @@ async def probe_infinitetalk() -> APIResponse:
     # Public test assets so Kie.ai doesn't reject for invalid input
     image_url = "https://affiliate-engine-videos.s3.us-east-1.amazonaws.com/_healthcheck/storage_probe.txt"
     audio_url = image_url
+    # Kie.ai rate-limits 20 reqs / 10s. Only test the 10 candidates we couldn't
+    # verify on the previous run, with a small delay between each so we stay
+    # well under the cap.
     candidates = [
-        # Common slug patterns observed across Kie.ai models (qwen2/image-edit,
-        # kling-2.6/text-to-video, etc.)
-        "infinitalk",
-        "infinitetalk",
-        "infinite-talk",
-        "infinitalk/text-to-video",
-        "infinitetalk/text-to-video",
-        "infinitetalk/audio-to-video",
-        "infinitetalk/image-to-video",
-        "infinitalk/image-to-video",
-        "infinite-talk/image-to-video",
-        "meigen-ai/infinitetalk",
-        "meigen/infinitetalk",
-        "MeiGen-AI/InfiniteTalk",
-        "MeiGen-AI/infinitetalk",
-        "infinitalk-kieai",
-        "infinitalk/v1",
-        "infinitetalk/v1",
-        # Generic alternative names
-        "lip-sync",
-        "lipsync",
-        "talking-head",
-        "talkinghead",
         "ai-talking-head",
         "ai-lipsync",
         "audio-to-video",
         "speech-to-video",
-        # MeiGen lower-case variants
         "meigen-ai/infinite-talk",
         "meigen-ai/infinitalk",
-        # WaveSpeed-style (since WaveSpeed serves InfiniteTalk too)
         "wavespeed-ai/infinitetalk",
         "wavespeed/infinitetalk",
-        # Just the playground/createTask style with explicit task names
         "infinitetalk-720p",
         "infinitetalk-480p",
     ]
@@ -154,6 +131,9 @@ async def probe_infinitetalk() -> APIResponse:
             results.append({"model": model, "status": r.status_code, "body": body})
         except Exception as e:
             results.append({"model": model, "status": -1, "body": str(e)[:200]})
+        # Throttle: Kie.ai's cap is 20/10s — sleep 0.7s between each request
+        import time as _time
+        _time.sleep(0.7)
     return APIResponse(
         success=True,
         message="probe results",
