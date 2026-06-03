@@ -1,4 +1,5 @@
-from fastapi import APIRouter
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query
 from ..schemas import APIResponse
 from ..config import settings
 from ..services.storage import StorageService
@@ -77,4 +78,34 @@ async def storage_health() -> APIResponse:
         success=False,
         message="S3 upload failed (check Render logs for the boto3 error)",
         data=info,
+    )
+
+
+@router.get("/presign")
+async def presign(
+    key: str = Query(..., description="S3 object key, e.g. 'videos/runway_xxx.mp4'"),
+    expires: int = Query(3600, ge=60, le=86400, description="URL lifetime in seconds"),
+) -> APIResponse:
+    """Generate a presigned S3 GET URL for a given object key.
+
+    Used when /edit can't run on the worker due to memory limits — fetch each
+    shot's presigned URL, download locally, stitch with ffmpeg client-side.
+    """
+    if not StorageService.is_configured():
+        raise HTTPException(500, detail="S3 not configured")
+    client = StorageService._client()
+    if not client:
+        raise HTTPException(500, detail="boto3 unavailable")
+    try:
+        url = client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": settings.aws_s3_bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+    except Exception as e:
+        raise HTTPException(500, detail=f"presign failed: {e}")
+    return APIResponse(
+        success=True,
+        message="Presigned URL",
+        data={"key": key, "expires_in": expires, "url": url},
     )
