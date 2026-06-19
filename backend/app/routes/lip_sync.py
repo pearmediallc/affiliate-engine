@@ -43,9 +43,9 @@ async def generate_lip_sync(
             audio_path = audio_tmp.name
 
         try:
-            # Upload files to Replicate
-            image_url = LipSyncService.upload_file_to_replicate(img_path)
-            audio_url = LipSyncService.upload_file_to_replicate(audio_path)
+            # Upload files to Replicate (or S3 → public URL)
+            image_url = LipSyncService.upload_file_to_provider(img_path)
+            audio_url = LipSyncService.upload_file_to_provider(audio_path)
 
             # Start generation
             result = LipSyncService.start_generation(
