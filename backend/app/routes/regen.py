@@ -321,7 +321,10 @@ async def recipe_hook_change(req: RunRequest) -> list:
             if clip:
                 break
         if not clip:
-            raise RuntimeError("no stock footage found for any candidate query — refusing to ship unrelated content")
+            has_key = bool(settings.pexels_api_key)
+            raise RuntimeError(
+                f"no stock footage found for any candidate query "
+                f"(pexels_key_configured={has_key}, tried={queries[:6]}) — refusing to ship unrelated content")
         stock = clip["local_path"]
 
         out_name = f"regen_hook_{req.request_id[:8]}.mp4"
