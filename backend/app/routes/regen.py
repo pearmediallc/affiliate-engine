@@ -298,21 +298,30 @@ async def recipe_hook_change(req: RunRequest) -> list:
         W, H = _ffprobe_dims(orig)
         transcript = await _transcribe_file(orig)
 
-        # derive a topic-grounded stock-footage query from the ORIGINAL's content
-        query = "broadcast news"
+        # derive several simple, searchable stock terms from the ORIGINAL's content
+        queries = []
         try:
             d = await _gemini_json(
-                f'From this ad transcript, give a 2-4 word stock-footage search query for a '
-                f'relevant OPENING hook visual matching the topic. Transcript: "{transcript[:1200]}". '
-                f'Return JSON {{"query":"..."}}')
-            query = d.get("query") or query
+                f'From this ad transcript, give 3 simple stock-footage search terms (1-2 common, '
+                f'very searchable words each) for a relevant OPENING hook visual matching the topic. '
+                f'Transcript: "{transcript[:1200]}". Return JSON {{"queries":["..","..",".."]}}')
+            queries = [q for q in (d.get("queries") or []) if isinstance(q, str) and q.strip()]
         except Exception as e:
             logger.warning(f"hook query gen failed: {e}")
+        queries += ["lifestyle", "people", "city"]  # generic fallbacks so we still find SOMETHING relevant-ish
 
-        orient = "portrait" if H >= W else "landscape"
-        clip = StockFootageService.get_broll(query, orientation=orient, duration_max=10)
-        if not clip or not clip.get("local_path"):
-            raise RuntimeError(f"no stock footage found for hook query '{query}' — refusing to ship unrelated content")
+        pref = "portrait" if H >= W else "landscape"
+        clip, query = None, None
+        for q in queries:
+            for orient in (pref, "landscape", "portrait"):
+                c = StockFootageService.get_broll(q, orientation=orient, duration_max=30)
+                if c and c.get("local_path"):
+                    clip, query = c, q
+                    break
+            if clip:
+                break
+        if not clip:
+            raise RuntimeError("no stock footage found for any candidate query — refusing to ship unrelated content")
         stock = clip["local_path"]
 
         out_name = f"regen_hook_{req.request_id[:8]}.mp4"
