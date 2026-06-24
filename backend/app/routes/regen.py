@@ -16,6 +16,8 @@ import os
 import json
 import logging
 import asyncio
+import tempfile
+import subprocess
 from typing import Optional, Any
 
 import httpx
@@ -24,12 +26,44 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..services.tiktok_symphony import TikTokSymphonyService
+from ..services.stock_footage import StockFootageService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 GEMINI_MODEL = "gemini-2.5-flash"
 CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
+AE_PUBLIC_URL = os.getenv("AE_PUBLIC_URL", "https://affiliate-engine-pl4p.onrender.com")
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ── media helpers ─────────────────────────────────────────────────────────────
+async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
+        r = await c.get(url); r.raise_for_status(); data = r.content
+    fd, path = tempfile.mkstemp(suffix=suffix); os.close(fd)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+async def _transcribe_file(path: str) -> str:
+    from ..services.transcription_service import TranscriptionService
+    res = await TranscriptionService().transcribe_audio(path, provider="openai")
+    return (res or {}).get("transcription") or (res or {}).get("text") or ""
+
+def _ffprobe_dims(path: str):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+        capture_output=True, text=True, timeout=60).stdout.strip()
+    w, h = out.split("x")[:2]
+    return int(w), int(h)
+
+def _ffmpeg(args, timeout: int = 600):
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
+                   check=True, timeout=timeout,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 # Shared service key — only callers that know it (i.e. creative-library) may trigger work.
 SERVICE_KEY = os.getenv("REGEN_SERVICE_KEY", "change-me-regen-service-key")
 
@@ -251,21 +285,64 @@ async def _poll_avatar(task_id: str, tries: int = 40, delay: int = 8) -> Optiona
 
 
 async def recipe_hook_change(req: RunRequest) -> list:
-    """Hook Change Only: swap the first ~3-4s VISUAL, keep the original voice+body.
-    Production path reuses the existing rescue/auto-editor + asset sources
-    (proven-winner footage / stock / generated). Wired here as a directive the
-    asset+stitch pipeline consumes; full stitch runs in the editing service."""
-    return [{
-        "recipe": "Hook Change Only",
-        "video_url": None,
-        "confidence": 0.7,
-        "whats_changed": (
-            "Swap hook visual to: " + (req.directive.get("asset_directive") or "audience-relevant footage")
-            + " · preserve: " + ", ".join(req.preserve or req.directive.get("preserve", []))
-            + " · queued to the editing/stitch pipeline (source: "
-            + (req.context.get("download_url", "")) + ")."
-        ),
-    }]
+    """SURGICAL fix: keep the original's full voiceover + entire body, replace ONLY
+    the first ~3.5s hook VISUAL with a topic-matched clip. Preserves script, voice,
+    story, and all body footage — only the opening visual changes."""
+    HOOK = 3.5
+    FPS = 30
+    download_url = req.context.get("download_url", "")
+    if not download_url:
+        raise RuntimeError("no original download_url in context")
+
+    orig = await _download_to_temp(download_url)
+    try:
+        W, H = _ffprobe_dims(orig)
+        transcript = await _transcribe_file(orig)
+
+        # derive a topic-grounded stock-footage query from the ORIGINAL's content
+        query = "broadcast news"
+        try:
+            d = await _gemini_json(
+                f'From this ad transcript, give a 2-4 word stock-footage search query for a '
+                f'relevant OPENING hook visual matching the topic. Transcript: "{transcript[:1200]}". '
+                f'Return JSON {{"query":"..."}}')
+            query = d.get("query") or query
+        except Exception as e:
+            logger.warning(f"hook query gen failed: {e}")
+
+        orient = "portrait" if H >= W else "landscape"
+        clip = StockFootageService.get_broll(query, orientation=orient, duration_max=10)
+        if not clip or not clip.get("local_path"):
+            raise RuntimeError(f"no stock footage found for hook query '{query}' — refusing to ship unrelated content")
+        stock = clip["local_path"]
+
+        out_name = f"regen_hook_{req.request_id[:8]}.mp4"
+        out_path = os.path.join(UPLOAD_DIR, out_name)
+        fc = (
+            f"[0:v]trim=0:{HOOK},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},fps={FPS}[hv];"
+            f"[1:a]atrim=0:{HOOK},asetpts=PTS-STARTPTS[ha];"
+            f"[1:v]trim={HOOK},setpts=PTS-STARTPTS,scale={W}:{H},fps={FPS}[bv];"
+            f"[1:a]atrim={HOOK},asetpts=PTS-STARTPTS[ba];"
+            f"[hv][ha][bv][ba]concat=n=2:v=1:a=1[outv][outa]"
+        )
+        _ffmpeg(["-i", stock, "-i", orig, "-filter_complex", fc,
+                 "-map", "[outv]", "-map", "[outa]",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "192k", out_path])
+
+        return [{
+            "recipe": "Hook Change Only (surgical)",
+            "video_url": f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}",
+            "confidence": 0.7,
+            "whats_changed": (
+                f"Replaced ONLY the first {HOOK}s hook visual with topic-matched stock "
+                f"('{query}'); kept the original voiceover + entire body. Script, voice and story preserved."
+            ),
+        }]
+    finally:
+        try: os.remove(orig)
+        except OSError: pass
 
 
 async def recipe_passthrough(req: RunRequest, label: str) -> list:
