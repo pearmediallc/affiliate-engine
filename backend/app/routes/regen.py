@@ -104,6 +104,29 @@ class RunRequest(BaseModel):
     preserve: list = []
     variant_count: int = 3
     callback_url: Optional[str] = None
+    active_url: Optional[str] = None
+
+
+class Cancelled(Exception):
+    """Raised when the user cancelled the job; stops before spending more credits."""
+
+
+async def _still_active(req: "RunRequest") -> bool:
+    """Ask creative-library whether this request is still active. Fail-open on
+    transient errors (don't abort a good job over a flaky check)."""
+    if not getattr(req, "active_url", None):
+        return True
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(req.active_url, headers={"x-regen-secret": CALLBACK_SECRET})
+            return bool(r.json().get("active", True))
+    except Exception:
+        return True
+
+
+async def _abort_if_cancelled(req: "RunRequest", where: str):
+    if not await _still_active(req):
+        raise Cancelled(f"cancelled before {where}")
 
 
 # ── Gemini intent interpreter ─────────────────────────────────────────────────
@@ -176,9 +199,13 @@ async def _execute(req: RunRequest):
     """Pick recipe by variation_type → produce variants → POST back to callback."""
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
     try:
+        await _abort_if_cancelled(req, "start")
         recipe = _RECIPES.get(vtype, recipe_special)
         variants = await recipe(req)
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "ready", "variants": variants})
+    except Cancelled as c:
+        logger.info(f"regen run cancelled for {req.request_id}: {c}")
+        await _callback(req.callback_url, {"request_id": req.request_id, "status": "cancelled", "error": str(c), "variants": []})
     except Exception as e:
         logger.exception(f"regen run failed for {req.request_id}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": str(e), "variants": []})
@@ -227,6 +254,9 @@ async def recipe_avatar(req: RunRequest) -> list:
     avatar_id = await _pick_avatar(age="elderly", gender="female", region="namer")
     if not avatar_id:
         raise RuntimeError("no matching avatar found")
+
+    # last credit-safety gate before the paid TikTok render
+    await _abort_if_cancelled(req, "avatar generation")
 
     # one avatar render per request (deterministic for a given script)
     loop = asyncio.get_event_loop()
@@ -327,6 +357,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
                 f"(pexels_key_configured={has_key}, tried={queries[:6]}) — refusing to ship unrelated content")
         stock = clip["local_path"]
 
+        await _abort_if_cancelled(req, "stitch")
         out_name = f"regen_hook_{req.request_id[:8]}.mp4"
         out_path = os.path.join(UPLOAD_DIR, out_name)
         fc = (
