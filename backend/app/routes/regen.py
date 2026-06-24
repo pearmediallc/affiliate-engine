@@ -151,12 +151,45 @@ async def _callback(url: Optional[str], payload: dict):
 
 
 # ── Recipes (each returns a list of variant dicts) ────────────────────────────
+async def _transcribe_original(download_url: str) -> str:
+    """Download the ORIGINAL creative and transcribe it so generation is grounded
+    in what the ad actually says — never a hardcoded/invented script."""
+    if not download_url:
+        return ""
+    import tempfile
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as c:
+        r = await c.get(download_url)
+        r.raise_for_status()
+        data = r.content
+    fd, path = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        from ..services.transcription_service import TranscriptionService
+        res = await TranscriptionService().transcribe_audio(path, provider="openai")
+        return (res or {}).get("transcription") or (res or {}).get("text") or ""
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+
 async def recipe_avatar(req: RunRequest) -> list:
-    """Avatar/UGC + map+ugc: elderly-female avatar speaks a (rewritten) script with
-    native lip-sync via TikTok Symphony. One consistent voice, audience-matched."""
-    script = req.directive.get("script_directive")
-    if not script or script == "none":
-        script = req.expectation or "If you own a home in Texas and your insurance keeps climbing, you may be overpaying. Compare every carrier in your area in under a minute. Tap below and enter your zip code."
+    """Avatar/UGC + map+ugc: elderly-female avatar speaks the script with native
+    lip-sync via TikTok Symphony. The script is ANCHORED to the original creative's
+    real transcript (preserve topic/message); only modified per an explicit directive.
+    NOTE: this is the *net-new* lane — it changes the spokesperson/setting. For
+    fixing a loser while preserving its look, use a surgical recipe instead."""
+    # 1) ground in the original's actual content
+    original_script = await _transcribe_original(req.context.get("download_url", ""))
+    # 2) an explicit rewrite directive may refine it; otherwise keep the original message
+    directive_script = req.directive.get("script_directive")
+    if directive_script and directive_script != "none":
+        script = directive_script
+    elif original_script:
+        script = original_script
+    else:
+        # do NOT invent unrelated content — fail loudly so the UI surfaces it
+        raise RuntimeError("could not transcribe the original and no script directive given — refusing to generate unrelated content")
 
     avatar_id = await _pick_avatar(age="elderly", gender="female", region="namer")
     if not avatar_id:
