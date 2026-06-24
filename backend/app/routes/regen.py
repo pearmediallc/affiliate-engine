@@ -49,8 +49,16 @@ async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
 
 async def _transcribe_file(path: str) -> str:
     from ..services.transcription_service import TranscriptionService
-    res = await TranscriptionService().transcribe_audio(path, provider="openai")
-    return (res or {}).get("transcription") or (res or {}).get("text") or ""
+    # Whisper API caps uploads at 25MB; a full video easily exceeds that. Extract
+    # compact mono audio first (a few hundred KB even for long ads).
+    fd, apath = tempfile.mkstemp(suffix=".mp3"); os.close(fd)
+    try:
+        _ffmpeg(["-i", path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", apath])
+        res = await TranscriptionService().transcribe_audio(apath, provider="openai")
+        return (res or {}).get("transcription") or (res or {}).get("text") or ""
+    finally:
+        try: os.remove(apath)
+        except OSError: pass
 
 def _ffprobe_dims(path: str):
     out = subprocess.run(
@@ -190,18 +198,9 @@ async def _transcribe_original(download_url: str) -> str:
     in what the ad actually says — never a hardcoded/invented script."""
     if not download_url:
         return ""
-    import tempfile
-    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as c:
-        r = await c.get(download_url)
-        r.raise_for_status()
-        data = r.content
-    fd, path = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
+    path = await _download_to_temp(download_url)
     try:
-        with open(path, "wb") as f:
-            f.write(data)
-        from ..services.transcription_service import TranscriptionService
-        res = await TranscriptionService().transcribe_audio(path, provider="openai")
-        return (res or {}).get("transcription") or (res or {}).get("text") or ""
+        return await _transcribe_file(path)   # extracts compact audio (handles 25MB cap)
     finally:
         try: os.remove(path)
         except OSError: pass
