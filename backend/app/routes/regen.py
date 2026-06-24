@@ -53,7 +53,7 @@ async def _transcribe_file(path: str) -> str:
     # compact mono audio first (a few hundred KB even for long ads).
     fd, apath = tempfile.mkstemp(suffix=".mp3"); os.close(fd)
     try:
-        _ffmpeg(["-i", path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", apath])
+        await asyncio.to_thread(_ffmpeg, ["-i", path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", apath])
         res = await TranscriptionService().transcribe_audio(apath, provider="openai")
         return (res or {}).get("transcription") or (res or {}).get("text") or ""
     finally:
@@ -295,7 +295,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
 
     orig = await _download_to_temp(download_url)
     try:
-        W, H = _ffprobe_dims(orig)
+        W, H = await asyncio.to_thread(_ffprobe_dims, orig)
         transcript = await _transcribe_file(orig)
 
         # derive several simple, searchable stock terms from the ORIGINAL's content
@@ -314,7 +314,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
         clip, query = None, None
         for q in queries:
             for orient in (pref, "landscape", "portrait"):
-                c = StockFootageService.get_broll(q, orientation=orient, duration_max=30)
+                c = await asyncio.to_thread(StockFootageService.get_broll, q, orient, 30)
                 if c and c.get("local_path"):
                     clip, query = c, q
                     break
@@ -337,7 +337,8 @@ async def recipe_hook_change(req: RunRequest) -> list:
             f"[1:a]atrim={HOOK},asetpts=PTS-STARTPTS[ba];"
             f"[hv][ha][bv][ba]concat=n=2:v=1:a=1[outv][outa]"
         )
-        _ffmpeg(["-i", stock, "-i", orig, "-filter_complex", fc,
+        await asyncio.to_thread(_ffmpeg,
+                ["-i", stock, "-i", orig, "-filter_complex", fc,
                  "-map", "[outv]", "-map", "[outa]",
                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                  "-c:a", "aac", "-b:a", "192k", out_path])
