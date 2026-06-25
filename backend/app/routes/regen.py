@@ -456,34 +456,46 @@ async def recipe_hook_change(req: RunRequest) -> list:
         queries = [q for q in (analysis.get("stock_queries") or []) if isinstance(q, str) and q.strip()]
         queries += ["lifestyle", "people", "city"]
 
+        # ── SOURCE PRIORITY: your own PROVEN WINNERS first (on-brand + already convert),
+        #    stock footage only as fallback. ──────────────────────────────────────
+        sources = []
+        for wh in (req.context.get("winner_hooks") or []):
+            if wh.get("download_url"):
+                sources.append({"kind": "winner", "url": wh["download_url"],
+                                "label": f"winner:{(wh.get('filename') or '')[:28]} (roas {wh.get('roas')})"})
+        for q in queries:
+            sources.append({"kind": "stock", "query": q, "label": f"stock:{q}"})
+
         # ── 2+3. GENERATE → SELF-CRITIQUE → AUTO-CORRECT (bounded) ─────────────
-        tried, verdict, best = [], None, None
+        si, verdict, best = 0, None, None
         for attempt in range(3):
             await _abort_if_cancelled(req, "generation")
-            # pick a stock clip we haven't tried
-            clip, query = None, None
-            for q in queries:
-                if q in tried:
-                    continue
-                for orient in (("portrait" if H >= W else "landscape"), "landscape", "portrait"):
-                    c = await asyncio.to_thread(StockFootageService.get_broll, q, orient, 30)
+            # resolve the next usable hook source (winners first)
+            src_path, src_label = None, None
+            while si < len(sources):
+                s = sources[si]; si += 1
+                if s["kind"] == "winner":
+                    try:
+                        src_path = await _download_to_temp(s["url"]); src_label = s["label"]; break
+                    except Exception as e:
+                        logger.warning(f"winner hook download failed: {e}"); continue
+                else:
+                    c = await asyncio.to_thread(StockFootageService.get_broll, s["query"],
+                                                ("portrait" if H >= W else "landscape"), 30)
                     if c and c.get("local_path"):
-                        clip, query = c, q
-                        break
-                if clip:
-                    break
-            if not clip:
+                        src_path = c["local_path"]; src_label = s["label"]; break
+            if not src_path:
                 if best:
                     break
                 raise RuntimeError(
-                    f"no stock footage (pexels_key_configured={bool(settings.pexels_api_key)}, tried={queries[:6]})")
-            tried.append(query)
+                    f"no usable hook source — winners+stock exhausted (pexels_key={bool(settings.pexels_api_key)})")
+            query = src_label
 
             cap_png = os.path.join(work, f"cap_{attempt}.png")
             await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
             out_name = f"regen_hook_{req.request_id[:8]}.mp4"
             out_path = os.path.join(UPLOAD_DIR, out_name)
-            await _stitch_hook(clip["local_path"], orig, cap_png, W, H, hook_end, FPS, out_path)
+            await _stitch_hook(src_path, orig, cap_png, W, H, hook_end, FPS, out_path)
 
             # ── SELF-CRITIQUE: watch the output, compare to the ad ─────────────
             vframes = await asyncio.to_thread(_extract_frames, out_path,
