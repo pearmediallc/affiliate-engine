@@ -75,6 +75,94 @@ async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
     return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
 
 
+# ── Clean state-map hook renderer (caption-free, correct geo) ─────────────────
+US_BBOX = (-125.0, 24.0, -66.5, 49.5)  # lon_min, lat_min, lon_max, lat_max (continental)
+_MAP_SKIP = {"Alaska", "Hawaii", "Puerto Rico"}
+STATE_ABBR = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+    "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
+    "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+    "VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+}
+_STATES_GEO = None
+
+def _load_states():
+    global _STATES_GEO
+    if _STATES_GEO is None:
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "us_states.geojson")
+        with open(p) as f:
+            _STATES_GEO = json.load(f)
+    return _STATES_GEO
+
+def _detect_state(text: str):
+    """Find a US state (abbr or full name) in a filename/transcript token stream."""
+    up = (text or "").upper()
+    toks = set(t for t in up.replace("-", " ").replace("_", " ").replace(".", " ").split() if t)
+    for ab in STATE_ABBR:
+        if ab in toks:
+            return ab
+    for ab, full in STATE_ABBR.items():
+        if full.upper() in up:
+            return ab
+    return None
+
+def _state_feature(name, data):
+    for f in data["features"]:
+        if str(f["properties"].get("name", "")).lower() == str(name).lower():
+            return f
+    return None
+
+def _rings(geom):
+    t, c = geom["type"], geom["coordinates"]
+    if t == "Polygon":
+        return [c[0]]
+    if t == "MultiPolygon":
+        return [poly[0] for poly in c]
+    return []
+
+def _render_state_map(state: str, W: int, H: int, out_path: str, fill_frac: float = 0.5) -> bool:
+    """Render a clean US map CENTERED on the target state (highlighted red, undistorted,
+    caption-free). Returns False if the state can't be found."""
+    import math
+    from PIL import Image, ImageDraw
+    name = STATE_ABBR.get((state or "").upper(), state)
+    data = _load_states()
+    tf = _state_feature(name, data)
+    if not tf:
+        return False
+
+    tpts = [(lon, lat) for r in _rings(tf["geometry"]) for lon, lat in r]
+    los = [p[0] for p in tpts]; las = [p[1] for p in tpts]
+    clon = (min(los) + max(los)) / 2; clat = (min(las) + max(las)) / 2
+    dlon = max(los) - min(los); dlat = max(las) - min(las)
+    cosl = math.cos(math.radians(clat)) or 1.0
+    dpp = max(dlon * cosl / (fill_frac * W), dlat / (fill_frac * H)) or 1e-6  # degrees/pixel
+
+    def proj(lon, lat):
+        return (W / 2 + (lon - clon) * cosl / dpp, H / 2 - (lat - clat) / dpp)
+
+    img = Image.new("RGB", (W, H), (236, 240, 245))
+    d = ImageDraw.Draw(img)
+    for f in data["features"]:
+        nm = f["properties"].get("name", "")
+        if nm in _MAP_SKIP:
+            continue
+        is_t = str(nm).lower() == str(name).lower()
+        fill = (214, 40, 40) if is_t else (178, 194, 210)
+        for ring in _rings(f["geometry"]):
+            pts = [proj(lon, lat) for lon, lat in ring]
+            if len(pts) >= 3:
+                d.polygon(pts, fill=fill, outline=(255, 255, 255))
+    img.save(out_path)
+    return True
+
+
 async def _detect_caption_boxes(frame_paths: list) -> list:
     """Vision-detect burned-in caption/overlay TEXT regions (any position) as normalized
     {x,y,w,h} boxes, so they can be masked out before reuse."""
@@ -491,11 +579,30 @@ async def recipe_hook_change(req: RunRequest) -> list:
         queries = [q for q in (analysis.get("stock_queries") or []) if isinstance(q, str) and q.strip()]
         queries += ["lifestyle", "people", "city"]
 
-        # ── SOURCE: format-matched PROVEN WINNER first (auto-strip its captions);
-        #    caption-free stock only as fallback. Resolve ONE source. ──────────────
+        # ── SOURCE selection (resolve ONE) ────────────────────────────────────
         await _abort_if_cancelled(req, "generation")
         src_path, src_label, is_winner = None, None, False
-        for wh in (req.context.get("winner_hooks") or []):
+
+        # PRIMARY for MAP-format losers: render a CLEAN state map — caption-free, correct
+        # geo, no donor text to scrub. This is the deterministic correct source for maps.
+        fname = req.context.get("filename", "") or ""
+        state = _detect_state(fname) or _detect_state(transcript)
+        if state and "MAP" in fname.upper():
+            map_png = os.path.join(work, "map.png")
+            ok = await asyncio.to_thread(_render_state_map, state, W, H, map_png)
+            if ok:
+                map_clip = os.path.join(work, "map_clip.mp4")
+                await asyncio.to_thread(_ffmpeg,
+                    ["-loop", "1", "-t", str(hook_end), "-i", map_png,
+                     "-vf", f"scale={W}:{H},fps={FPS}", "-c:v", "libx264", "-preset", "veryfast",
+                     "-pix_fmt", "yuv420p", "-t", str(hook_end), map_clip])
+                src_path = map_clip
+                src_label = f"clean {STATE_ABBR.get(state.upper(), state)} map"
+                is_winner = False
+
+        # else: format-matched PROVEN WINNER (auto-strip its captions)
+        if not src_path:
+          for wh in (req.context.get("winner_hooks") or []):
             if not wh.get("download_url"):
                 continue
             try:
