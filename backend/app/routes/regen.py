@@ -75,6 +75,23 @@ async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
     return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
 
 
+async def _detect_caption_boxes(frame_paths: list) -> list:
+    """Vision-detect burned-in caption/overlay TEXT regions (any position) as normalized
+    {x,y,w,h} boxes, so they can be masked out before reuse."""
+    if not frame_paths:
+        return []
+    try:
+        r = await _gemini_vision(frame_paths,
+            'These frames are from a video ad. Find EVERY burned-in caption / subtitle / overlay '
+            'TEXT region (text added on top of the video, NOT text that is part of the real scene). '
+            'Return STRICT JSON {"boxes":[{"x":<left 0-1>,"y":<top 0-1>,"w":<width 0-1>,"h":<height 0-1>}]} '
+            'as fractions of the frame. Pad each box ~4%. Return {"boxes":[]} if there is no overlay text.')
+        return [b for b in (r.get("boxes") or []) if all(k in b for k in ("x", "y", "w", "h"))]
+    except Exception as e:
+        logger.warning(f"caption-box detect failed: {e}")
+        return []
+
+
 async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
         r = await c.get(url); r.raise_for_status(); data = r.content
@@ -397,15 +414,30 @@ async def _poll_avatar(task_id: str, tries: int = 40, delay: int = 8) -> Optiona
     return None
 
 
-async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path, strip_captions=False):
+def _delogo_chain(boxes, W, H):
+    """Build ffmpeg delogo filters that blur out detected caption regions (any position)."""
+    parts = []
+    for b in (boxes or []):
+        try:
+            x = max(1, int(W * float(b["x"]))); y = max(1, int(H * float(b["y"])))
+            w = int(W * float(b["w"])); h = int(H * float(b["h"]))
+            w = min(w, W - x - 1); h = min(h, H - y - 1)
+            if w > 4 and h > 4:
+                parts.append(f"delogo=x={x}:y={y}:w={w}:h={h}")
+        except Exception:
+            continue
+    return (",".join(parts) + ",") if parts else ""
+
+
+async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path, cover_boxes=None):
     """Replace [0:hook_end] visual with the source clip + ONE caption overlay; keep the
     original's hook audio + the entire body (a+v) untouched. Re-stitch.
-    strip_captions=True (for reused winner footage) crops the donor's burned caption band
-    BEFORE scaling, so the source can't show its own (conflicting) text."""
-    pre = "crop=iw:ih*0.70:0:0," if strip_captions else ""   # drop bottom ~30% (UGC caption zone)
+    cover_boxes (for reused winner footage) blurs out the donor's burned caption regions
+    wherever they are, so the source can't show its own (conflicting) text."""
+    post = _delogo_chain(cover_boxes, W, H)   # blur donor captions after scaling to WxH
     fc = (
-        f"[0:v]trim=0:{hook_end},setpts=PTS-STARTPTS,{pre}scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H},fps={fps}[hk];"
+        f"[0:v]trim=0:{hook_end},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},{post}fps={fps}[hk];"
         f"[hk][2:v]overlay=0:0[hv];"
         f"[1:a]atrim=0:{hook_end},asetpts=PTS-STARTPTS[ha];"
         f"[1:v]trim={hook_end},setpts=PTS-STARTPTS,scale={W}:{H},fps={fps}[bv];"
@@ -483,13 +515,20 @@ async def recipe_hook_change(req: RunRequest) -> list:
         if not src_path:
             raise RuntimeError(f"no usable hook source (pexels_key={bool(settings.pexels_api_key)})")
 
-        # ── GENERATE: one clean caption + stitch (strip donor captions if reusing a winner) ──
+        # ── If reusing a winner, DETECT its burned captions (any position) so we can mask them ──
+        cover_boxes = []
+        if is_winner:
+            wframes = await asyncio.to_thread(_extract_frames, src_path,
+                        [hook_end * 0.3, hook_end * 0.6, hook_end * 0.9], work)
+            cover_boxes = await _detect_caption_boxes(wframes)
+
+        # ── GENERATE: one clean caption + stitch (donor captions masked if reusing a winner) ──
         cap_png = os.path.join(work, "cap.png")
         await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
         await _abort_if_cancelled(req, "stitch")
         out_name = f"regen_hook_{req.request_id[:8]}.mp4"
         out_path = os.path.join(UPLOAD_DIR, out_name)
-        await _stitch_hook(src_path, orig, cap_png, W, H, hook_end, FPS, out_path, strip_captions=is_winner)
+        await _stitch_hook(src_path, orig, cap_png, W, H, hook_end, FPS, out_path, cover_boxes=cover_boxes)
 
         return [{
             "recipe": "Hook Change Only (surgical)",
