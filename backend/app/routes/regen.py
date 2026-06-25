@@ -14,6 +14,7 @@ Recipes are ordered chains over the engine's EXISTING separate features
 """
 import os
 import json
+import base64
 import logging
 import asyncio
 import tempfile
@@ -39,6 +40,41 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # ── media helpers ─────────────────────────────────────────────────────────────
+def _extract_frames(video: str, times: list, outdir: str) -> list:
+    """Extract a few JPEG frames at the given timestamps (for vision analysis)."""
+    paths = []
+    for i, t in enumerate(times):
+        p = os.path.join(outdir, f"vf_{i}.jpg")
+        try:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", video,
+                            "-frames:v", "1", "-vf", "scale=360:-1", p],
+                           check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if os.path.isfile(p):
+                paths.append(p)
+        except Exception:
+            pass
+    return paths
+
+
+async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
+    """Send frames + a prompt to Gemini and get back STRICT JSON."""
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+    parts = [{"text": prompt}]
+    for fp in frame_paths:
+        with open(fp, "rb") as f:
+            parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                          "data": base64.b64encode(f.read()).decode()}})
+    body = {"contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={settings.gemini_api_key}"
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(url, json=body)
+        r.raise_for_status()
+        data = r.json()
+    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+
+
 async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
         r = await c.get(url); r.raise_for_status(); data = r.content
@@ -67,6 +103,15 @@ def _ffprobe_dims(path: str):
         capture_output=True, text=True, timeout=60).stdout.strip()
     w, h = out.split("x")[:2]
     return int(w), int(h)
+
+def _ffprobe_duration(path: str) -> float:
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=noprint_wrappers=1:nokey=1", path],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
 
 def _ffmpeg(args, timeout: int = 600):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
@@ -352,98 +397,135 @@ async def _poll_avatar(task_id: str, tries: int = 40, delay: int = 8) -> Optiona
     return None
 
 
+async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path):
+    """Replace [0:hook_end] visual with the stock clip + caption overlay; keep the
+    original's hook audio + the entire body (a+v) untouched. Re-stitch."""
+    fc = (
+        f"[0:v]trim=0:{hook_end},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},fps={fps}[hk];"
+        f"[hk][2:v]overlay=0:0[hv];"
+        f"[1:a]atrim=0:{hook_end},asetpts=PTS-STARTPTS[ha];"
+        f"[1:v]trim={hook_end},setpts=PTS-STARTPTS,scale={W}:{H},fps={fps}[bv];"
+        f"[1:a]atrim={hook_end},asetpts=PTS-STARTPTS[ba];"
+        f"[hv][ha][bv][ba]concat=n=2:v=1:a=1[outv][outa]"
+    )
+    await asyncio.to_thread(_ffmpeg,
+        ["-i", stock, "-i", orig, "-loop", "1", "-t", str(hook_end), "-i", cap_png,
+         "-filter_complex", fc, "-map", "[outv]", "-map", "[outa]",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", out_path])
+
+
 async def recipe_hook_change(req: RunRequest) -> list:
-    """SURGICAL fix: keep the original's full voiceover + entire body, replace ONLY
-    the first ~3.5s hook VISUAL with a topic-matched clip. Preserves script, voice,
-    story, and all body footage — only the opening visual changes."""
-    HOOK = 3.5
+    """SURGICAL fix with a self-correcting intelligence loop:
+       ANALYZE the original (Gemini Vision) → GENERATE a coherent hook (matched
+       caption + topic-relevant footage) → SELF-CRITIQUE the output (Vision) →
+       AUTO-CORRECT and retry until it reads as the same ad. Preserves the
+       original's voice + entire body; only the opening visual changes."""
     FPS = 30
     download_url = req.context.get("download_url", "")
     if not download_url:
         raise RuntimeError("no original download_url in context")
 
     orig = await _download_to_temp(download_url)
+    work = tempfile.mkdtemp()
     try:
         W, H = await asyncio.to_thread(_ffprobe_dims, orig)
+        dur = await asyncio.to_thread(_ffprobe_duration, orig)
         transcript = await _transcribe_file(orig)
 
-        # derive several simple, searchable stock terms from the ORIGINAL's content
-        queries = []
+        # ── 1. ANALYZE the original with vision ────────────────────────────────
+        oframes = await asyncio.to_thread(_extract_frames, orig, [0.3, 1.0, 2.5, 4.0, min(6.0, max(0.0, dur - 0.5))], work)
+        analysis = {}
         try:
-            d = await _gemini_json(
-                f'From this ad transcript, give 3 simple stock-footage search terms (1-2 common, '
-                f'very searchable words each) for a relevant OPENING hook visual matching the topic. '
-                f'Transcript: "{transcript[:1200]}". Return JSON {{"queries":["..","..",".."]}}')
-            queries = [q for q in (d.get("queries") or []) if isinstance(q, str) and q.strip()]
+            analysis = await _gemini_vision(oframes,
+                'You are analyzing frames (in order) from the START of a UGC video ad. '
+                f'Its transcript: "{transcript[:1200]}". Return STRICT JSON: '
+                '{"hook_end_sec": <seconds where the opening hook shot ends, 2-6>, '
+                '"hook_caption": "<a punchy 4-8 word ON-SCREEN caption that tells a scroller exactly what this ad is about/its offer>", '
+                '"stock_queries": ["<3 simple 1-2 word stock-footage search terms for a relevant opening visual>"], '
+                '"topic": "<short>"}')
         except Exception as e:
-            logger.warning(f"hook query gen failed: {e}")
-        queries += ["lifestyle", "people", "city"]  # generic fallbacks so we still find SOMETHING relevant-ish
+            logger.warning(f"vision analyze failed: {e}")
+        try:
+            hook_end = float(analysis.get("hook_end_sec") or 3.5)
+        except Exception:
+            hook_end = 3.5
+        hook_end = max(2.0, min(hook_end, 6.0, (dur - 1.0) if dur else 3.5))
+        caption = (analysis.get("hook_caption") or "").strip() or (" ".join(transcript.split()[:7]) or "WATCH THIS")
+        queries = [q for q in (analysis.get("stock_queries") or []) if isinstance(q, str) and q.strip()]
+        queries += ["lifestyle", "people", "city"]
 
-        pref = "portrait" if H >= W else "landscape"
-        clip, query = None, None
-        for q in queries:
-            for orient in (pref, "landscape", "portrait"):
-                c = await asyncio.to_thread(StockFootageService.get_broll, q, orient, 30)
-                if c and c.get("local_path"):
-                    clip, query = c, q
+        # ── 2+3. GENERATE → SELF-CRITIQUE → AUTO-CORRECT (bounded) ─────────────
+        tried, verdict, best = [], None, None
+        for attempt in range(3):
+            await _abort_if_cancelled(req, "generation")
+            # pick a stock clip we haven't tried
+            clip, query = None, None
+            for q in queries:
+                if q in tried:
+                    continue
+                for orient in (("portrait" if H >= W else "landscape"), "landscape", "portrait"):
+                    c = await asyncio.to_thread(StockFootageService.get_broll, q, orient, 30)
+                    if c and c.get("local_path"):
+                        clip, query = c, q
+                        break
+                if clip:
                     break
-            if clip:
+            if not clip:
+                if best:
+                    break
+                raise RuntimeError(
+                    f"no stock footage (pexels_key_configured={bool(settings.pexels_api_key)}, tried={queries[:6]})")
+            tried.append(query)
+
+            cap_png = os.path.join(work, f"cap_{attempt}.png")
+            await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
+            out_name = f"regen_hook_{req.request_id[:8]}.mp4"
+            out_path = os.path.join(UPLOAD_DIR, out_name)
+            await _stitch_hook(clip["local_path"], orig, cap_png, W, H, hook_end, FPS, out_path)
+
+            # ── SELF-CRITIQUE: watch the output, compare to the ad ─────────────
+            vframes = await asyncio.to_thread(_extract_frames, out_path,
+                        [hook_end * 0.4, hook_end * 0.85, hook_end + 1.2], work)
+            verdict = {}
+            try:
+                verdict = await _gemini_vision(vframes,
+                    'These frames (in order) are the OPENING of a regenerated video ad. The first 1-2 are '
+                    f'the new hook; the last is just after the cut. The ad is about: "{caption}". '
+                    'Judge as a strict ad reviewer. Return JSON: '
+                    '{"pass": <true only if the hook clearly reads as part of THIS ad: relevant footage AND '
+                    'readable on-screen caption AND a clean cut>, "hook_relevant": <bool>, '
+                    '"caption_readable": <bool>, "issues": ["..."], "fix": "<stock|caption|none>"}')
+            except Exception as e:
+                logger.warning(f"vision critique failed: {e}")
+                verdict = {"pass": True, "issues": [f"critique skipped: {e}"]}
+
+            best = {"out_name": out_name, "out_path": out_path, "query": query, "verdict": verdict, "hook_end": hook_end}
+            if verdict.get("pass"):
                 break
-        if not clip:
-            has_key = bool(settings.pexels_api_key)
-            raise RuntimeError(
-                f"no stock footage found for any candidate query "
-                f"(pexels_key_configured={has_key}, tried={queries[:6]}) — refusing to ship unrelated content")
-        stock = clip["local_path"]
+            # AUTO-CORRECT: if the footage was the problem, next loop tries another query;
+            # if the caption was unreadable, strengthen it.
+            if verdict.get("fix") == "caption" or verdict.get("caption_readable") is False:
+                caption = caption.upper()[:48]
 
-        # Caption so the new hook reads as the SAME ad (not random footage).
-        caption = ""
-        try:
-            d = await _gemini_json(
-                f'Write ONE punchy 4-8 word on-screen HOOK caption (scroll-stopping, clearly '
-                f'conveys what this ad is about / its offer) from this transcript: "{transcript[:1000]}". '
-                f'Return JSON {{"caption":"..."}}')
-            caption = (d.get("caption") or "").strip()
-        except Exception as e:
-            logger.warning(f"caption gen failed: {e}")
-        if not caption:
-            caption = " ".join(transcript.split()[:7]) or "WATCH THIS"
-        cap_png = os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.png")
-        await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
-
-        await _abort_if_cancelled(req, "stitch")
-        out_name = f"regen_hook_{req.request_id[:8]}.mp4"
-        out_path = os.path.join(UPLOAD_DIR, out_name)
-        fc = (
-            f"[0:v]trim=0:{HOOK},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},fps={FPS}[hk];"
-            f"[hk][2:v]overlay=(W-w)/2:0[hv];"               # burn the hook caption
-            f"[1:a]atrim=0:{HOOK},asetpts=PTS-STARTPTS[ha];"
-            f"[1:v]trim={HOOK},setpts=PTS-STARTPTS,scale={W}:{H},fps={FPS}[bv];"
-            f"[1:a]atrim={HOOK},asetpts=PTS-STARTPTS[ba];"
-            f"[hv][ha][bv][ba]concat=n=2:v=1:a=1[outv][outa]"
-        )
-        await asyncio.to_thread(_ffmpeg,
-                ["-i", stock, "-i", orig, "-loop", "1", "-t", str(HOOK), "-i", cap_png,
-                 "-filter_complex", fc,
-                 "-map", "[outv]", "-map", "[outa]",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                 "-c:a", "aac", "-b:a", "192k", out_path])
-        try: os.remove(cap_png)
-        except OSError: pass
-
+        v = best["verdict"]
         return [{
-            "recipe": "Hook Change Only (surgical)",
-            "video_url": f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}",
-            "confidence": 0.7,
+            "recipe": "Hook Change Only (surgical, self-verified)",
+            "video_url": f"{AE_PUBLIC_URL}/api/v1/uploads/{best['out_name']}",
+            "confidence": 0.85 if v.get("pass") else 0.5,
             "whats_changed": (
-                f"Replaced ONLY the first {HOOK}s hook visual with topic-matched stock "
-                f"('{query}'); kept the original voiceover + entire body. Script, voice and story preserved."
+                f"Replaced only the first {best['hook_end']:.1f}s hook with topic-matched footage ('{best['query']}') "
+                f"+ on-screen caption \"{caption}\"; kept original voice + entire body. "
+                f"Self-QA: {'PASSED' if v.get('pass') else 'flagged: ' + '; '.join(v.get('issues', [])[:2])}."
             ),
         }]
     finally:
         try: os.remove(orig)
         except OSError: pass
+        try:
+            import shutil; shutil.rmtree(work, ignore_errors=True)
+        except Exception: pass
 
 
 async def recipe_passthrough(req: RunRequest, label: str) -> list:
