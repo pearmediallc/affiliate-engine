@@ -72,6 +72,45 @@ def _ffmpeg(args, timeout: int = 600):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
                    check=True, timeout=timeout,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+def _make_caption_png(text: str, W: int, H: int, out_path: str):
+    """Render a centered, wrapped lower-third caption (white text on a dark rounded
+    box) as a transparent PNG, so the new hook reads as the SAME ad."""
+    from PIL import Image, ImageDraw, ImageFont
+    text = (text or "").strip().upper()
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    fs = max(30, W // 15)
+    font = None
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
+        if os.path.exists(p):
+            font = ImageFont.truetype(p, fs); break
+    if font is None:
+        font = ImageFont.load_default()
+    # word-wrap to ~86% width
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if d.textbbox((0, 0), t, font=font)[2] <= W * 0.86:
+            cur = t
+        else:
+            if cur: lines.append(cur)
+            cur = w
+    if cur: lines.append(cur)
+    lines = lines[:3] or ["WATCH THIS"]
+    line_h = int(fs * 1.3)
+    total_h = line_h * len(lines)
+    y0 = int(H * 0.66)
+    pad = int(fs * 0.45)
+    box_w = max(d.textbbox((0, 0), l, font=font)[2] for l in lines) + pad * 2
+    x0 = (W - box_w) // 2
+    d.rounded_rectangle([x0, y0 - pad, x0 + box_w, y0 + total_h + pad],
+                        radius=int(fs * 0.3), fill=(0, 0, 0, 180))
+    for i, l in enumerate(lines):
+        lw = d.textbbox((0, 0), l, font=font)[2]
+        d.text(((W - lw) // 2, y0 + i * line_h), l, font=font, fill=(255, 255, 255, 255))
+    img.save(out_path)
 # Shared service key — only callers that know it (i.e. creative-library) may trigger work.
 SERVICE_KEY = os.getenv("REGEN_SERVICE_KEY", "change-me-regen-service-key")
 
@@ -357,22 +396,41 @@ async def recipe_hook_change(req: RunRequest) -> list:
                 f"(pexels_key_configured={has_key}, tried={queries[:6]}) — refusing to ship unrelated content")
         stock = clip["local_path"]
 
+        # Caption so the new hook reads as the SAME ad (not random footage).
+        caption = ""
+        try:
+            d = await _gemini_json(
+                f'Write ONE punchy 4-8 word on-screen HOOK caption (scroll-stopping, clearly '
+                f'conveys what this ad is about / its offer) from this transcript: "{transcript[:1000]}". '
+                f'Return JSON {{"caption":"..."}}')
+            caption = (d.get("caption") or "").strip()
+        except Exception as e:
+            logger.warning(f"caption gen failed: {e}")
+        if not caption:
+            caption = " ".join(transcript.split()[:7]) or "WATCH THIS"
+        cap_png = os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.png")
+        await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
+
         await _abort_if_cancelled(req, "stitch")
         out_name = f"regen_hook_{req.request_id[:8]}.mp4"
         out_path = os.path.join(UPLOAD_DIR, out_name)
         fc = (
             f"[0:v]trim=0:{HOOK},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},fps={FPS}[hv];"
+            f"crop={W}:{H},fps={FPS}[hk];"
+            f"[hk][2:v]overlay=(W-w)/2:0[hv];"               # burn the hook caption
             f"[1:a]atrim=0:{HOOK},asetpts=PTS-STARTPTS[ha];"
             f"[1:v]trim={HOOK},setpts=PTS-STARTPTS,scale={W}:{H},fps={FPS}[bv];"
             f"[1:a]atrim={HOOK},asetpts=PTS-STARTPTS[ba];"
             f"[hv][ha][bv][ba]concat=n=2:v=1:a=1[outv][outa]"
         )
         await asyncio.to_thread(_ffmpeg,
-                ["-i", stock, "-i", orig, "-filter_complex", fc,
+                ["-i", stock, "-i", orig, "-loop", "1", "-t", str(HOOK), "-i", cap_png,
+                 "-filter_complex", fc,
                  "-map", "[outv]", "-map", "[outa]",
                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                  "-c:a", "aac", "-b:a", "192k", out_path])
+        try: os.remove(cap_png)
+        except OSError: pass
 
         return [{
             "recipe": "Hook Change Only (surgical)",
