@@ -535,8 +535,10 @@ async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path, cove
     await asyncio.to_thread(_ffmpeg,
         ["-i", stock, "-i", orig, "-loop", "1", "-t", str(hook_end), "-i", cap_png,
          "-filter_complex", fc, "-map", "[outv]", "-map", "[outa]",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "192k", out_path])
+         # lighter on a small instance: ultrafast preset + bounded mux queue + threads cap
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
+         "-threads", "2", "-max_muxing_queue_size", "1024",
+         "-c:a", "aac", "-b:a", "192k", out_path], timeout=900)
 
 
 async def recipe_hook_change(req: RunRequest) -> list:
