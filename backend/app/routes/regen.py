@@ -397,11 +397,14 @@ async def _poll_avatar(task_id: str, tries: int = 40, delay: int = 8) -> Optiona
     return None
 
 
-async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path):
-    """Replace [0:hook_end] visual with the stock clip + caption overlay; keep the
-    original's hook audio + the entire body (a+v) untouched. Re-stitch."""
+async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path, strip_captions=False):
+    """Replace [0:hook_end] visual with the source clip + ONE caption overlay; keep the
+    original's hook audio + the entire body (a+v) untouched. Re-stitch.
+    strip_captions=True (for reused winner footage) crops the donor's burned caption band
+    BEFORE scaling, so the source can't show its own (conflicting) text."""
+    pre = "crop=iw:ih*0.70:0:0," if strip_captions else ""   # drop bottom ~30% (UGC caption zone)
     fc = (
-        f"[0:v]trim=0:{hook_end},setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"[0:v]trim=0:{hook_end},setpts=PTS-STARTPTS,{pre}scale={W}:{H}:force_original_aspect_ratio=increase,"
         f"crop={W}:{H},fps={fps}[hk];"
         f"[hk][2:v]overlay=0:0[hv];"
         f"[1:a]atrim=0:{hook_end},asetpts=PTS-STARTPTS[ha];"
@@ -417,11 +420,11 @@ async def _stitch_hook(stock, orig, cap_png, W, H, hook_end, fps, out_path):
 
 
 async def recipe_hook_change(req: RunRequest) -> list:
-    """SURGICAL fix with a self-correcting intelligence loop:
-       ANALYZE the original (Gemini Vision) → GENERATE a coherent hook (matched
-       caption + topic-relevant footage) → SELF-CRITIQUE the output (Vision) →
-       AUTO-CORRECT and retry until it reads as the same ad. Preserves the
-       original's voice + entire body; only the opening visual changes."""
+    """SURGICAL fix — one accurate pass (no human-in-loop QA):
+       ANALYZE the original (Vision) for the real hook boundary + an on-screen caption,
+       pick a FORMAT-MATCHED proven winner, AUTO-STRIP that donor's burned captions so
+       they can't clash, add ONE clean caption, and re-stitch. Keeps the original's
+       voice + entire body; only the opening visual changes. Correct by construction."""
     FPS = 30
     download_url = req.context.get("download_url", "")
     if not download_url:
@@ -434,8 +437,9 @@ async def recipe_hook_change(req: RunRequest) -> list:
         dur = await asyncio.to_thread(_ffprobe_duration, orig)
         transcript = await _transcribe_file(orig)
 
-        # ── 1. ANALYZE the original with vision ────────────────────────────────
-        oframes = await asyncio.to_thread(_extract_frames, orig, [0.3, 1.0, 2.5, 4.0, min(6.0, max(0.0, dur - 0.5))], work)
+        # ── ANALYZE the original (one vision pass): real hook boundary + caption ──
+        oframes = await asyncio.to_thread(_extract_frames, orig,
+                    [0.3, 1.0, 2.5, 4.0, min(6.0, max(0.0, dur - 0.5))], work)
         analysis = {}
         try:
             analysis = await _gemini_vision(oframes,
@@ -443,8 +447,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
                 f'Its transcript: "{transcript[:1200]}". Return STRICT JSON: '
                 '{"hook_end_sec": <seconds where the opening hook shot ends, 2-6>, '
                 '"hook_caption": "<a punchy 4-8 word ON-SCREEN caption that tells a scroller exactly what this ad is about/its offer>", '
-                '"stock_queries": ["<3 simple 1-2 word stock-footage search terms for a relevant opening visual>"], '
-                '"topic": "<short>"}')
+                '"stock_queries": ["<3 simple 1-2 word stock-footage search terms for a relevant opening visual>"]}')
         except Exception as e:
             logger.warning(f"vision analyze failed: {e}")
         try:
@@ -456,80 +459,46 @@ async def recipe_hook_change(req: RunRequest) -> list:
         queries = [q for q in (analysis.get("stock_queries") or []) if isinstance(q, str) and q.strip()]
         queries += ["lifestyle", "people", "city"]
 
-        # ── SOURCE PRIORITY: your own PROVEN WINNERS first (on-brand + already convert),
-        #    stock footage only as fallback. ──────────────────────────────────────
-        sources = []
+        # ── SOURCE: format-matched PROVEN WINNER first (auto-strip its captions);
+        #    caption-free stock only as fallback. Resolve ONE source. ──────────────
+        await _abort_if_cancelled(req, "generation")
+        src_path, src_label, is_winner = None, None, False
         for wh in (req.context.get("winner_hooks") or []):
-            if wh.get("download_url"):
-                sources.append({"kind": "winner", "url": wh["download_url"],
-                                "label": f"winner:{(wh.get('filename') or '')[:28]} (roas {wh.get('roas')})"})
-        for q in queries:
-            sources.append({"kind": "stock", "query": q, "label": f"stock:{q}"})
-
-        # ── 2+3. GENERATE → SELF-CRITIQUE → AUTO-CORRECT (bounded) ─────────────
-        si, verdict, best = 0, None, None
-        for attempt in range(3):
-            await _abort_if_cancelled(req, "generation")
-            # resolve the next usable hook source (winners first)
-            src_path, src_label = None, None
-            while si < len(sources):
-                s = sources[si]; si += 1
-                if s["kind"] == "winner":
-                    try:
-                        src_path = await _download_to_temp(s["url"]); src_label = s["label"]; break
-                    except Exception as e:
-                        logger.warning(f"winner hook download failed: {e}"); continue
-                else:
-                    c = await asyncio.to_thread(StockFootageService.get_broll, s["query"],
-                                                ("portrait" if H >= W else "landscape"), 30)
-                    if c and c.get("local_path"):
-                        src_path = c["local_path"]; src_label = s["label"]; break
-            if not src_path:
-                if best:
-                    break
-                raise RuntimeError(
-                    f"no usable hook source — winners+stock exhausted (pexels_key={bool(settings.pexels_api_key)})")
-            query = src_label
-
-            cap_png = os.path.join(work, f"cap_{attempt}.png")
-            await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
-            out_name = f"regen_hook_{req.request_id[:8]}.mp4"
-            out_path = os.path.join(UPLOAD_DIR, out_name)
-            await _stitch_hook(src_path, orig, cap_png, W, H, hook_end, FPS, out_path)
-
-            # ── SELF-CRITIQUE: watch the output, compare to the ad ─────────────
-            vframes = await asyncio.to_thread(_extract_frames, out_path,
-                        [hook_end * 0.4, hook_end * 0.85, hook_end + 1.2], work)
-            verdict = {}
+            if not wh.get("download_url"):
+                continue
             try:
-                verdict = await _gemini_vision(vframes,
-                    'These frames (in order) are the OPENING of a regenerated video ad. The first 1-2 are '
-                    f'the new hook; the last is just after the cut. The ad is about: "{caption}". '
-                    'Judge as a strict ad reviewer. Return JSON: '
-                    '{"pass": <true only if the hook clearly reads as part of THIS ad: relevant footage AND '
-                    'readable on-screen caption AND a clean cut>, "hook_relevant": <bool>, '
-                    '"caption_readable": <bool>, "issues": ["..."], "fix": "<stock|caption|none>"}')
-            except Exception as e:
-                logger.warning(f"vision critique failed: {e}")
-                verdict = {"pass": True, "issues": [f"critique skipped: {e}"]}
-
-            best = {"out_name": out_name, "out_path": out_path, "query": query, "verdict": verdict, "hook_end": hook_end}
-            if verdict.get("pass"):
+                src_path = await _download_to_temp(wh["download_url"])
+                src_label = f"your winner '{(wh.get('filename') or '')[:30]}' (roas {wh.get('roas')})"
+                is_winner = True
                 break
-            # AUTO-CORRECT: if the footage was the problem, next loop tries another query;
-            # if the caption was unreadable, strengthen it.
-            if verdict.get("fix") == "caption" or verdict.get("caption_readable") is False:
-                caption = caption.upper()[:48]
+            except Exception as e:
+                logger.warning(f"winner download failed: {e}")
+        if not src_path:
+            for q in queries:
+                c = await asyncio.to_thread(StockFootageService.get_broll, q,
+                                            ("portrait" if H >= W else "landscape"), 30)
+                if c and c.get("local_path"):
+                    src_path, src_label, is_winner = c["local_path"], f"stock '{q}'", False
+                    break
+        if not src_path:
+            raise RuntimeError(f"no usable hook source (pexels_key={bool(settings.pexels_api_key)})")
 
-        v = best["verdict"]
+        # ── GENERATE: one clean caption + stitch (strip donor captions if reusing a winner) ──
+        cap_png = os.path.join(work, "cap.png")
+        await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
+        await _abort_if_cancelled(req, "stitch")
+        out_name = f"regen_hook_{req.request_id[:8]}.mp4"
+        out_path = os.path.join(UPLOAD_DIR, out_name)
+        await _stitch_hook(src_path, orig, cap_png, W, H, hook_end, FPS, out_path, strip_captions=is_winner)
+
         return [{
-            "recipe": "Hook Change Only (surgical, self-verified)",
-            "video_url": f"{AE_PUBLIC_URL}/api/v1/uploads/{best['out_name']}",
-            "confidence": 0.85 if v.get("pass") else 0.5,
+            "recipe": "Hook Change Only (surgical)",
+            "video_url": f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}",
+            "confidence": 0.8,
             "whats_changed": (
-                f"Replaced only the first {best['hook_end']:.1f}s hook with topic-matched footage ('{best['query']}') "
-                f"+ on-screen caption \"{caption}\"; kept original voice + entire body. "
-                f"Self-QA: {'PASSED' if v.get('pass') else 'flagged: ' + '; '.join(v.get('issues', [])[:2])}."
+                f"Replaced only the first {hook_end:.1f}s hook with {src_label}"
+                + (" (its burned captions auto-removed)" if is_winner else "")
+                + f", added on-screen caption \"{caption}\"; kept the original voice + entire body."
             ),
         }]
     finally:
