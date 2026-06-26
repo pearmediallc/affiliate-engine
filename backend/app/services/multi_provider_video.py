@@ -16,6 +16,7 @@ Provider mapping:
 Replicate dependency removed. All models now route through Higgsfield or Kie.ai.
 """
 import os
+import re
 import time
 import uuid
 import logging
@@ -213,9 +214,40 @@ def _higgsfield_poll(request_id: str, headers: dict, timeout: int = 600) -> dict
     raise TimeoutError(f"Higgsfield request {request_id} timed out")
 
 
+_IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".avif")
+_VID_EXT = (".mp4", ".mov", ".webm", ".m4v")
+
+
+def _deep_find_url(obj, prefer: str = "image") -> Optional[str]:
+    """Recursively walk any nested dict/list and return the first asset URL. Ignores
+    the request/status URLs. Prefers the extension matching `prefer`, then any media."""
+    exts = _VID_EXT if prefer == "video" else _IMG_EXT
+    urls: list = []
+
+    def walk(o):
+        if isinstance(o, str):
+            if o.startswith("http") and "/requests/" not in o:
+                urls.append(o)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    for u in urls:
+        if u.split("?")[0].lower().endswith(exts):
+            return u
+    for u in urls:                       # any media url
+        if u.split("?")[0].lower().endswith(_IMG_EXT + _VID_EXT):
+            return u
+    return urls[0] if urls else None
+
+
 def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
     """Pull image_url / video_url out of a Higgsfield completed payload.
-    Higgsfield response shapes vary by model — walk the common spots."""
+    Higgsfield response shapes vary by model — walk the common spots, then deep-search."""
     primary = ["video_url", "videoUrl"] if prefer == "video" else ["image_url", "imageUrl"]
     candidates = primary + ["url"]
     for k in candidates:
@@ -226,7 +258,7 @@ def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
         for k in candidates:
             v = container.get(k)
             if v: return v
-        raw = container.get("raw")
+        raw = container.get("raw") or container.get("min")
         if isinstance(raw, dict) and raw.get("url"):
             return raw["url"]
     if isinstance(container, list) and container:
@@ -235,10 +267,24 @@ def _higgsfield_extract_url(sd: dict, prefer: str = "video") -> Optional[str]:
             for k in candidates:
                 v = first.get(k)
                 if v: return v
-            raw = first.get("raw")
+            raw = first.get("raw") or first.get("min")
             if isinstance(raw, dict) and raw.get("url"):
                 return raw["url"]
-    return None
+    # last resort: recursively find any asset URL anywhere in the payload
+    return _deep_find_url(sd, prefer)
+
+
+def _higgsfield_result_detail(request_id: str, headers: dict) -> dict:
+    """Fetch the full request detail (some Higgsfield endpoints put the output assets
+    on /requests/{id} rather than /requests/{id}/status)."""
+    try:
+        r = httpx.get(f"{_HIGGSFIELD_BASE}/requests/{request_id}", headers=headers, timeout=20)
+        if r.is_success:
+            j = r.json()
+            return j.get("data") or j
+    except Exception as e:
+        logger.warning(f"Higgsfield detail fetch failed for {request_id}: {e}")
+    return {}
 
 
 def _higgsfield_t2i(prompt: str, headers: dict, size: str = "1152x2048") -> str:
@@ -249,6 +295,8 @@ def _higgsfield_t2i(prompt: str, headers: dict, size: str = "1152x2048") -> str:
     rid = _higgsfield_submit(_HIGGSFIELD_T2I_SOUL_SLUG, payload, headers)
     sd = _higgsfield_poll(rid, headers, timeout=180)
     image_url = _higgsfield_extract_url(sd, prefer="image")
+    if not image_url:                                  # output may live on the detail endpoint
+        image_url = _higgsfield_extract_url(_higgsfield_result_detail(rid, headers), prefer="image")
     if not image_url:
         raise RuntimeError(f"No image_url in Higgsfield Soul T2I result: {sd}")
     return image_url
@@ -288,6 +336,8 @@ def _generate_higgsfield(
     rid = _higgsfield_submit(slug, payload, headers)
     sd = _higgsfield_poll(rid, headers, timeout=600)
     video_url = _higgsfield_extract_url(sd, prefer="video")
+    if not video_url:                                  # output may live on the detail endpoint
+        video_url = _higgsfield_extract_url(_higgsfield_result_detail(rid, headers), prefer="video")
     if not video_url:
         raise RuntimeError(f"No video_url in Higgsfield DoP I2V result: {sd}")
 
