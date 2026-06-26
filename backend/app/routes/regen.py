@@ -559,6 +559,11 @@ async def recipe_hook_change(req: RunRequest) -> list:
         dur = await asyncio.to_thread(_ffprobe_duration, orig)
         transcript = await _transcribe_file(orig)
 
+        # Metric-driven: the diagnosis tells us WHAT to fix and the target to lift.
+        diag = req.context.get("diagnosis", {}) or {}
+        hint = diag.get("directive_hint") or ""
+        lagging = diag.get("lagging_metric") or ""
+
         # ── ANALYZE the original (one vision pass): real hook boundary + caption ──
         oframes = await asyncio.to_thread(_extract_frames, orig,
                     [0.3, 1.0, 2.5, 4.0, min(6.0, max(0.0, dur - 0.5))], work)
@@ -566,7 +571,10 @@ async def recipe_hook_change(req: RunRequest) -> list:
         try:
             analysis = await _gemini_vision(oframes,
                 'You are analyzing frames (in order) from the START of a UGC video ad. '
-                f'Its transcript: "{transcript[:1200]}". Return STRICT JSON: '
+                f'Its transcript: "{transcript[:1200]}". '
+                + (f'This ad is underperforming on {lagging}. The fix should: {hint} '
+                   'Write the hook_caption so it directly serves that goal. ' if hint else '')
+                + 'Return STRICT JSON: '
                 '{"hook_end_sec": <seconds where the opening hook shot ends, 2-6>, '
                 '"hook_caption": "<a punchy 4-8 word ON-SCREEN caption that tells a scroller exactly what this ad is about/its offer>", '
                 '"stock_queries": ["<3 simple 1-2 word stock-footage search terms for a relevant opening visual>"]}')
