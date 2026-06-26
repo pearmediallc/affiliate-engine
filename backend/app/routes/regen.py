@@ -961,15 +961,18 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         queries = (d.get("queries") or []) + ["lifestyle", "city"]
         caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
         offer_desc = (caption + " — " + transcript[:220]).strip()
+        # force_generate skips stock and goes straight to AI generation (Higgsfield/Veo)
+        force_gen = bool((req.directive or {}).get("force_generate"))
         clip = None
-        for q in queries:
-            c = await asyncio.to_thread(StockFootageService.get_broll, q, ("portrait" if H >= W else "landscape"), 30)
-            if not (c and c.get("local_path")):
-                continue
-            sframes = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
-            if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
-                continue
-            clip = c; break
+        if not force_gen:
+            for q in queries:
+                c = await asyncio.to_thread(StockFootageService.get_broll, q, ("portrait" if H >= W else "landscape"), 30)
+                if not (c and c.get("local_path")):
+                    continue
+                sframes = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
+                if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
+                    continue
+                clip = c; break
         # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway)
         if not clip:
             gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5)
