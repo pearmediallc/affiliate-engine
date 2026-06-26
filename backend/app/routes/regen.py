@@ -130,7 +130,7 @@ def _render_state_map(state: str, W: int, H: int, out_path: str, fill_frac: floa
     """Render a clean US map CENTERED on the target state (highlighted red, undistorted,
     caption-free). Returns False if the state can't be found."""
     import math
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFont
     name = STATE_ABBR.get((state or "").upper(), state)
     data = _load_states()
     tf = _state_feature(name, data)
@@ -159,6 +159,27 @@ def _render_state_map(state: str, W: int, H: int, out_path: str, fill_frac: floa
             pts = [proj(lon, lat) for lon, lat in ring]
             if len(pts) >= 3:
                 d.polygon(pts, fill=fill, outline=(255, 255, 255))
+
+    # Label the highlighted state (our own clean label — not a donor caption)
+    try:
+        fs = max(26, W // 22)
+        font = None
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"]:
+            if os.path.exists(p):
+                font = ImageFont.truetype(p, fs); break
+        if font is None:
+            font = ImageFont.load_default()
+        label = str(name).upper()
+        px, py = proj(clon, clat)
+        b = d.textbbox((0, 0), label, font=font); tw, th = b[2] - b[0], b[3] - b[1]
+        lx, ly = int(px - tw / 2), int(py - th / 2)
+        pad = int(fs * 0.3)
+        d.rounded_rectangle([lx - pad, ly - pad, lx + tw + pad, ly + th + pad],
+                            radius=int(fs * 0.25), fill=(255, 255, 255, 230))
+        d.text((lx, ly), label, font=font, fill=(20, 20, 20))
+    except Exception:
+        pass
     img.save(out_path)
     return True
 
@@ -602,10 +623,13 @@ async def recipe_hook_change(req: RunRequest) -> list:
             ok = await asyncio.to_thread(_render_state_map, state, W, H, map_png)
             if ok:
                 map_clip = os.path.join(work, "map_clip.mp4")
+                frames = max(1, int(hook_end * FPS))
                 await asyncio.to_thread(_ffmpeg,
                     ["-loop", "1", "-t", str(hook_end), "-i", map_png,
-                     "-vf", f"scale={W}:{H},fps={FPS}", "-c:v", "libx264", "-preset", "veryfast",
-                     "-pix_fmt", "yuv420p", "-t", str(hook_end), map_clip])
+                     "-vf", (f"scale={W*2}:{H*2},zoompan=z='min(zoom+0.0010,1.25)':d={frames}:"
+                             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={FPS}"),
+                     "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                     "-t", str(hook_end), map_clip])
                 src_path = map_clip
                 src_label = f"clean {STATE_ABBR.get(state.upper(), state)} map"
                 is_winner = False
