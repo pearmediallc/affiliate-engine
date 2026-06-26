@@ -201,6 +201,58 @@ async def _detect_caption_boxes(frame_paths: list) -> list:
         return []
 
 
+async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
+    """On-offer relevance gate. Vision-checks a candidate visual against the actual
+    product/offer and REJECTS loose-keyword mismatches (the 'leaf-blower on a
+    weight-loss ad' failure). Fails open (allow) only if the check itself errors."""
+    if not frame_paths or not offer_desc:
+        return True
+    try:
+        r = await _gemini_vision(frame_paths,
+            f'This image is a candidate opening visual for a video ad whose product/offer is: '
+            f'"{offer_desc[:300]}". Would a professional media buyer accept this visual as clearly '
+            'ON-TOPIC and on-brand for THAT specific offer (not generic or unrelated)? '
+            'Be strict — reject anything a buyer would call irrelevant. '
+            'Return STRICT JSON {"relevant": true|false, "why": "<=6 words"}.')
+        ok = bool(r.get("relevant", True))
+        if not ok:
+            logger.info(f"relevance gate REJECTED asset: {r.get('why')}")
+        return ok
+    except Exception as e:
+        logger.warning(f"relevance check failed (allowing): {e}")
+        return True
+
+
+def _boxes_area(boxes: list) -> float:
+    """Total normalized area covered by detected caption boxes (0-1)."""
+    tot = 0.0
+    for b in boxes or []:
+        try:
+            tot += max(0.0, float(b["w"])) * max(0.0, float(b["h"]))
+        except Exception:
+            continue
+    return tot
+
+
+def _pick_caption_y(boxes: list, est_h: float = 0.22) -> float:
+    """Choose a vertical position (as a fraction of H) for a NEW caption that does NOT
+    overlap the base video's existing burned-in captions. Tries lower-third, then top,
+    then mid. This is the fix for the double-caption clash."""
+    occ = []
+    for b in boxes or []:
+        try:
+            y = float(b["y"]); occ.append((y, y + float(b["h"])))
+        except Exception:
+            continue
+    def clear(y0):
+        y1 = y0 + est_h
+        return all(y1 <= a or y0 >= b for a, b in occ)
+    for cand in (0.66, 0.06, 0.40):
+        if clear(cand):
+            return cand
+    return 0.06  # top least likely to clash with the usual lower-third captions
+
+
 async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
         r = await c.get(url); r.raise_for_status(); data = r.content
@@ -244,9 +296,10 @@ def _ffmpeg(args, timeout: int = 600):
                    check=True, timeout=timeout,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-def _make_caption_png(text: str, W: int, H: int, out_path: str):
-    """Render a centered, wrapped lower-third caption (white text on a dark rounded
-    box) as a transparent PNG, so the new hook reads as the SAME ad."""
+def _make_caption_png(text: str, W: int, H: int, out_path: str, y_frac: float = 0.66):
+    """Render a centered, wrapped caption (white text on a dark rounded box) as a
+    transparent PNG. y_frac sets the vertical position so callers can place it clear
+    of the base video's existing captions."""
     from PIL import Image, ImageDraw, ImageFont
     text = (text or "").strip().upper()
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -272,7 +325,7 @@ def _make_caption_png(text: str, W: int, H: int, out_path: str):
     lines = lines[:3] or ["WATCH THIS"]
     line_h = int(fs * 1.3)
     total_h = line_h * len(lines)
-    y0 = int(H * 0.66)
+    y0 = int(H * max(0.04, min(y_frac, 0.80)))
     pad = int(fs * 0.45)
     box_w = max(d.textbbox((0, 0), l, font=font)[2] for l in lines) + pad * 2
     x0 = (W - box_w) // 2
@@ -479,11 +532,32 @@ async def recipe_avatar(req: RunRequest) -> list:
     url = await _poll_avatar(task_id)
     if not url:
         raise RuntimeError("avatar render timed out/failed")
+
+    # Remove the TikTok "AI-generated" watermark (bottom strip) so the clip is ad-usable:
+    # crop the bottom ~8% and scale back to the original frame size, then serve from our host.
+    final_url = url
+    try:
+        raw = await _download_to_temp(url)
+        try:
+            W, H = await asyncio.to_thread(_ffprobe_dims, raw)
+            keep_h = (int(H * 0.92) // 2) * 2  # even height for yuv420p
+            name, out_path, out_url = _out_url(req, "avatar")
+            await asyncio.to_thread(_ffmpeg,
+                ["-i", raw, "-vf", f"crop={W}:{keep_h}:0:0,scale={W}:{H}",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+                 "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=300)
+            final_url = out_url
+        finally:
+            try: os.remove(raw)
+            except OSError: pass
+    except Exception as e:
+        logger.warning(f"avatar watermark crop failed, serving raw: {e}")
+
     return [{
         "recipe": "Avatar/UGC (TikTok Symphony)",
-        "video_url": url,
+        "video_url": final_url,
         "confidence": 0.6,
-        "whats_changed": f"Net-new avatar ad. Script: {script[:140]}",
+        "whats_changed": f"Net-new avatar ad (watermark removed). Script: {script[:120]}",
     }]
 
 
@@ -634,34 +708,47 @@ async def recipe_hook_change(req: RunRequest) -> list:
                 src_label = f"clean {STATE_ABBR.get(state.upper(), state)} map"
                 is_winner = False
 
-        # else: format-matched PROVEN WINNER (auto-strip its captions)
+        # On-offer relevance basis: what is THIS ad actually selling?
+        offer_desc = (caption + " — " + transcript[:220]).strip()
+        cover_boxes = []
+
+        # else: format-matched PROVEN WINNER — must be ON-OFFER and reasonably caption-clean
+        # (reject loose-keyword mismatches AND winners too text-heavy to mask without smear).
         if not src_path:
           for wh in (req.context.get("winner_hooks") or []):
             if not wh.get("download_url"):
                 continue
             try:
-                src_path = await _download_to_temp(wh["download_url"])
-                src_label = f"your winner '{(wh.get('filename') or '')[:30]}' (roas {wh.get('roas')})"
-                is_winner = True
-                break
+                cand = await _download_to_temp(wh["download_url"])
             except Exception as e:
                 logger.warning(f"winner download failed: {e}")
+                continue
+            wframes = await asyncio.to_thread(_extract_frames, cand,
+                        [hook_end * 0.3, hook_end * 0.6, hook_end * 0.9], work)
+            if not await _asset_is_relevant(wframes, offer_desc):
+                continue
+            boxes = await _detect_caption_boxes(wframes)
+            if _boxes_area(boxes) > 0.16:   # too much burned text → masking would smear
+                logger.info("skipping winner: too caption-heavy to mask cleanly")
+                continue
+            src_path, src_label, is_winner, cover_boxes = cand, \
+                f"your winner '{(wh.get('filename') or '')[:30]}' (roas {wh.get('roas')})", True, boxes
+            break
+
+        # else: stock footage — also gated on relevance
         if not src_path:
             for q in queries:
                 c = await asyncio.to_thread(StockFootageService.get_broll, q,
                                             ("portrait" if H >= W else "landscape"), 30)
-                if c and c.get("local_path"):
-                    src_path, src_label, is_winner = c["local_path"], f"stock '{q}'", False
-                    break
+                if not (c and c.get("local_path")):
+                    continue
+                sframes = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
+                if not await _asset_is_relevant(sframes, offer_desc):
+                    continue
+                src_path, src_label, is_winner = c["local_path"], f"stock '{q}'", False
+                break
         if not src_path:
-            raise RuntimeError(f"no usable hook source (pexels_key={bool(settings.pexels_api_key)})")
-
-        # ── If reusing a winner, DETECT its burned captions (any position) so we can mask them ──
-        cover_boxes = []
-        if is_winner:
-            wframes = await asyncio.to_thread(_extract_frames, src_path,
-                        [hook_end * 0.3, hook_end * 0.6, hook_end * 0.9], work)
-            cover_boxes = await _detect_caption_boxes(wframes)
+            raise RuntimeError(f"no on-offer hook source found (relevance gate rejected all candidates)")
 
         # ── GENERATE: one clean caption + stitch (donor captions masked if reusing a winner) ──
         cap_png = os.path.join(work, "cap.png")
@@ -701,6 +788,7 @@ async def recipe_caption_change(req: RunRequest) -> list:
     work = tempfile.mkdtemp()
     try:
         W, H = await asyncio.to_thread(_ffprobe_dims, orig)
+        dur = await asyncio.to_thread(_ffprobe_duration, orig)
         transcript = await _transcribe_file(orig)
         hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
         cap = ""
@@ -712,8 +800,12 @@ async def recipe_caption_change(req: RunRequest) -> list:
         except Exception:
             pass
         cap = cap or "TAP TO LEARN MORE"
+        # caption-clash guard: place the new CTA clear of the ad's EXISTING burned captions
+        bframes = await asyncio.to_thread(_extract_frames, orig,
+                    [0.5, max(0.6, dur * 0.4), max(1.0, dur * 0.8)], work)
+        y_frac = _pick_caption_y(await _detect_caption_boxes(bframes))
         cap_png = os.path.join(work, "cta.png")
-        await asyncio.to_thread(_make_caption_png, cap, W, H, cap_png)
+        await asyncio.to_thread(_make_caption_png, cap, W, H, cap_png, y_frac=y_frac)
         name, out_path, url = _out_url(req, "caption")
         await asyncio.to_thread(_ffmpeg,
             ["-i", orig, "-i", cap_png, "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
@@ -806,13 +898,18 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                                f'Transcript:"{transcript[:900]}". Return JSON {{"queries":[".."],"caption":".."}}')
         queries = (d.get("queries") or []) + ["lifestyle", "city"]
         caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
+        offer_desc = (caption + " — " + transcript[:220]).strip()
         clip = None
         for q in queries:
             c = await asyncio.to_thread(StockFootageService.get_broll, q, ("portrait" if H >= W else "landscape"), 30)
-            if c and c.get("local_path"):
-                clip = c; break
+            if not (c and c.get("local_path")):
+                continue
+            sframes = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
+            if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
+                continue
+            clip = c; break
         if not clip:
-            raise RuntimeError(f"no stock footage (pexels_key={bool(settings.pexels_api_key)})")
+            raise RuntimeError("no on-offer stock footage found (relevance gate rejected all candidates)")
         cap_png = os.path.join(work, "cap.png")
         await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
         name, out_path, url = _out_url(req, "broll")
