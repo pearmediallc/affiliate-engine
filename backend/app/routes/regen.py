@@ -229,6 +229,7 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     Runway Gen-4). Used when no relevant winner or stock footage exists — so we GENERATE
     on-brand footage instead of failing or shipping junk. Returns a local mp4 path or None.
     Costs real generation credits (intentional)."""
+    _generate_clip.last_error = ""
     # turn the offer into a concrete, text-free, photorealistic scene prompt
     try:
         d = await _gemini_json(
@@ -245,6 +246,7 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
             prompt=prompt, shot_type=shot_type, duration=duration, s3_prefix="regen")
     except Exception as e:
         logger.warning(f"generative clip failed: {e}")
+        _generate_clip.last_error = f"{type(e).__name__}: {str(e)[:180]}"   # surfaced to the recipe
         return None
     if not result:
         return None
@@ -804,7 +806,8 @@ async def recipe_hook_change(req: RunRequest) -> list:
             if gen:
                 src_path, src_label, is_winner = gen, "an AI-generated on-offer clip (Veo/Higgsfield)", False
         if not src_path:
-            raise RuntimeError("no on-offer hook source (stock rejected + generation unavailable — check Higgsfield/Veo keys)")
+            raise RuntimeError("no on-offer hook source; generation failed: "
+                               + (getattr(_generate_clip, "last_error", "") or "no provider configured (set HIGGSFIELD_API_KEY[:secret] on the engine)"))
 
         # ── GENERATE: one clean caption + stitch (donor captions masked if reusing a winner) ──
         cap_png = os.path.join(work, "cap.png")
@@ -970,7 +973,8 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             if gen:
                 clip = {"local_path": gen, "id": "ai-generated (Veo/Higgsfield)"}
         if not clip:
-            raise RuntimeError("no on-offer footage and generation unavailable (check Higgsfield/Veo keys)")
+            raise RuntimeError("no on-offer footage; generation failed: "
+                               + (getattr(_generate_clip, "last_error", "") or "no provider configured (set HIGGSFIELD_API_KEY[:secret] on the engine)"))
         cap_png = os.path.join(work, "cap.png")
         await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
         name, out_path, url = _out_url(req, "broll")
