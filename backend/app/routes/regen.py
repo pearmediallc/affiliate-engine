@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from ..config import settings
 from ..services.tiktok_symphony import TikTokSymphonyService
 from ..services.stock_footage import StockFootageService
+from ..services.multi_provider_video import MultiProviderVideoService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -221,6 +222,55 @@ async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
     except Exception as e:
         logger.warning(f"relevance check failed (allowing): {e}")
         return True
+
+
+async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6) -> Optional[str]:
+    """Generate an ON-OFFER clip with the engine's generative stack (Veo 3.1 / Higgsfield /
+    Runway Gen-4). Used when no relevant winner or stock footage exists — so we GENERATE
+    on-brand footage instead of failing or shipping junk. Returns a local mp4 path or None.
+    Costs real generation credits (intentional)."""
+    # turn the offer into a concrete, text-free, photorealistic scene prompt
+    try:
+        d = await _gemini_json(
+            f'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
+            f'B-roll shot for this ad offer: "{offer_desc[:300]}". Concrete real-world scene with '
+            f'subtle camera motion; NO on-screen text, NO captions, photorealistic, vertical 9:16. '
+            f'Return JSON {{"prompt":"..."}}')
+        prompt = (d.get("prompt") or offer_desc)[:500]
+    except Exception:
+        prompt = offer_desc[:500]
+    try:
+        result = await asyncio.to_thread(
+            MultiProviderVideoService.generate,
+            prompt=prompt, shot_type=shot_type, duration=duration, s3_prefix="regen")
+    except Exception as e:
+        logger.warning(f"generative clip failed: {e}")
+        return None
+    if not result:
+        return None
+    # async path (Google Veo) → poll; sync providers (Higgsfield/Kie) return a local path
+    if result.get("async"):
+        from ..services.video_creator import VideoCreatorService
+        op = result.get("operation_name")
+        for _ in range(60):
+            await asyncio.sleep(8)
+            st = await asyncio.to_thread(VideoCreatorService.check_status, op)
+            if st.get("done"):
+                vp = st.get("video_path")
+                if vp and os.path.exists(vp):
+                    return vp
+                du = st.get("download_url")
+                return await _download_to_temp(du) if du and du.startswith("http") else None
+        return None
+    vp = result.get("video_path")
+    if vp and os.path.exists(vp):
+        return vp
+    du = result.get("download_url") or ""
+    if du.startswith("http"):
+        return await _download_to_temp(du)
+    if du.startswith("/"):
+        return await _download_to_temp(f"{AE_PUBLIC_URL}{du}")
+    return None
 
 
 def _boxes_area(boxes: list) -> float:
@@ -747,8 +797,14 @@ async def recipe_hook_change(req: RunRequest) -> list:
                     continue
                 src_path, src_label, is_winner = c["local_path"], f"stock '{q}'", False
                 break
+
+        # else: GENERATE an on-offer clip (Veo / Higgsfield / Runway) — never fail for footage
         if not src_path:
-            raise RuntimeError(f"no on-offer hook source found (relevance gate rejected all candidates)")
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1))
+            if gen:
+                src_path, src_label, is_winner = gen, "an AI-generated on-offer clip (Veo/Higgsfield)", False
+        if not src_path:
+            raise RuntimeError("no on-offer hook source (stock rejected + generation unavailable — check Higgsfield/Veo keys)")
 
         # ── GENERATE: one clean caption + stitch (donor captions masked if reusing a winner) ──
         cap_png = os.path.join(work, "cap.png")
@@ -908,8 +964,13 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
                 continue
             clip = c; break
+        # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway)
         if not clip:
-            raise RuntimeError("no on-offer stock footage found (relevance gate rejected all candidates)")
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=8)
+            if gen:
+                clip = {"local_path": gen, "id": "ai-generated (Veo/Higgsfield)"}
+        if not clip:
+            raise RuntimeError("no on-offer footage and generation unavailable (check Higgsfield/Veo keys)")
         cap_png = os.path.join(work, "cap.png")
         await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
         name, out_path, url = _out_url(req, "broll")
