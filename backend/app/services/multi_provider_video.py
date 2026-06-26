@@ -334,7 +334,7 @@ def _generate_higgsfield(
         }
     }
     rid = _higgsfield_submit(slug, payload, headers)
-    sd = _higgsfield_poll(rid, headers, timeout=600)
+    sd = _higgsfield_poll(rid, headers, timeout=900)   # DoP I2V can queue several minutes
     video_url = _higgsfield_extract_url(sd, prefer="video")
     if not video_url:                                  # output may live on the detail endpoint
         video_url = _higgsfield_extract_url(_higgsfield_result_detail(rid, headers), prefer="video")

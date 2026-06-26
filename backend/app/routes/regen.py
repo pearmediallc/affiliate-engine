@@ -972,7 +972,7 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             clip = c; break
         # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway)
         if not clip:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=8)
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5)
             if gen:
                 clip = {"local_path": gen, "id": "ai-generated (Veo/Higgsfield)"}
         if not clip:
