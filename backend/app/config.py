@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     pixabay_api_key: Optional[str] = None      # Pixabay free CC0 music
     pexels_api_key: Optional[str] = None       # Pexels free stock footage
 
+    # Voice cloning (ElevenLabs) — set ELEVENLABS_API_KEY to enable voiced script rewrites
+    elevenlabs_api_key: Optional[str] = None
+
     # AWS S3 — persistent storage for generated images/videos
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None

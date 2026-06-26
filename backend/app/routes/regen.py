@@ -665,37 +665,168 @@ async def recipe_hook_change(req: RunRequest) -> list:
         except Exception: pass
 
 
-async def recipe_passthrough(req: RunRequest, label: str) -> list:
-    return [{
-        "recipe": label,
-        "video_url": None,
-        "confidence": 0.5,
-        "whats_changed": f"{label} directive prepared: {json.dumps(req.directive)[:200]}",
-    }]
+def _out_url(req, kind):
+    name = f"regen_{kind}_{req.request_id[:8]}.mp4"
+    return name, os.path.join(UPLOAD_DIR, name), f"{AE_PUBLIC_URL}/api/v1/uploads/{name}"
+
+
+async def recipe_caption_change(req: RunRequest) -> list:
+    """Add/refresh a bold on-screen CTA caption over the original (drives CTR). Keeps
+    everything else; overlays one new caption band across the video."""
+    orig = await _download_to_temp(req.context.get("download_url", ""))
+    work = tempfile.mkdtemp()
+    try:
+        W, H = await asyncio.to_thread(_ffprobe_dims, orig)
+        transcript = await _transcribe_file(orig)
+        hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
+        cap = ""
+        try:
+            d = await _gemini_json(
+                f'Write ONE punchy on-screen CTA caption (4-7 words, imperative, drives the click) for this ad. '
+                f'{("Goal: " + hint) if hint else ""} Transcript: "{transcript[:900]}". Return JSON {{"caption":"..."}}')
+            cap = (d.get("caption") or "").strip()
+        except Exception:
+            pass
+        cap = cap or "TAP TO LEARN MORE"
+        cap_png = os.path.join(work, "cta.png")
+        await asyncio.to_thread(_make_caption_png, cap, W, H, cap_png)
+        name, out_path, url = _out_url(req, "caption")
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", orig, "-i", cap_png, "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
+             "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+             "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "copy", out_path], timeout=900)
+        return [{"recipe": "Caption Change Only", "video_url": url, "confidence": 0.7,
+                 "whats_changed": f'Added on-screen CTA caption "{cap}" over the original to lift CTR; everything else unchanged.'}]
+    finally:
+        for p in (orig,):
+            try: os.remove(p)
+            except OSError: pass
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
+async def recipe_reclean(req: RunRequest) -> list:
+    """Reclean / minor remaster: clean re-encode + light contrast/saturation lift +
+    audio loudness normalization. Same content, crisper delivery."""
+    orig = await _download_to_temp(req.context.get("download_url", ""))
+    try:
+        name, out_path, url = _out_url(req, "reclean")
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", orig, "-vf", "eq=contrast=1.06:saturation=1.08,unsharp=5:5:0.5",
+             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-pix_fmt", "yuv420p",
+             "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=900)
+        return [{"recipe": "Reclean/Minor Mod", "video_url": url, "confidence": 0.7,
+                 "whats_changed": "Remastered: light contrast/sharpness lift + normalized loudness. Content unchanged."}]
+    finally:
+        try: os.remove(orig)
+        except OSError: pass
+
+
+async def recipe_script_rewrite(req: RunRequest) -> list:
+    """Rewrite the script (Gemini) and re-voice it IN THE SPOKESPERSON'S VOICE via
+    ElevenLabs clone, then lay it over the original visuals. Best for VO/B-roll ads
+    (talking-head lip-sync won't match). Requires ELEVENLABS_API_KEY."""
+    from ..services.elevenlabs_service import ElevenLabsService
+    orig = await _download_to_temp(req.context.get("download_url", ""))
+    work = tempfile.mkdtemp()
+    voice_id = None
+    try:
+        transcript = await _transcribe_file(orig)
+        hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
+        d = await _gemini_json(
+            f'Rewrite this ad script to convert better WITHOUT losing the offer, claims, or core story. '
+            f'{("Focus: " + hint) if hint else ""} Keep it the same approximate length. '
+            f'Original: "{transcript[:1500]}". Return JSON {{"script":"..."}}')
+        new_script = (d.get("script") or "").strip()
+        if not new_script:
+            raise RuntimeError("script rewrite produced nothing")
+
+        if not ElevenLabsService.is_configured():
+            # Voiced rewrite needs the clone key; return the rewritten script so it's not lost.
+            return [{"recipe": "Script (rewrite)", "video_url": None, "confidence": 0.5,
+                     "whats_changed": "Rewrote the script (below). Voiced version needs ELEVENLABS_API_KEY set on the engine.\n\n" + new_script[:600]}]
+
+        # clone the spokesperson's voice from a sample of the original audio
+        sample = os.path.join(work, "sample.mp3")
+        await asyncio.to_thread(_ffmpeg, ["-i", orig, "-t", "45", "-vn", "-ac", "1", "-ar", "22050", "-b:a", "96k", sample])
+        voice_id = await asyncio.to_thread(ElevenLabsService.clone_voice, sample, f"regen-{req.request_id[:8]}")
+        vo = os.path.join(work, "vo.mp3")
+        await asyncio.to_thread(ElevenLabsService.tts, voice_id, new_script, vo)
+
+        name, out_path, url = _out_url(req, "script")
+        # lay the new VO over the original visuals; length = the new VO
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", orig, "-i", vo, "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-pix_fmt", "yuv420p",
+             "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=900)
+        return [{"recipe": "Script (rewrite, cloned voice)", "video_url": url, "confidence": 0.65,
+                 "whats_changed": "Rewrote the script + re-voiced it in the spokesperson's cloned voice over the original visuals."}]
+    finally:
+        try:
+            from ..services.elevenlabs_service import ElevenLabsService as _E
+            if voice_id: await asyncio.to_thread(_E.delete_voice, voice_id)
+        except Exception: pass
+        try: os.remove(orig)
+        except OSError: pass
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
+async def recipe_broll(req: RunRequest, label="Broll") -> list:
+    """Topic-matched stock B-roll clip + on-screen caption (net-new short)."""
+    orig = await _download_to_temp(req.context.get("download_url", ""))
+    work = tempfile.mkdtemp()
+    try:
+        W, H = await asyncio.to_thread(_ffprobe_dims, orig)
+        transcript = await _transcribe_file(orig)
+        d = await _gemini_json(f'From this transcript give 3 stock search terms + one 5-word caption. '
+                               f'Transcript:"{transcript[:900]}". Return JSON {{"queries":[".."],"caption":".."}}')
+        queries = (d.get("queries") or []) + ["lifestyle", "city"]
+        caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
+        clip = None
+        for q in queries:
+            c = await asyncio.to_thread(StockFootageService.get_broll, q, ("portrait" if H >= W else "landscape"), 30)
+            if c and c.get("local_path"):
+                clip = c; break
+        if not clip:
+            raise RuntimeError(f"no stock footage (pexels_key={bool(settings.pexels_api_key)})")
+        cap_png = os.path.join(work, "cap.png")
+        await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
+        name, out_path, url = _out_url(req, "broll")
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", clip["local_path"], "-i", orig, "-i", cap_png, "-filter_complex",
+             f"[0:v]trim=0:8,setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[v0];"
+             f"[v0][2:v]overlay=0:0[v];[1:a]atrim=0:8,asetpts=PTS-STARTPTS[a]",
+             "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+        return [{"recipe": label, "video_url": url, "confidence": 0.55,
+                 "whats_changed": f'{label}: topic-matched stock ("{clip.get("id","")}") + caption "{caption}" + original audio.'}]
+    finally:
+        try: os.remove(orig)
+        except OSError: pass
+        import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
 async def recipe_special(req: RunRequest) -> list:
-    """Special Request / unmapped: surface the interpreter's clarifications."""
+    """Special Request: route the interpreter's chosen recipe, else surface clarifications."""
+    chosen = (req.directive.get("chosen_variation_type") or "").strip()
     clar = req.directive.get("conflicts_or_clarifications") or []
-    return [{
-        "recipe": "Special Request",
-        "video_url": None,
-        "confidence": 0.4,
-        "whats_changed": ("Needs clarification: " + "; ".join(clar)) if clar
-                         else f"Custom recipe: {req.directive.get('recipe_steps')}",
-    }]
+    if chosen and chosen in _RECIPES and chosen != "Special Request":
+        return await _RECIPES[chosen](req)
+    return [{"recipe": "Special Request", "video_url": None, "confidence": 0.4,
+             "whats_changed": ("Needs clarification: " + "; ".join(clar)) if clar
+                              else f"Could not map to a recipe. Parsed: {req.directive.get('recipe_steps')}"}]
 
 
 _RECIPES = {
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,
     "Hook Change Only": recipe_hook_change,
-    "Caption Change Only": lambda r: recipe_passthrough(r, "Caption Change Only"),
-    "Reclean/Minor Mod": lambda r: recipe_passthrough(r, "Reclean/Minor Mod"),
-    "Script": lambda r: recipe_passthrough(r, "Script"),
-    "Broll": lambda r: recipe_passthrough(r, "Broll"),
-    "Stock Video": lambda r: recipe_passthrough(r, "Stock Video"),
-    "Image": lambda r: recipe_passthrough(r, "Image"),
-    "Image + Voiceover": lambda r: recipe_passthrough(r, "Image + Voiceover"),
+    "Caption Change Only": recipe_caption_change,
+    "Reclean/Minor Mod": recipe_reclean,
+    "Script": recipe_script_rewrite,
+    "Broll": recipe_broll,
+    "Stock Video": lambda r: recipe_broll(r, "Stock Video"),
+    "Image": lambda r: recipe_broll(r, "Image"),
+    "Image + Voiceover": lambda r: recipe_broll(r, "Image + Voiceover"),
     "Special Request": recipe_special,
 }
