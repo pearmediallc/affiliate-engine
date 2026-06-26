@@ -241,9 +241,12 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     except Exception:
         prompt = offer_desc[:500]
     try:
+        # pin Higgsfield (where the user keeps generation credits); falls back to the
+        # routing table if Higgsfield keys aren't configured.
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
-            prompt=prompt, shot_type=shot_type, duration=duration, s3_prefix="regen")
+            prompt=prompt, shot_type=shot_type, duration=duration,
+            preferred_model="higgsfield-v1", s3_prefix="regen")
     except Exception as e:
         logger.warning(f"generative clip failed: {e}")
         _generate_clip.last_error = f"{type(e).__name__}: {str(e)[:180]}"   # surfaced to the recipe

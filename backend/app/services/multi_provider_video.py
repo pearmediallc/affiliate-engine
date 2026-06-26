@@ -120,7 +120,11 @@ def _model_provider(model_id: str) -> str:
 
 def _pick_model(shot_type: str, preferred_model: Optional[str] = None) -> str:
     available = _available_keys()
-    # Routing table is authoritative — preferred_model from storyboard may be stale
+    # An explicit preferred_model wins IF its provider is actually configured — lets a
+    # caller pin a provider (e.g. regen pinning Higgsfield) instead of the default order.
+    if preferred_model and _model_provider(preferred_model) in available:
+        return preferred_model
+    # otherwise the routing table is authoritative
     candidates = list(_ROUTING.get(shot_type, _ROUTING["b_roll"]))
 
     for model_id in candidates:
