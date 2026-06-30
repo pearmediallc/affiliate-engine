@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # (https://metaadlibrary-media.s3.us-east-1.amazonaws.com). If unset, falls back to the
     # scraped video_url (Facebook CDN — works while fresh, but expires).
     winner_media_base: Optional[str] = None
+    # Option B: the engine presigns winner media keys from the scraper's private S3 bucket.
+    # winner_s3_* creds fall back to the engine's aws_* creds when unset (same account).
+    winner_s3_bucket: str = "ad-library-bucket"
+    winner_s3_region: Optional[str] = None
+    winner_s3_access_key_id: Optional[str] = None
+    winner_s3_secret_access_key: Optional[str] = None
     winner_library_url: Optional[str] = None
     winner_library_token: Optional[str] = None
 

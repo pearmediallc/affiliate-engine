@@ -27,11 +27,42 @@ _SQL = """
 """
 
 
+_s3_client = None
+
+def _get_s3():
+    """boto3 client for the scraper's winner-media bucket (Option B). Creds fall back to
+    the engine's own aws_* when winner_s3_* unset (same account)."""
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        _s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=settings.winner_s3_access_key_id or settings.aws_access_key_id,
+            aws_secret_access_key=settings.winner_s3_secret_access_key or settings.aws_secret_access_key,
+            region_name=settings.winner_s3_region or settings.aws_region,
+        )
+    return _s3_client
+
+
 def _durable_url(s3_key, fallback_url):
-    """Prefer the durable S3 copy ({winner_media_base}/{key}); else the scraped CDN url."""
-    base = (settings.winner_media_base or "").rstrip("/")
-    if base and s3_key:
-        return f"{base}/{s3_key.lstrip('/')}"
+    """Resolve a downloadable URL for a winner asset, in order:
+       1. presign the private S3 object (Option B — works for ad-library-bucket),
+       2. {winner_media_base}/{key} (CloudFront/public base, if configured),
+       3. the scraped CDN url (Facebook — works while fresh, expires)."""
+    if s3_key:
+        key = s3_key.lstrip("/")
+        # 1) presigned GET (1h — engine downloads immediately)
+        try:
+            return _get_s3().generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.winner_s3_bucket, "Key": key},
+                ExpiresIn=3600)
+        except Exception as e:
+            logger.warning(f"winner presign failed for {key}: {e}")
+        # 2) public/CloudFront base
+        base = (settings.winner_media_base or "").rstrip("/")
+        if base:
+            return f"{base}/{key}"
     return fallback_url
 
 
