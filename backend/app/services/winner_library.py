@@ -1,62 +1,70 @@
 """
-Winning Reference Library consumer.
+Winning Reference Library consumer — reads the adforge scraper Postgres DIRECTLY.
 
-Queries the Meta-ad-library scraper for competitor WINNERS by vertical, so the regen
-recipes can use a proven, real winning ad as a reference (highest-priority source, above
-stock and pure generation).
+Winners are NOT a separate table: they are `ads` JOIN `winning_ad_scores` where
+is_winner = TRUE, ranked by profitability_score. Schema (verified from the scraper ORM):
+  winning_ad_scores(ad_id FK->ads.id, is_winner bool, profitability_score float, hook text)
+  ads(id pk, vertical, video_url, image_url, s3_video_key)
 
-Contract (metaadlibrary): GET {WINNER_LIBRARY_URL}/api/winning/top?vertical=&angle=&limit=
-  Auth: Authorization: Bearer {WINNER_LIBRARY_TOKEN}
-  -> { "winning_ads": [ { "video_url", "image_url", "hook", "angle", "vertical",
-                          "profitability_score", ... } ] }
-
-Fully graceful: if not configured or unreachable, returns [] and the caller falls back
-to its existing sources. No behavior change until both env vars are set.
+Set WINNER_DB_URL to activate. Fully graceful: unconfigured / unreachable / empty -> [],
+and the caller falls back to its own winners, then stock, then generation. Read-only.
 """
 import logging
-import httpx
-
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+_SQL = """
+    SELECT a.video_url, a.image_url, a.vertical, w.profitability_score AS score, w.hook
+      FROM winning_ad_scores w
+      JOIN ads a ON a.id = w.ad_id
+     WHERE w.is_winner = TRUE
+       AND a.vertical IS NOT NULL
+       AND LOWER(a.vertical) = LOWER(%(vertical)s)
+     ORDER BY w.profitability_score DESC NULLS LAST
+     LIMIT %(limit)s
+"""
+
 
 def is_configured() -> bool:
-    return bool(settings.winner_library_url and settings.winner_library_token)
+    return bool(settings.winner_db_url)
 
 
-def fetch_winners(vertical: str, limit: int = 10, angle: str = "", media: str = "video") -> list:
+def fetch_winners(vertical: str, limit: int = 10, media: str = "video") -> list:
     """Return ranked winner reference dicts for a vertical (best profitability first).
-    Each dict: {url, hook, angle, vertical, score, media_type}. [] if unconfigured/empty."""
+    Each: {url, hook, vertical, score, media_type}. [] if unconfigured/empty/error."""
     if not is_configured() or not vertical or vertical == "unknown":
         return []
-    base = settings.winner_library_url.rstrip("/")
-    params = {"vertical": vertical, "limit": limit}
-    if angle:
-        params["angle"] = angle
+    import psycopg2
+    import psycopg2.extras
+    conn = None
     try:
-        r = httpx.get(f"{base}/api/winning/top", params=params,
-                      headers={"Authorization": f"Bearer {settings.winner_library_token}"},
-                      timeout=20)
-        r.raise_for_status()
-        ads = (r.json() or {}).get("winning_ads", []) or []
+        conn = psycopg2.connect(settings.winner_db_url, connect_timeout=6)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(_SQL, {"vertical": vertical, "limit": int(limit)})
+            rows = cur.fetchall()
     except Exception as e:
-        logger.warning(f"winner_library fetch failed ({vertical}): {e}")
+        logger.warning(f"winner_library DB query failed (vertical={vertical}): {e}")
         return []
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
     out = []
-    for a in ads:
-        url = a.get("video_url") if media == "video" else a.get("image_url")
-        url = url or a.get("video_url") or a.get("image_url")
+    for r in rows:
+        url = (r.get("video_url") if media == "video" else r.get("image_url")) \
+            or r.get("video_url") or r.get("image_url")
         if not url:
             continue
         out.append({
             "url": url,
-            "hook": a.get("hook") or "",
-            "angle": a.get("angle") or "",
-            "vertical": a.get("vertical") or vertical,
-            "score": a.get("profitability_score") or 0,
-            "media_type": "video" if a.get("video_url") else "image",
+            "hook": r.get("hook") or "",
+            "vertical": r.get("vertical") or vertical,
+            "score": r.get("score") or 0,
+            "media_type": "video" if r.get("video_url") else "image",
         })
     logger.info(f"winner_library: {len(out)} winners for vertical={vertical}")
     return out

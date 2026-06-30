@@ -785,7 +785,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
         from ..services import winner_library
         lib_winners = winner_library.fetch_winners(req.context.get("vertical", ""), limit=8)
         winner_candidates = (
-            [{"download_url": w["url"], "filename": f"library winner ({w.get('angle') or w.get('vertical')})",
+            [{"download_url": w["url"], "filename": f"library winner ({w.get('vertical')})",
               "roas": w.get("score")} for w in lib_winners]
             + (req.context.get("winner_hooks") or [])
         )
