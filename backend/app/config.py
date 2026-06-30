@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     pixabay_api_key: Optional[str] = None      # Pixabay free CC0 music
     pexels_api_key: Optional[str] = None       # Pexels free stock footage
 
+    # Winning Reference Library (the Meta-ad-library scraper) — competitor winners by vertical.
+    # Set both to activate; engine queries GET {url}/api/winning/top?vertical=&limit= with the token.
+    winner_library_url: Optional[str] = None
+    winner_library_token: Optional[str] = None
+
     # Voice cloning (ElevenLabs) — set ELEVENLABS_API_KEY to enable voiced script rewrites
     elevenlabs_api_key: Optional[str] = None
 

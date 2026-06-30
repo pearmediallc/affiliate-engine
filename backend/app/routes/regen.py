@@ -767,10 +767,18 @@ async def recipe_hook_change(req: RunRequest) -> list:
         offer_desc = (caption + " — " + transcript[:220]).strip()
         cover_boxes = []
 
-        # else: format-matched PROVEN WINNER — must be ON-OFFER and reasonably caption-clean
-        # (reject loose-keyword mismatches AND winners too text-heavy to mask without smear).
+        # PROVEN WINNERS — competitor winners from the scraper's Winning Reference Library
+        # (vertical-matched) take priority, then our own winner_hooks. Each must be ON-OFFER
+        # and reasonably caption-clean (reject mismatches + text-heavy winners that'd smear).
+        from ..services import winner_library
+        lib_winners = winner_library.fetch_winners(req.context.get("vertical", ""), limit=8)
+        winner_candidates = (
+            [{"download_url": w["url"], "filename": f"library winner ({w.get('angle') or w.get('vertical')})",
+              "roas": w.get("score")} for w in lib_winners]
+            + (req.context.get("winner_hooks") or [])
+        )
         if not src_path:
-          for wh in (req.context.get("winner_hooks") or []):
+          for wh in winner_candidates:
             if not wh.get("download_url"):
                 continue
             try:
