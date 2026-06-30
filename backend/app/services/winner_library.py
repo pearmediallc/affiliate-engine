@@ -15,7 +15,8 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 _SQL = """
-    SELECT a.video_url, a.image_url, a.vertical, w.profitability_score AS score, w.hook
+    SELECT a.video_url, a.image_url, a.s3_video_key, a.s3_image_key,
+           a.vertical, w.profitability_score AS score, w.hook
       FROM winning_ad_scores w
       JOIN ads a ON a.id = w.ad_id
      WHERE w.is_winner = TRUE
@@ -24,6 +25,14 @@ _SQL = """
      ORDER BY w.profitability_score DESC NULLS LAST
      LIMIT %(limit)s
 """
+
+
+def _durable_url(s3_key, fallback_url):
+    """Prefer the durable S3 copy ({winner_media_base}/{key}); else the scraped CDN url."""
+    base = (settings.winner_media_base or "").rstrip("/")
+    if base and s3_key:
+        return f"{base}/{s3_key.lstrip('/')}"
+    return fallback_url
 
 
 def is_configured() -> bool:
@@ -79,8 +88,10 @@ def fetch_winners(vertical: str, limit: int = 10, media: str = "video") -> list:
 
     out = []
     for r in rows:
-        url = (r.get("video_url") if media == "video" else r.get("image_url")) \
-            or r.get("video_url") or r.get("image_url")
+        # prefer durable S3 video, else durable S3 image, else scraped CDN urls
+        vid = _durable_url(r.get("s3_video_key"), r.get("video_url"))
+        img = _durable_url(r.get("s3_image_key"), r.get("image_url"))
+        url = (vid if media == "video" else img) or vid or img
         if not url:
             continue
         out.append({
@@ -88,7 +99,7 @@ def fetch_winners(vertical: str, limit: int = 10, media: str = "video") -> list:
             "hook": r.get("hook") or "",
             "vertical": r.get("vertical") or vertical,
             "score": r.get("score") or 0,
-            "media_type": "video" if r.get("video_url") else "image",
+            "media_type": "video" if (r.get("s3_video_key") or r.get("video_url")) else "image",
         })
     logger.info(f"winner_library: {len(out)} winners for vertical={vertical}")
     return out

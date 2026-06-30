@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # winning_ad_scores, computed not stored separately). Set winner_db_url to activate;
     # the engine reads it read-only by vertical. (HTTP fields kept for optional fallback.)
     winner_db_url: Optional[str] = None
+    # Base URL for the scraper's S3 media bucket (metaadlibrary-media) so the engine can
+    # download the DURABLE winner file by key: {winner_media_base}/{s3_video_key}.
+    # Set to the CloudFront domain (e.g. https://dxxxx.cloudfront.net) or the public S3 base
+    # (https://metaadlibrary-media.s3.us-east-1.amazonaws.com). If unset, falls back to the
+    # scraped video_url (Facebook CDN — works while fresh, but expires).
+    winner_media_base: Optional[str] = None
     winner_library_url: Optional[str] = None
     winner_library_token: Optional[str] = None
 
