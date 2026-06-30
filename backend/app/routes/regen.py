@@ -506,6 +506,14 @@ async def _gemini_json(prompt: str) -> dict:
     return json.loads(txt)
 
 
+@router.get("/winner-db-test")
+async def winner_db_test(vertical: str = "", _auth: bool = Depends(require_service_key)):
+    """Prove the Winning Reference Library (adforge Postgres) is reachable + has winners."""
+    from ..services import winner_library
+    vs = [vertical] if vertical else None
+    return {"success": True, **winner_library.health(vs)}
+
+
 @router.post("/interpret")
 async def interpret(req: InterpretRequest, _auth: bool = Depends(require_service_key)):
     try:

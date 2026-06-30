@@ -30,6 +30,30 @@ def is_configured() -> bool:
     return bool(settings.winner_db_url)
 
 
+def health(verticals: list = None) -> dict:
+    """Prove the connection live: returns {configured, connected, total_winners, by_vertical, error}."""
+    if not is_configured():
+        return {"configured": False, "connected": False, "error": "WINNER_DB_URL not set"}
+    verticals = verticals or ["home_insurance", "auto_insurance", "bizop", "refinance", "medicare"]
+    import psycopg2
+    conn = None
+    try:
+        conn = psycopg2.connect(settings.winner_db_url, connect_timeout=6)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM winning_ad_scores WHERE is_winner = TRUE")
+            total = cur.fetchone()[0]
+        by_v = {v: len(fetch_winners(v, limit=50)) for v in verticals}
+        return {"configured": True, "connected": True, "total_winners": total, "by_vertical": by_v}
+    except Exception as e:
+        return {"configured": True, "connected": False, "error": f"{type(e).__name__}: {str(e)[:160]}"}
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
 def fetch_winners(vertical: str, limit: int = 10, media: str = "video") -> list:
     """Return ranked winner reference dicts for a vertical (best profitability first).
     Each: {url, hook, vertical, score, media_type}. [] if unconfigured/empty/error."""
