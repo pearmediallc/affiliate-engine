@@ -112,7 +112,7 @@ def _model_provider(model_id: str) -> str:
     m = model_id.lower()
     if "veo" in m:
         return "google"
-    if "runway" in m:
+    if "runway" in m or "seedance" in m:
         return "kieai"
     if model_id in _HIGGSFIELD_I2V:
         return "higgsfield"
@@ -431,6 +431,7 @@ class MultiProviderVideoService:
         preferred_model: Optional[str] = None,
         image_path: Optional[str] = None,
         image_url: Optional[str] = None,
+        reference_video_urls: Optional[list] = None,  # Seedance: motion/style reference videos
         duration: int = 6,
         s3_prefix: Optional[str] = None,
     ) -> dict:
@@ -443,6 +444,13 @@ class MultiProviderVideoService:
             return _generate_veo(prompt, image_path, duration, fast=fast)
 
         if provider == "kieai":
+            if "seedance" in model_id:
+                from .kieai_service import KieAIService
+                refs_img = [image_url] if image_url else None
+                refs_vid = reference_video_urls or None
+                res = KieAIService.generate_video_seedance(
+                    prompt, image_urls=refs_img, video_urls=refs_vid, duration=duration)
+                return {**res, "download_url": _persist_video(res["video_path"], res["video_filename"], s3_prefix=s3_prefix)}
             if "runway" in model_id:
                 return _generate_kieai_runway(prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
             fast = "fast" in model_id

@@ -224,7 +224,7 @@ async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
         return True
 
 
-async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6) -> Optional[str]:
+async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6, model: Optional[str] = None) -> Optional[str]:
     """Generate an ON-OFFER clip with the engine's generative stack (Veo 3.1 / Higgsfield /
     Runway Gen-4). Used when no relevant winner or stock footage exists — so we GENERATE
     on-brand footage instead of failing or shipping junk. Returns a local mp4 path or None.
@@ -241,12 +241,12 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     except Exception:
         prompt = offer_desc[:500]
     try:
-        # pin Higgsfield (where the user keeps generation credits); falls back to the
-        # routing table if Higgsfield keys aren't configured.
+        # Use the user-chosen model if provided; else pin Higgsfield (where credits live).
+        # Both fall back to the routing table if that provider's keys aren't configured.
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
             prompt=prompt, shot_type=shot_type, duration=duration,
-            preferred_model="higgsfield-v1", s3_prefix="regen")
+            preferred_model=(model or "higgsfield-v1"), s3_prefix="regen")
     except Exception as e:
         logger.warning(f"generative clip failed: {e}")
         _generate_clip.last_error = f"{type(e).__name__}: {str(e)[:180]}"   # surfaced to the recipe
@@ -421,6 +421,9 @@ class RunRequest(BaseModel):
     directive: dict = {}
     preserve: list = []
     variant_count: int = 3
+    model: Optional[str] = None      # user-chosen generation model (overrides default routing)
+    phase: Optional[str] = None
+    node: Optional[str] = None
     callback_url: Optional[str] = None
     active_url: Optional[str] = None
 
@@ -813,7 +816,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
 
         # else: GENERATE an on-offer clip (Veo / Higgsfield / Runway) — never fail for footage
         if not src_path:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1))
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1), model=req.model)
             if gen:
                 src_path, src_label, is_winner = gen, "an AI-generated on-offer clip (Veo/Higgsfield)", False
         if not src_path:
@@ -983,7 +986,7 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                 clip = c; break
         # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway)
         if not clip:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5)
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5, model=req.model)
             if gen:
                 clip = {"local_path": gen, "id": "ai-generated (Veo/Higgsfield)"}
         if not clip:
