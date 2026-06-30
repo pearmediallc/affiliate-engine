@@ -224,29 +224,38 @@ async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
         return True
 
 
-async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6, model: Optional[str] = None) -> Optional[str]:
+async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6,
+                         model: Optional[str] = None, reference_video_urls: Optional[list] = None) -> Optional[str]:
     """Generate an ON-OFFER clip with the engine's generative stack (Veo 3.1 / Higgsfield /
-    Runway Gen-4). Used when no relevant winner or stock footage exists — so we GENERATE
-    on-brand footage instead of failing or shipping junk. Returns a local mp4 path or None.
-    Costs real generation credits (intentional)."""
+    Runway / Seedance). When a winning reference VIDEO is supplied AND a reference-capable
+    model (Seedance) is chosen, the winner's motion/style guides the generation. Returns a
+    local mp4 path or None. Costs real generation credits (intentional)."""
     _generate_clip.last_error = ""
-    # turn the offer into a concrete, text-free, photorealistic scene prompt
+    seedance = bool(model and "seedance" in model.lower())
+    # turn the offer into a concrete, text-free, photorealistic scene prompt.
+    # For Seedance with a reference video, instruct it to follow @Video1's motion/pacing.
     try:
+        extra = (' The result must follow the motion, pacing and style of @Video1.'
+                 if (seedance and reference_video_urls) else '')
         d = await _gemini_json(
             f'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
             f'B-roll shot for this ad offer: "{offer_desc[:300]}". Concrete real-world scene with '
-            f'subtle camera motion; NO on-screen text, NO captions, photorealistic, vertical 9:16. '
-            f'Return JSON {{"prompt":"..."}}')
+            f'subtle camera motion; NO on-screen text, NO captions, photorealistic, vertical 9:16.'
+            + extra + ' Return JSON {"prompt":"..."}')
         prompt = (d.get("prompt") or offer_desc)[:500]
     except Exception:
         prompt = offer_desc[:500]
+    if seedance and reference_video_urls:
+        prompt += " @Video1"
     try:
         # Use the user-chosen model if provided; else pin Higgsfield (where credits live).
         # Both fall back to the routing table if that provider's keys aren't configured.
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
             prompt=prompt, shot_type=shot_type, duration=duration,
-            preferred_model=(model or "higgsfield-v1"), s3_prefix="regen")
+            preferred_model=(model or "higgsfield-v1"),
+            reference_video_urls=(reference_video_urls if seedance else None),
+            s3_prefix="regen")
     except Exception as e:
         logger.warning(f"generative clip failed: {e}")
         _generate_clip.last_error = f"{type(e).__name__}: {str(e)[:180]}"   # surfaced to the recipe
@@ -816,7 +825,9 @@ async def recipe_hook_change(req: RunRequest) -> list:
 
         # else: GENERATE an on-offer clip (Veo / Higgsfield / Runway) — never fail for footage
         if not src_path:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1), model=req.model)
+            ref_vids = [lib_winners[0]["url"]] if lib_winners else None  # Seedance motion ref
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1),
+                                       model=req.model, reference_video_urls=ref_vids)
             if gen:
                 src_path, src_label, is_winner = gen, "an AI-generated on-offer clip (Veo/Higgsfield)", False
         if not src_path:
@@ -984,11 +995,16 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                 if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
                     continue
                 clip = c; break
-        # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway)
+        # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway / Seedance).
+        # Pass a vertical-matched winner video as the Seedance motion reference if available.
         if not clip:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5, model=req.model)
+            from ..services import winner_library
+            _lw = winner_library.fetch_winners(req.context.get("vertical", ""), limit=1)
+            ref_vids = [_lw[0]["url"]] if _lw else None
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5,
+                                       model=req.model, reference_video_urls=ref_vids)
             if gen:
-                clip = {"local_path": gen, "id": "ai-generated (Veo/Higgsfield)"}
+                clip = {"local_path": gen, "id": "ai-generated"}
         if not clip:
             raise RuntimeError("no on-offer footage; generation failed: "
                                + (getattr(_generate_clip, "last_error", "") or "no provider configured (set HIGGSFIELD_API_KEY[:secret] on the engine)"))
