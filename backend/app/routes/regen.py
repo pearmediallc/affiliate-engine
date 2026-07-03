@@ -57,6 +57,23 @@ def _extract_frames(video: str, times: list, outdir: str) -> list:
     return paths
 
 
+def _frame_to_public_url(video_path: str, t: float = 1.0) -> Optional[str]:
+    """Extract one frame and serve it from the engine's public /uploads so a generation
+    provider (Kie/Seedance) can fetch it as an @Image1 identity reference. Returns URL or None."""
+    try:
+        import uuid as _uuid
+        name = f"ref_{_uuid.uuid4().hex[:8]}.jpg"
+        out = os.path.join(UPLOAD_DIR, name)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", video_path,
+                        "-frames:v", "1", "-vf", "scale=720:-1", out],
+                       check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if os.path.isfile(out):
+            return f"{AE_PUBLIC_URL}/api/v1/uploads/{name}"
+    except Exception as e:
+        logger.warning(f"_frame_to_public_url failed: {e}")
+    return None
+
+
 async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
     """Send frames + a prompt to Gemini and get back STRICT JSON."""
     if not settings.gemini_api_key:
@@ -225,36 +242,56 @@ async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
 
 
 async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6,
-                         model: Optional[str] = None, reference_video_urls: Optional[list] = None) -> Optional[str]:
-    """Generate an ON-OFFER clip with the engine's generative stack (Veo 3.1 / Higgsfield /
-    Runway / Seedance). When a winning reference VIDEO is supplied AND a reference-capable
-    model (Seedance) is chosen, the winner's motion/style guides the generation. Returns a
-    local mp4 path or None. Costs real generation credits (intentional)."""
+                         model: Optional[str] = None, reference_video_urls: Optional[list] = None,
+                         reference_image_urls: Optional[list] = None, winner_hook: Optional[str] = None,
+                         vertical: Optional[str] = None) -> Optional[str]:
+    """Generate a CONVERSION-FIRST clip.
+
+    WINNER-CLONE mode (preferred, when a winning reference VIDEO is supplied): recreate a
+    proven winning ad's hook/pacing/structure for THIS offer, keeping the real spokesperson/
+    product (@Image1). This is what a media buyer actually does — clone a winner, swap the
+    offer/person — not "generate a nice scene". Requires Seedance (reference-to-video).
+
+    SCENE mode (last-resort fallback, no winner): a plain on-offer B-roll scene.
+    Returns a local mp4 path or None. Costs real generation credits (intentional)."""
     _generate_clip.last_error = ""
+    cloning = bool(reference_video_urls)
+    # cloning needs a reference-capable model → force Seedance unless the user picked one
+    if cloning and not model:
+        model = "seedance-2"
     seedance = bool(model and "seedance" in model.lower())
-    # turn the offer into a concrete, text-free, photorealistic scene prompt.
-    # For Seedance with a reference video, instruct it to follow @Video1's motion/pacing.
     try:
-        extra = (' The result must follow the motion, pacing and style of @Video1.'
-                 if (seedance and reference_video_urls) else '')
-        d = await _gemini_json(
-            f'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
-            f'B-roll shot for this ad offer: "{offer_desc[:300]}". Concrete real-world scene with '
-            f'subtle camera motion; NO on-screen text, NO captions, photorealistic, vertical 9:16.'
-            + extra + ' Return JSON {"prompt":"..."}')
-        prompt = (d.get("prompt") or offer_desc)[:500]
+        if cloning:
+            ask = (
+                'Write ONE direct-response video generation prompt that RECREATES the proven '
+                'winning ad shown in @Video1 — its hook, pacing and shot structure — but for THIS '
+                f'offer: "{offer_desc[:300]}". '
+                + ('Keep the SAME real spokesperson/product shown in @Image1 (preserve identity, face, product). '
+                   if reference_image_urls else '')
+                + (f'Preserve this winning hook angle: "{winner_hook[:120]}". ' if winner_hook else '')
+                + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. NO on-screen captions '
+                'or text (added later). Photorealistic, native-UGC feel. Return JSON {"prompt":"..."}')
+        else:
+            ask = (
+                'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
+                f'B-roll shot for this ad offer: "{offer_desc[:300]}". Concrete real-world scene with '
+                'subtle camera motion; NO on-screen text, photorealistic, vertical 9:16. '
+                'Return JSON {"prompt":"..."}')
+        d = await _gemini_json(ask)
+        prompt = (d.get("prompt") or offer_desc)[:1000]
     except Exception:
         prompt = offer_desc[:500]
     if seedance and reference_video_urls:
         prompt += " @Video1"
+        if reference_image_urls:
+            prompt += " @Image1"
     try:
-        # Use the user-chosen model if provided; else pin Higgsfield (where credits live).
-        # Both fall back to the routing table if that provider's keys aren't configured.
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
             prompt=prompt, shot_type=shot_type, duration=duration,
             preferred_model=(model or "higgsfield-v1"),
             reference_video_urls=(reference_video_urls if seedance else None),
+            reference_image_urls=(reference_image_urls if seedance else None),
             s3_prefix="regen")
     except Exception as e:
         logger.warning(f"generative clip failed: {e}")
@@ -787,18 +824,29 @@ async def recipe_hook_change(req: RunRequest) -> list:
         offer_desc = (caption + " — " + transcript[:220]).strip()
         cover_boxes = []
 
-        # PROVEN WINNERS — competitor winners from the scraper's Winning Reference Library
-        # (vertical-matched) take priority, then our own winner_hooks. Each must be ON-OFFER
-        # and reasonably caption-clean (reject mismatches + text-heavy winners that'd smear).
         from ..services import winner_library
         lib_winners = winner_library.fetch_winners(req.context.get("vertical", ""), limit=8)
-        winner_candidates = (
-            [{"download_url": w["url"], "filename": f"library winner ({w.get('vertical')})",
-              "roas": w.get("score")} for w in lib_winners]
-            + (req.context.get("winner_hooks") or [])
-        )
+
+        # ── PRIMARY: WINNER-CLONE (conversion-first) ──────────────────────────
+        # Recreate a proven competitor winner's hook/pacing for THIS offer while KEEPING the
+        # real spokesperson (Seedance @Video1=winner + @Image1=this creative's person). This is
+        # what a media buyer does — clone a winner, swap offer/person — not "generate a scene".
+        if not src_path and lib_winners:
+            person_url = _frame_to_public_url(orig, min(1.5, (dur or 3) * 0.3))
+            clip = await _generate_clip(
+                offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1),
+                model=(req.model or "seedance-2"),
+                reference_video_urls=[lib_winners[0]["url"]],
+                reference_image_urls=([person_url] if person_url else None),
+                winner_hook=lib_winners[0].get("hook"), vertical=req.context.get("vertical"))
+            if clip:
+                src_path, src_label, is_winner = clip, (
+                    f"winner-clone of a top {req.context.get('vertical','')} ad "
+                    f"(Seedance; your spokesperson kept)"), False
+
+        # ── else: your OWN proven winner (same editor) — direct transplant, caption-masked ──
         if not src_path:
-          for wh in winner_candidates:
+          for wh in (req.context.get("winner_hooks") or []):
             if not wh.get("download_url"):
                 continue
             try:
@@ -811,14 +859,13 @@ async def recipe_hook_change(req: RunRequest) -> list:
             if not await _asset_is_relevant(wframes, offer_desc):
                 continue
             boxes = await _detect_caption_boxes(wframes)
-            if _boxes_area(boxes) > 0.16:   # too much burned text → masking would smear
-                logger.info("skipping winner: too caption-heavy to mask cleanly")
+            if _boxes_area(boxes) > 0.16:
                 continue
             src_path, src_label, is_winner, cover_boxes = cand, \
                 f"your winner '{(wh.get('filename') or '')[:30]}' (roas {wh.get('roas')})", True, boxes
             break
 
-        # else: stock footage — also gated on relevance
+        # else: stock footage — LAST resort, relevance-gated
         if not src_path:
             for q in queries:
                 c = await asyncio.to_thread(StockFootageService.get_broll, q,
@@ -991,26 +1038,35 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         queries = (d.get("queries") or []) + ["lifestyle", "city"]
         caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
         offer_desc = (caption + " — " + transcript[:220]).strip()
-        # force_generate skips stock and goes straight to AI generation (Higgsfield/Veo)
-        force_gen = bool((req.directive or {}).get("force_generate"))
         clip = None
-        if not force_gen:
+        from ..services import winner_library
+        _lw = winner_library.fetch_winners(req.context.get("vertical", ""), limit=1)
+
+        # ── PRIMARY: winner-clone (conversion-first) ──────────────────────────
+        if _lw:
+            person_url = _frame_to_public_url(orig, 1.0)
+            gen = await _generate_clip(
+                offer_desc, shot_type="b_roll", duration=6, model=(req.model or "seedance-2"),
+                reference_video_urls=[_lw[0]["url"]],
+                reference_image_urls=([person_url] if person_url else None),
+                winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))
+            if gen:
+                clip = {"local_path": gen, "id": "winner-clone (Seedance)"}
+
+        # ── else: relevant stock (last resort) ────────────────────────────────
+        if not clip:
             for q in queries:
                 c = await asyncio.to_thread(StockFootageService.get_broll, q, ("portrait" if H >= W else "landscape"), 30)
                 if not (c and c.get("local_path")):
                     continue
                 sframes = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
-                if not await _asset_is_relevant(sframes, offer_desc):   # reject off-offer stock
+                if not await _asset_is_relevant(sframes, offer_desc):
                     continue
                 clip = c; break
-        # else: GENERATE an on-offer b-roll clip (Veo / Higgsfield / Runway / Seedance).
-        # Pass a vertical-matched winner video as the Seedance motion reference if available.
+
+        # ── else: plain AI generation (no winner) ─────────────────────────────
         if not clip:
-            from ..services import winner_library
-            _lw = winner_library.fetch_winners(req.context.get("vertical", ""), limit=1)
-            ref_vids = [_lw[0]["url"]] if _lw else None
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=5,
-                                       model=req.model, reference_video_urls=ref_vids)
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=6, model=req.model)
             if gen:
                 clip = {"local_path": gen, "id": "ai-generated"}
         if not clip:

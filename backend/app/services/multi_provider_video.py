@@ -431,7 +431,8 @@ class MultiProviderVideoService:
         preferred_model: Optional[str] = None,
         image_path: Optional[str] = None,
         image_url: Optional[str] = None,
-        reference_video_urls: Optional[list] = None,  # Seedance: motion/style reference videos
+        reference_video_urls: Optional[list] = None,   # Seedance: motion/style reference videos
+        reference_image_urls: Optional[list] = None,    # Seedance: identity refs (person/product)
         duration: int = 6,
         s3_prefix: Optional[str] = None,
     ) -> dict:
@@ -446,7 +447,7 @@ class MultiProviderVideoService:
         if provider == "kieai":
             if "seedance" in model_id:
                 from .kieai_service import KieAIService
-                refs_img = [image_url] if image_url else None
+                refs_img = reference_image_urls or ([image_url] if image_url else None)
                 refs_vid = reference_video_urls or None
                 res = KieAIService.generate_video_seedance(
                     prompt, reference_image_urls=refs_img, reference_video_urls=refs_vid,
