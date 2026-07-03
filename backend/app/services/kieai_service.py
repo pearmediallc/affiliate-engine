@@ -67,8 +67,8 @@ def _poll(endpoint: str, task_id: str, timeout: int = 300) -> dict:
         status = (inner.get("status") or inner.get("state") or "").lower()
         if success_flag == 1 or status in ("completed", "succeeded", "success", "done"):
             return inner
-        if success_flag in (2, 3) or status in ("failed", "error", "canceled"):
-            raise RuntimeError(f"Kie.ai task failed: {inner.get('errorMessage') or inner.get('message') or inner}")
+        if success_flag in (2, 3) or status in ("failed", "fail", "error", "canceled"):
+            raise RuntimeError(f"Kie.ai task failed: {inner.get('failMsg') or inner.get('errorMessage') or inner.get('message') or inner}")
     raise TimeoutError(f"Kie.ai task {task_id} timed out after {timeout}s")
 
 
@@ -335,24 +335,36 @@ class KieAIService:
     @staticmethod
     def generate_video_seedance(
         prompt: str,
-        image_urls: Optional[list] = None,
-        video_urls: Optional[list] = None,
+        reference_image_urls: Optional[list] = None,
+        reference_video_urls: Optional[list] = None,
+        reference_audio_urls: Optional[list] = None,
         duration: int = 8,
         resolution: str = "720p",
         aspect_ratio: str = "9:16",
+        generate_audio: bool = True,
         model: str = "bytedance/seedance-2",
     ) -> dict:
-        """Generate via ByteDance Seedance 2.0 on Kie.ai's universal Market createTask.
-        Reference assets are passed as image_urls/video_urls and @-mentioned in the prompt
-        (e.g. 'the person from @Image1 ...'). Returns {video_path, model_id, provider}."""
+        """Generate via ByteDance Seedance 2.0 on Kie.ai (POST /api/v1/jobs/createTask →
+        poll /api/v1/jobs/recordInfo). Field names match the Kie Seedance API EXACTLY:
+        reference_image_urls / reference_video_urls / reference_audio_urls. References are
+        @-mentioned in the prompt (e.g. 'the person from @Image1 does @Video1's motion')."""
         if not settings.kie_api_key:
             raise ValueError("KIE_API_KEY not configured")
-        inp = {"prompt": prompt, "duration": duration,
-               "resolution": resolution, "aspect_ratio": aspect_ratio}
-        if image_urls:
-            inp["image_urls"] = image_urls
-        if video_urls:
-            inp["video_urls"] = video_urls
+        inp = {
+            "prompt": prompt,
+            "duration": int(duration),
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": bool(generate_audio),
+            "nsfw_checker": False,   # ad content — avoid false-positive blocks
+        }
+        if reference_image_urls:
+            inp["reference_image_urls"] = reference_image_urls
+        if reference_video_urls:
+            inp["reference_video_urls"] = reference_video_urls
+        if reference_audio_urls:
+            inp["reference_audio_urls"] = reference_audio_urls
+
         r = httpx.post(f"{_BASE}/api/v1/jobs/createTask", headers=_headers(),
                        json={"model": model, "input": inp}, timeout=30)
         r.raise_for_status()
@@ -360,24 +372,23 @@ class KieAIService:
         logger.debug(f"Kie.ai seedance createTask response: {data}")
         task_id = _extract_task_id(data)
         if not task_id:
-            raise RuntimeError(f"No task_id in Kie.ai Seedance response: {data}")
+            raise RuntimeError(f"No taskId in Kie.ai Seedance response: {data}")
 
+        # state: waiting -> success/fail ; result in resultJson (JSON string) -> resultUrls[]
         result = _poll("/api/v1/jobs/recordInfo", task_id, timeout=900)
-        response_data = result.get("response") or result.get("resultJson") or {}
-        if isinstance(response_data, str):
+        rj = result.get("resultJson")
+        parsed = {}
+        if isinstance(rj, str) and rj:
             try:
                 import json as _json
-                response_data = _json.loads(response_data)
+                parsed = _json.loads(rj)
             except Exception:
-                response_data = {}
-        video_url = (
-            result.get("videoUrl") or result.get("video_url")
-            or response_data.get("videoUrl")
-            or (response_data.get("resultUrls") or [None])[0]
-            or (response_data.get("video_urls") or [None])[0]
-        )
+                parsed = {}
+        elif isinstance(rj, dict):
+            parsed = rj
+        video_url = (parsed.get("resultUrls") or [None])[0] or parsed.get("videoUrl")
         if not video_url:
-            raise RuntimeError(f"No video_url in Kie.ai Seedance result: {result}")
+            raise RuntimeError(f"No resultUrls in Kie.ai Seedance result: {result}")
 
         filename = f"seedance_{uuid.uuid4().hex[:8]}.mp4"
         local_path = _download(video_url, filename)

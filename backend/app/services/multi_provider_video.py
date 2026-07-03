@@ -449,7 +449,8 @@ class MultiProviderVideoService:
                 refs_img = [image_url] if image_url else None
                 refs_vid = reference_video_urls or None
                 res = KieAIService.generate_video_seedance(
-                    prompt, image_urls=refs_img, video_urls=refs_vid, duration=duration)
+                    prompt, reference_image_urls=refs_img, reference_video_urls=refs_vid,
+                    duration=duration, aspect_ratio="9:16")
                 return {**res, "download_url": _persist_video(res["video_path"], res["video_filename"], s3_prefix=s3_prefix)}
             if "runway" in model_id:
                 return _generate_kieai_runway(prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
