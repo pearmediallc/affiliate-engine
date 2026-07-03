@@ -22,7 +22,7 @@ import subprocess
 from typing import Optional, Any
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Depends
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Depends, File, Form, UploadFile
 from pydantic import BaseModel
 
 from ..config import settings
@@ -541,6 +541,65 @@ async def _gemini_json(prompt: str) -> dict:
         data = r.json()
     txt = data["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(txt)
+
+
+@router.post("/seedance-test")
+async def seedance_test(
+    prompt: str = Form(...),
+    resolution: str = Form("480p"),
+    aspect_ratio: str = Form("9:16"),
+    duration: int = Form(8),
+    generate_audio: bool = Form(True),
+    images: list[UploadFile] = File(default=[]),
+    reference_video_url: str = Form(""),
+    _auth: bool = Depends(require_service_key),
+):
+    """ISOLATED pure-Seedance test — no recipe, no stitch. Saves uploaded reference images to
+    the public /uploads dir, then calls Kie Seedance exactly per the docs. Returns the taskId;
+    poll GET /seedance-test/{taskId} for the raw result URL."""
+    import uuid as _uuid
+    ref_img_urls = []
+    for up in (images or []):
+        ext = os.path.splitext(up.filename or "")[1].lower() or ".png"
+        name = f"seedref_{_uuid.uuid4().hex[:8]}{ext}"
+        dest = os.path.join(UPLOAD_DIR, name)
+        with open(dest, "wb") as f:
+            f.write(await up.read())
+        ref_img_urls.append(f"{AE_PUBLIC_URL}/api/v1/uploads/{name}")
+
+    inp = {
+        "prompt": prompt, "duration": int(duration), "resolution": resolution,
+        "aspect_ratio": aspect_ratio, "generate_audio": bool(generate_audio), "nsfw_checker": False,
+    }
+    if ref_img_urls:
+        inp["reference_image_urls"] = ref_img_urls
+    if reference_video_url:
+        inp["reference_video_urls"] = [reference_video_url]
+
+    r = httpx.post("https://api.kie.ai/api/v1/jobs/createTask",
+                   headers={"Authorization": f"Bearer {settings.kie_api_key}", "Content-Type": "application/json"},
+                   json={"model": "bytedance/seedance-2", "input": inp}, timeout=30)
+    body = r.json()
+    task_id = (body.get("data") or {}).get("taskId")
+    return {"success": bool(task_id), "taskId": task_id, "reference_image_urls": ref_img_urls,
+            "sent_input": inp, "raw": body}
+
+
+@router.get("/seedance-test/{task_id}")
+async def seedance_test_status(task_id: str, _auth: bool = Depends(require_service_key)):
+    """Poll the pure-Seedance test task; returns state + raw resultUrl when done."""
+    r = httpx.get("https://api.kie.ai/api/v1/jobs/recordInfo", params={"taskId": task_id},
+                  headers={"Authorization": f"Bearer {settings.kie_api_key}"}, timeout=20)
+    d = (r.json() or {}).get("data") or {}
+    result_url = None
+    rj = d.get("resultJson")
+    if isinstance(rj, str) and rj:
+        try:
+            result_url = (json.loads(rj).get("resultUrls") or [None])[0]
+        except Exception:
+            pass
+    return {"success": True, "state": d.get("state"), "result_url": result_url,
+            "failMsg": d.get("failMsg"), "costTime": d.get("costTime")}
 
 
 @router.get("/winner-db-test")
