@@ -960,25 +960,13 @@ async def recipe_hook_change(req: RunRequest) -> list:
         from ..services import winner_library
         lib_winners = winner_library.fetch_winners(req.context.get("vertical", ""), limit=8)
 
-        # ── PRIMARY: WINNER-CLONE (conversion-first) ──────────────────────────
-        # Recreate a proven competitor winner's hook/pacing for THIS offer while KEEPING the
-        # real spokesperson (Seedance @Video1=winner + @Image1=this creative's person). This is
-        # what a media buyer does — clone a winner, swap offer/person — not "generate a scene".
-        if not src_path and lib_winners:
-            ref_imgs = await _select_references(orig, work, offer_desc)          # person + product from loser
-            winner_clip = await _prep_winner_clip(lib_winners[0]["url"], work)   # trimmed proven winner
-            clip = await _generate_clip(
-                offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1),
-                model=(req.model or "seedance-2"),
-                reference_video_urls=[winner_clip],
-                reference_image_urls=(ref_imgs or None),
-                winner_hook=lib_winners[0].get("hook"), vertical=req.context.get("vertical"))
-            if clip:
-                src_path, src_label, is_winner = clip, (
-                    f"winner-clone of a top {req.context.get('vertical','')} ad "
-                    f"(Seedance; {len(ref_imgs)} refs auto-selected from your creative)"), False
+        # NOTE: Hook Change is a SURGICAL VISUAL swap that keeps the original AUDIO for the
+        # hook seconds — so the new opening must be a NON-talking visual (map/b-roll/stock),
+        # NOT a talking-head. A full talking winner-clone (its own voice) belongs in the
+        # "Winner Clone" (Broll) lane, where it's used as a self-contained ad. So we do NOT
+        # inject a Seedance talking-head here (that caused voice/caption/audio mismatch).
 
-        # ── else: your OWN proven winner (same editor) — direct transplant, caption-masked ──
+        # ── your OWN proven winner (same editor) — direct transplant, caption-masked ──
         if not src_path:
           for wh in (req.context.get("winner_hooks") or []):
             if not wh.get("download_url"):
@@ -1207,9 +1195,46 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         if not clip:
             raise RuntimeError("no on-offer footage; generation failed: "
                                + (getattr(_generate_clip, "last_error", "") or "no provider configured (set HIGGSFIELD_API_KEY[:secret] on the engine)"))
+        name, out_path, url = _out_url(req, "broll")
+        is_clone = str(clip.get("id", "")).startswith("winner-clone")
+
+        if is_clone:
+            # SELF-CONTAINED Seedance ad: keep ITS OWN synced voice/audio; caption is derived
+            # from ITS OWN speech so voice+caption+audio all match (coherent). No original-audio
+            # overlay, no pre-decided caption — that's what made the earlier output incoherent.
+            cpath = clip["local_path"]
+            cw, ch = await asyncio.to_thread(_ffprobe_dims, cpath)
+            ccap = ""
+            try:
+                clone_tx = await _transcribe_file(cpath)
+                if clone_tx.strip():
+                    d2 = await _gemini_json(
+                        'From this ad voiceover, write ONE short on-screen caption (3-6 words) that '
+                        f'MATCHES what is actually being said. Voiceover: "{clone_tx[:300]}". '
+                        'Return JSON {"caption":"..."}')
+                    ccap = (d2.get("caption") or "").strip()
+            except Exception as e:
+                logger.warning(f"clone caption failed: {e}")
+            if ccap:
+                cc_png = os.path.join(work, "cc.png")
+                await asyncio.to_thread(_make_caption_png, ccap, cw, ch, cc_png)
+                await asyncio.to_thread(_ffmpeg,
+                    ["-i", cpath, "-i", cc_png, "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
+                     "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast",
+                     "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "aac", "-b:a", "192k",
+                     out_path], timeout=600)
+            else:
+                await asyncio.to_thread(_ffmpeg,
+                    ["-i", cpath, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+            return [{"recipe": "Winner Clone (Seedance)", "video_url": url, "confidence": 0.7,
+                     "whats_changed": (f'Winner-clone of a top {req.context.get("vertical","")} winner using your '
+                        f'creative as references — self-contained (its OWN synced voice/audio)'
+                        + (f', caption matches its speech: "{ccap}"' if ccap else '') + '.')}]
+
+        # ── stock / silent b-roll: overlay ORIGINAL audio + CTA caption (coherent for silent assets) ──
         cap_png = os.path.join(work, "cap.png")
         await asyncio.to_thread(_make_caption_png, caption, W, H, cap_png)
-        name, out_path, url = _out_url(req, "broll")
         await asyncio.to_thread(_ffmpeg,
             ["-i", clip["local_path"], "-i", orig, "-i", cap_png, "-filter_complex",
              f"[0:v]trim=0:8,setpts=PTS-STARTPTS,scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[v0];"
