@@ -341,6 +341,8 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
                 f'offer: "{offer_desc[:300]}". '
                 + roles
                 + (f'Preserve this winning hook angle: "{winner_hook[:120]}". ' if winner_hook else '')
+                + 'The subject is ALREADY speaking energetically from the very FIRST frame — no intro, '
+                'no silent/smiling lead-in, no dead air; open directly ON the hook line. '
                 + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. Photorealistic, native-UGC feel. '
                 'CRITICAL: the video MUST contain ABSOLUTELY NO text, letters, words, subtitles, '
                 'captions, watermarks or writing anywhere in the frame — a completely clean image with '
@@ -1181,7 +1183,7 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             ref_imgs = await _select_references(orig, work, offer_desc)
             winner_clip = await _prep_winner_clip(_lw[0]["url"], work)
             gen = await _generate_clip(
-                offer_desc, shot_type="b_roll", duration=6,
+                offer_desc, shot_type="b_roll", duration=12,
                 model=MultiProviderVideoService.route_capability("reference_to_video", req.model),
                 reference_video_urls=[winner_clip],
                 reference_image_urls=(ref_imgs or None),
