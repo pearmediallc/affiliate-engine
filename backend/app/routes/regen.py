@@ -334,8 +334,11 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
                 f'offer: "{offer_desc[:300]}". '
                 + roles
                 + (f'Preserve this winning hook angle: "{winner_hook[:120]}". ' if winner_hook else '')
-                + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. NO on-screen captions '
-                'or text (added later). Photorealistic, native-UGC feel. Return JSON {"prompt":"..."}')
+                + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. Photorealistic, native-UGC feel. '
+                'CRITICAL: the video MUST contain ABSOLUTELY NO text, letters, words, subtitles, '
+                'captions, watermarks or writing anywhere in the frame — a completely clean image with '
+                'zero on-screen text (captions are added afterward). Ignore/do not reproduce any text '
+                'that appears in the reference video. Return JSON {"prompt":"..."}')
         else:
             ask = (
                 'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
@@ -350,6 +353,8 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
         prompt += " @Video1"
         for i in range(len(reference_image_urls or [])):
             prompt += f" @Image{i+1}"
+        if cloning:
+            prompt += " — IMPORTANT: absolutely no text, captions, subtitles or words on screen; clean footage only."
     try:
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
@@ -1205,16 +1210,20 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             cpath = clip["local_path"]
             cw, ch = await asyncio.to_thread(_ffprobe_dims, cpath)
             ccap = ""
-            try:
-                clone_tx = await _transcribe_file(cpath)
-                if clone_tx.strip():
-                    d2 = await _gemini_json(
-                        'From this ad voiceover, write ONE short on-screen caption (3-6 words) that '
-                        f'MATCHES what is actually being said. Voiceover: "{clone_tx[:300]}". '
-                        'Return JSON {"caption":"..."}')
-                    ccap = (d2.get("caption") or "").strip()
-            except Exception as e:
-                logger.warning(f"clone caption failed: {e}")
+            # only add OUR caption if the clone is text-free (avoid doubling Seedance's own text)
+            cframes = await asyncio.to_thread(_extract_frames, cpath, [0.6, 2.0, 4.0], work)
+            clone_has_text = _boxes_area(await _detect_caption_boxes(cframes)) > 0.03
+            if not clone_has_text:
+                try:
+                    clone_tx = await _transcribe_file(cpath)
+                    if clone_tx.strip():
+                        d2 = await _gemini_json(
+                            'From this ad voiceover, write ONE short on-screen caption (3-6 words) that '
+                            f'MATCHES what is actually being said. Voiceover: "{clone_tx[:300]}". '
+                            'Return JSON {"caption":"..."}')
+                        ccap = (d2.get("caption") or "").strip()
+                except Exception as e:
+                    logger.warning(f"clone caption failed: {e}")
             if ccap:
                 cc_png = os.path.join(work, "cc.png")
                 await asyncio.to_thread(_make_caption_png, ccap, cw, ch, cc_png)
