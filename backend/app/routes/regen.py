@@ -323,9 +323,9 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     Returns a local mp4 path or None. Costs real generation credits (intentional)."""
     _generate_clip.last_error = ""
     cloning = bool(reference_video_urls)
-    # cloning needs a reference-capable model → force Seedance unless the user picked one
-    if cloning and not model:
-        model = "seedance-2"
+    # cloning needs a reference-to-video capable model → route by capability (user pick wins)
+    if cloning:
+        model = MultiProviderVideoService.route_capability("reference_to_video", model)
     seedance = bool(model and "seedance" in model.lower())
     try:
         if cloning:
@@ -366,7 +366,7 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
             prompt=prompt, shot_type=shot_type, duration=duration,
-            preferred_model=(model or "higgsfield-v1"),
+            preferred_model=(model or MultiProviderVideoService.route_capability("b_roll")),
             reference_video_urls=(reference_video_urls if seedance else None),
             reference_image_urls=(reference_image_urls if seedance else None),
             s3_prefix="regen")
@@ -1181,7 +1181,8 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             ref_imgs = await _select_references(orig, work, offer_desc)
             winner_clip = await _prep_winner_clip(_lw[0]["url"], work)
             gen = await _generate_clip(
-                offer_desc, shot_type="b_roll", duration=6, model=(req.model or "seedance-2"),
+                offer_desc, shot_type="b_roll", duration=6,
+                model=MultiProviderVideoService.route_capability("reference_to_video", req.model),
                 reference_video_urls=[winner_clip],
                 reference_image_urls=(ref_imgs or None),
                 winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))

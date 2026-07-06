@@ -109,14 +109,16 @@ def _available_keys() -> set[str]:
 
 
 def _model_provider(model_id: str) -> str:
-    m = model_id.lower()
+    """Map an EXPLICIT, provider-tagged model id to its gateway. Ids are provider-explicit so
+    the user's choice is unambiguous, e.g. 'veo3-kie' vs 'veo3-google'."""
+    m = (model_id or "").lower()
     if "veo" in m:
-        return "google"
-    if "runway" in m or "seedance" in m:
+        return "kieai" if "kie" in m else "google"    # Veo via Kie OR via Google — user picks
+    if "seedance" in m or "runway" in m or "infinitetalk" in m or "flux" in m:
         return "kieai"
-    if model_id in _HIGGSFIELD_I2V:
+    if "higgsfield" in m or "kling" in m or "wan" in m or "hailuo" in m or "luma" in m or model_id in _HIGGSFIELD_I2V:
         return "higgsfield"
-    return "higgsfield"  # default to higgsfield for unknown models
+    return "higgsfield"
 
 
 def _pick_model(shot_type: str, preferred_model: Optional[str] = None) -> str:
@@ -445,13 +447,17 @@ class MultiProviderVideoService:
             return _generate_veo(prompt, image_path, duration, fast=fast)
 
         if provider == "kieai":
+            from .kieai_service import KieAIService
             if "seedance" in model_id:
-                from .kieai_service import KieAIService
                 refs_img = reference_image_urls or ([image_url] if image_url else None)
                 refs_vid = reference_video_urls or None
                 res = KieAIService.generate_video_seedance(
                     prompt, reference_image_urls=refs_img, reference_video_urls=refs_vid,
                     duration=duration, aspect_ratio="9:16")
+                return {**res, "download_url": _persist_video(res["video_path"], res["video_filename"], s3_prefix=s3_prefix)}
+            if "veo" in model_id:   # Veo via Kie (your Kie key + credits)
+                fast = "fast" in model_id
+                res = KieAIService.generate_video_veo(prompt, duration=duration, ratio="9:16", fast=fast)
                 return {**res, "download_url": _persist_video(res["video_path"], res["video_filename"], s3_prefix=s3_prefix)}
             if "runway" in model_id:
                 return _generate_kieai_runway(prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
@@ -460,6 +466,32 @@ class MultiProviderVideoService:
 
         # higgsfield covers everything else
         return _generate_higgsfield(model_id, prompt, image_url or image_path, duration, s3_prefix=s3_prefix)
+
+    # Capability → candidate models (provider-explicit ids). The router honors the user's
+    # explicit pick first; "auto"/None picks the best AVAILABLE model for the job — no hardcoding.
+    CAPABILITY_MODELS = {
+        "reference_to_video": ["seedance-2"],                                  # ref-video: Seedance
+        "talking_head":       ["infinitetalk-kie"],                            # lip-sync a person to VO
+        "image_to_video":     ["veo3-kie", "kling-v3", "higgsfield-v1", "veo-3", "luma-ray-2"],
+        "b_roll":             ["hailuo-02", "wan-2.2", "veo3-kie", "higgsfield-v1"],
+        "text_to_video":      ["veo3-kie", "runway-gen4", "higgsfield-v1"],
+    }
+
+    @staticmethod
+    def route_capability(capability: str, preferred: Optional[str] = None) -> Optional[str]:
+        """Pick a model for a JOB capability. User's explicit choice wins (if its provider is
+        configured); else the best AVAILABLE candidate; else any available. None if nothing."""
+        avail = _available_keys()
+        if preferred and preferred.lower() != "auto" and _model_provider(preferred) in avail:
+            return preferred
+        for mid in MultiProviderVideoService.CAPABILITY_MODELS.get(capability, []):
+            if _model_provider(mid) in avail:
+                return mid
+        for cands in MultiProviderVideoService.CAPABILITY_MODELS.values():
+            for mid in cands:
+                if _model_provider(mid) in avail:
+                    return mid
+        return None
 
     @staticmethod
     def estimate_cost(shot_type: str, duration: int = 6, preferred_model: Optional[str] = None) -> dict:
