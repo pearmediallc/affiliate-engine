@@ -13,6 +13,7 @@ Recipes are ordered chains over the engine's EXISTING separate features
 (tiktok_symphony avatar, stock_footage, speech_generator, auto_editor, ...).
 """
 import os
+import re
 import json
 import base64
 import logging
@@ -1220,16 +1221,28 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
             cframes = await asyncio.to_thread(_extract_frames, cpath, [0.6, 2.0, 4.0], work)
             clone_has_text = _boxes_area(await _detect_caption_boxes(cframes)) > 0.03
             if not clone_has_text:
+                clone_tx = ""
                 try:
                     clone_tx = await _transcribe_file(cpath)
-                    if clone_tx.strip():
+                except Exception as e:
+                    logger.warning(f"clone transcribe failed: {e}")
+                # Filter Whisper SOUND artifacts ("[music]", "sad music plays", "(applause)") and
+                # no-real-speech clips — those must NOT become the caption.
+                words = re.findall(r"[a-zA-Z']{3,}", clone_tx or "")
+                artifact = (not clone_tx.strip()
+                            or re.search(r"music|applause|silence|laughter|\[|\]|\(|\)", clone_tx, re.I)
+                            or len(words) < 4)
+                if not artifact:
+                    try:
                         d2 = await _gemini_json(
                             'From this ad voiceover, write ONE short on-screen caption (3-6 words) that '
                             f'MATCHES what is actually being said. Voiceover: "{clone_tx[:300]}". '
                             'Return JSON {"caption":"..."}')
                         ccap = (d2.get("caption") or "").strip()
-                except Exception as e:
-                    logger.warning(f"clone caption failed: {e}")
+                    except Exception as e:
+                        logger.warning(f"clone caption failed: {e}")
+                else:
+                    ccap = caption   # no clear speech (music/ambient) → use the on-offer CTA
             if ccap:
                 cc_png = os.path.join(work, "cc.png")
                 await asyncio.to_thread(_make_caption_png, ccap, cw, ch, cc_png)
