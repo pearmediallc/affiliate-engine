@@ -135,10 +135,13 @@ async def _prep_winner_clip(winner_url: str, work: str, max_sec: int = 12) -> st
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", out])
         try: os.remove(wp)
         except OSError: pass
+        if not os.path.isfile(out) or os.path.getsize(out) < 1000:
+            raise RuntimeError("trimmed winner clip empty")
         return f"{AE_PUBLIC_URL}/api/v1/uploads/{name}"
     except Exception as e:
-        logger.warning(f"winner clip prep failed ({e}); using raw url")
-        return winner_url
+        # Do NOT fall back to the raw winner url — it may be >15s/>50MB and Seedance will 422.
+        logger.warning(f"winner clip prep failed ({e}); skipping winner video reference")
+        return None
 
 
 async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
@@ -763,17 +766,31 @@ async def recipe_avatar(req: RunRequest) -> list:
     fixing a loser while preserving its look, use a surgical recipe instead."""
     # 1) ground in the original's actual content
     original_script = await _transcribe_original(req.context.get("download_url", ""))
-    # 2) an explicit rewrite directive may refine it; otherwise keep the original message
+    # 2) explicit rewrite directive wins; else POLISH the transcript into a tighter UGC hook
+    #    targeting the lagging metric (keeps the offer/claims); else use the raw transcript.
     directive_script = req.directive.get("script_directive")
     if directive_script and directive_script != "none":
         script = directive_script
     elif original_script:
         script = original_script
+        hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
+        try:
+            d = await _gemini_json(
+                'Rewrite this into a tight, natural first-person UGC ad voiceover (~30-45s) that '
+                'KEEPS the same offer and claims but hooks harder in the first line. '
+                f'{("Focus: " + hint) if hint else ""} Original: "{original_script[:1200]}". '
+                'Return JSON {"script":"..."}')
+            script = (d.get("script") or original_script).strip()
+        except Exception as e:
+            logger.warning(f"avatar script polish failed, using transcript: {e}")
     else:
-        # do NOT invent unrelated content — fail loudly so the UI surfaces it
         raise RuntimeError("could not transcribe the original and no script directive given — refusing to generate unrelated content")
 
-    avatar_id = await _pick_avatar(age="elderly", gender="female", region="namer")
+    # avatar persona from the directive (de-hardcoded); sensible default for this vertical
+    avatar_id = await _pick_avatar(
+        age=(req.directive.get("avatar_age") or "elderly"),
+        gender=(req.directive.get("avatar_gender") or "female"),
+        region=(req.directive.get("avatar_region") or "namer"))
     if not avatar_id:
         raise RuntimeError("no matching avatar found")
 
@@ -792,25 +809,46 @@ async def recipe_avatar(req: RunRequest) -> list:
     if not url:
         raise RuntimeError("avatar render timed out/failed")
 
-    # Remove the TikTok "AI-generated" watermark (bottom strip) so the clip is ad-usable:
-    # crop the bottom ~8% and scale back to the original frame size, then serve from our host.
+    # Remove the TikTok "AI-generated" watermark (bottom strip) + add ONE clean lower-third CTA
+    # caption (the avatar speaks the exact script, so a CTA is coherent + never garbled).
     final_url = url
+    work = tempfile.mkdtemp()
     try:
         raw = await _download_to_temp(url)
+        W, H = await asyncio.to_thread(_ffprobe_dims, raw)
+        keep_h = (int(H * 0.92) // 2) * 2  # even height for yuv420p, drops the watermark strip
+        # clean CTA from the offer (imperative, drives click)
+        cta = ""
         try:
-            W, H = await asyncio.to_thread(_ffprobe_dims, raw)
-            keep_h = (int(H * 0.92) // 2) * 2  # even height for yuv420p
-            name, out_path, out_url = _out_url(req, "avatar")
+            hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
+            dc = await _gemini_json(f'Write ONE punchy on-screen CTA caption (4-7 words, imperative) '
+                                    f'for this UGC ad. {("Goal: "+hint) if hint else ""} '
+                                    f'Script: "{script[:400]}". Return JSON {{"caption":"..."}}')
+            cta = (dc.get("caption") or "").strip()
+        except Exception:
+            pass
+        name, out_path, out_url = _out_url(req, "avatar")
+        if cta:
+            cta_png = os.path.join(work, "cta.png")
+            await asyncio.to_thread(_make_caption_png, cta, W, H, cta_png)
+            await asyncio.to_thread(_ffmpeg,
+                ["-i", raw, "-i", cta_png, "-filter_complex",
+                 f"[0:v]crop={W}:{keep_h}:0:0,scale={W}:{H}[v0];[v0][1:v]overlay=0:0[v]",
+                 "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "21", "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "aac", "-b:a", "192k",
+                 out_path], timeout=300)
+        else:
             await asyncio.to_thread(_ffmpeg,
                 ["-i", raw, "-vf", f"crop={W}:{keep_h}:0:0,scale={W}:{H}",
                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
                  "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=300)
-            final_url = out_url
-        finally:
-            try: os.remove(raw)
-            except OSError: pass
+        final_url = out_url
+        try: os.remove(raw)
+        except OSError: pass
     except Exception as e:
-        logger.warning(f"avatar watermark crop failed, serving raw: {e}")
+        logger.warning(f"avatar post-process failed, serving raw: {e}")
+    finally:
+        import shutil; shutil.rmtree(work, ignore_errors=True)
 
     return [{
         "recipe": "Avatar/UGC (TikTok Symphony)",
@@ -1181,15 +1219,18 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         # ── PRIMARY: winner-clone (conversion-first) ──────────────────────────
         if _lw:
             ref_imgs = await _select_references(orig, work, offer_desc)
-            winner_clip = await _prep_winner_clip(_lw[0]["url"], work)
-            gen = await _generate_clip(
-                offer_desc, shot_type="b_roll", duration=12,
-                model=MultiProviderVideoService.route_capability("reference_to_video", req.model),
-                reference_video_urls=[winner_clip],
-                reference_image_urls=(ref_imgs or None),
-                winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))
-            if gen:
-                clip = {"local_path": gen, "id": "winner-clone (Seedance)"}
+            winner_clip = await _prep_winner_clip(_lw[0]["url"], work)   # None if too long/failed
+            if winner_clip:
+                gen = await _generate_clip(
+                    offer_desc, shot_type="b_roll", duration=12,
+                    model=MultiProviderVideoService.route_capability("reference_to_video", req.model),
+                    reference_video_urls=[winner_clip],
+                    reference_image_urls=(ref_imgs or None),
+                    winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))
+                if gen:
+                    clip = {"local_path": gen, "id": "winner-clone (Seedance)"}
+                else:
+                    logger.error(f"winner-clone gen failed: {getattr(_generate_clip,'last_error','')}")
 
         # ── else: relevant stock (last resort) ────────────────────────────────
         if not clip:
