@@ -74,6 +74,66 @@ def _frame_to_public_url(video_path: str, t: float = 1.0) -> Optional[str]:
     return None
 
 
+async def _select_references(video_path: str, work: str, offer_desc: str) -> list:
+    """Vision-pick the BEST identity + product/proof frames from a video and serve them from
+    the public /uploads dir as @Image references. This is what makes winner-clones look right —
+    a clean face + the product/offer, not a random timestamp. Returns a list of public URLs."""
+    import uuid as _uuid, shutil
+    dur = await asyncio.to_thread(_ffprobe_duration, video_path)
+    d = dur or 8.0
+    times = [max(0.2, d * f) for f in (0.05, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9)]
+    frames = await asyncio.to_thread(_extract_frames, video_path, times, work)
+    if not frames:
+        return []
+    idxs = []
+    try:
+        r = await _gemini_vision(frames,
+            f'These are numbered frames (0-indexed, in order) from a video ad for: "{offer_desc[:200]}". '
+            'Choose the SINGLE best frame that clearly shows the main spokesperson/person FACE '
+            '(sharp, front-facing — for an identity reference), and the SINGLE best frame showing '
+            'the PRODUCT / offer / proof (a document, product, result, or key visual). '
+            'Return STRICT JSON {"person_idx": <int or -1>, "product_idx": <int or -1>}.')
+        for k in ("person_idx", "product_idx"):
+            v = r.get(k)
+            if isinstance(v, int) and 0 <= v < len(frames):
+                idxs.append(v)
+    except Exception as e:
+        logger.warning(f"reference selection vision failed: {e}")
+    if not idxs:
+        idxs = [len(frames) // 3]  # sensible fallback
+    urls = []
+    for i in list(dict.fromkeys(idxs)):   # dedup, keep order
+        name = f"ref_{_uuid.uuid4().hex[:8]}.jpg"
+        try:
+            shutil.copy(frames[i], os.path.join(UPLOAD_DIR, name))
+            urls.append(f"{AE_PUBLIC_URL}/api/v1/uploads/{name}")
+        except Exception:
+            continue
+    logger.info(f"selected {len(urls)} reference frames")
+    return urls
+
+
+async def _prep_winner_clip(winner_url: str, work: str, max_sec: int = 12) -> str:
+    """Download a winner ad, trim to <=max_sec + downscale (Seedance caps reference video at
+    15s / 50MB), re-serve from /uploads. Returns the prepared URL, or the raw url on failure."""
+    import uuid as _uuid
+    try:
+        wp = await _download_to_temp(winner_url)
+        dur = await asyncio.to_thread(_ffprobe_duration, wp)
+        name = f"win_{_uuid.uuid4().hex[:8]}.mp4"
+        out = os.path.join(UPLOAD_DIR, name)
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", wp, "-t", str(min(max_sec, int(dur) if dur else max_sec)),
+             "-vf", "scale=480:-2", "-an",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", out])
+        try: os.remove(wp)
+        except OSError: pass
+        return f"{AE_PUBLIC_URL}/api/v1/uploads/{name}"
+    except Exception as e:
+        logger.warning(f"winner clip prep failed ({e}); using raw url")
+        return winner_url
+
+
 async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
     """Send frames + a prompt to Gemini and get back STRICT JSON."""
     if not settings.gemini_api_key:
@@ -262,12 +322,17 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     seedance = bool(model and "seedance" in model.lower())
     try:
         if cloning:
+            nimg = len(reference_image_urls or [])
+            roles = ''
+            if nimg >= 1:
+                roles += 'Feature the real spokesperson/person from @Image1 (preserve their identity/face). '
+            if nimg >= 2:
+                roles += 'Show the product/offer/proof from @Image2. '
             ask = (
                 'Write ONE direct-response video generation prompt that RECREATES the proven '
                 'winning ad shown in @Video1 — its hook, pacing and shot structure — but for THIS '
                 f'offer: "{offer_desc[:300]}". '
-                + ('Keep the SAME real spokesperson/product shown in @Image1 (preserve identity, face, product). '
-                   if reference_image_urls else '')
+                + roles
                 + (f'Preserve this winning hook angle: "{winner_hook[:120]}". ' if winner_hook else '')
                 + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. NO on-screen captions '
                 'or text (added later). Photorealistic, native-UGC feel. Return JSON {"prompt":"..."}')
@@ -283,8 +348,8 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
         prompt = offer_desc[:500]
     if seedance and reference_video_urls:
         prompt += " @Video1"
-        if reference_image_urls:
-            prompt += " @Image1"
+        for i in range(len(reference_image_urls or [])):
+            prompt += f" @Image{i+1}"
     try:
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
@@ -891,17 +956,18 @@ async def recipe_hook_change(req: RunRequest) -> list:
         # real spokesperson (Seedance @Video1=winner + @Image1=this creative's person). This is
         # what a media buyer does — clone a winner, swap offer/person — not "generate a scene".
         if not src_path and lib_winners:
-            person_url = _frame_to_public_url(orig, min(1.5, (dur or 3) * 0.3))
+            ref_imgs = await _select_references(orig, work, offer_desc)          # person + product from loser
+            winner_clip = await _prep_winner_clip(lib_winners[0]["url"], work)   # trimmed proven winner
             clip = await _generate_clip(
                 offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1),
                 model=(req.model or "seedance-2"),
-                reference_video_urls=[lib_winners[0]["url"]],
-                reference_image_urls=([person_url] if person_url else None),
+                reference_video_urls=[winner_clip],
+                reference_image_urls=(ref_imgs or None),
                 winner_hook=lib_winners[0].get("hook"), vertical=req.context.get("vertical"))
             if clip:
                 src_path, src_label, is_winner = clip, (
                     f"winner-clone of a top {req.context.get('vertical','')} ad "
-                    f"(Seedance; your spokesperson kept)"), False
+                    f"(Seedance; {len(ref_imgs)} refs auto-selected from your creative)"), False
 
         # ── else: your OWN proven winner (same editor) — direct transplant, caption-masked ──
         if not src_path:
@@ -1103,11 +1169,12 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
 
         # ── PRIMARY: winner-clone (conversion-first) ──────────────────────────
         if _lw:
-            person_url = _frame_to_public_url(orig, 1.0)
+            ref_imgs = await _select_references(orig, work, offer_desc)
+            winner_clip = await _prep_winner_clip(_lw[0]["url"], work)
             gen = await _generate_clip(
                 offer_desc, shot_type="b_roll", duration=6, model=(req.model or "seedance-2"),
-                reference_video_urls=[_lw[0]["url"]],
-                reference_image_urls=([person_url] if person_url else None),
+                reference_video_urls=[winner_clip],
+                reference_image_urls=(ref_imgs or None),
                 winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))
             if gen:
                 clip = {"local_path": gen, "id": "winner-clone (Seedance)"}
