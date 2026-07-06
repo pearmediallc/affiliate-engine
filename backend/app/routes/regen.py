@@ -114,17 +114,23 @@ async def _select_references(video_path: str, work: str, offer_desc: str) -> lis
 
 
 async def _prep_winner_clip(winner_url: str, work: str, max_sec: int = 12) -> str:
-    """Download a winner ad, trim to <=max_sec + downscale (Seedance caps reference video at
-    15s / 50MB), re-serve from /uploads. Returns the prepared URL, or the raw url on failure."""
+    """Download a winner ad, SCRUB its burned captions (so Seedance won't mimic/garble them),
+    trim to <=max_sec + downscale (Seedance caps reference video at 15s/50MB), re-serve from
+    /uploads. Returns the prepared URL, or the raw url on failure."""
     import uuid as _uuid
     try:
         wp = await _download_to_temp(winner_url)
         dur = await asyncio.to_thread(_ffprobe_duration, wp)
+        W, H = await asyncio.to_thread(_ffprobe_dims, wp)
+        # detect + blur the winner's burned captions so the reference is text-free
+        wframes = await asyncio.to_thread(_extract_frames, wp,
+                    [0.5, max(0.6, (dur or 6) * 0.5), max(1.0, (dur or 6) * 0.85)], work)
+        delogo = _delogo_chain(await _detect_caption_boxes(wframes), W, H)
         name = f"win_{_uuid.uuid4().hex[:8]}.mp4"
         out = os.path.join(UPLOAD_DIR, name)
         await asyncio.to_thread(_ffmpeg,
             ["-i", wp, "-t", str(min(max_sec, int(dur) if dur else max_sec)),
-             "-vf", "scale=480:-2", "-an",
+             "-vf", f"{delogo}scale=480:-2", "-an",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", out])
         try: os.remove(wp)
         except OSError: pass
