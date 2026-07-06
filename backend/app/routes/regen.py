@@ -667,6 +667,15 @@ async def seedance_test_status(task_id: str, _auth: bool = Depends(require_servi
             "failMsg": d.get("failMsg"), "costTime": d.get("costTime")}
 
 
+@router.get("/winners")
+async def winners(vertical: str = "", limit: int = 12, _auth: bool = Depends(require_service_key)):
+    """List competitor winners (scraper library) for a vertical — playable video_url + hook +
+    score. Powers the Creative Library 'Scraper Winners' section."""
+    from ..services import winner_library
+    return {"success": True, "vertical": vertical,
+            "winners": winner_library.fetch_winners(vertical, limit=limit)}
+
+
 @router.get("/winner-db-test")
 async def winner_db_test(vertical: str = "", _auth: bool = Depends(require_service_key)):
     """Prove the Winning Reference Library (adforge Postgres) is reachable + has winners."""
