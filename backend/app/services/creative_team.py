@@ -32,6 +32,7 @@ from typing import Optional, Any
 import httpx
 
 import os
+import asyncio
 
 from ..config import settings
 from . import prompt_reference_library as lib
@@ -118,6 +119,66 @@ async def _gemini_json(prompt: str, *, temperature: float = 0.4,
         logger.warning(f"creative_team LLM call failed twice ({e}); using heuristic fallback")
         _LLM_STATS["fallback"] += 1
         return None
+
+
+# ── Typed contracts + validation + sanitization ───────────────────────────────
+# TypedDicts document each role's promised shape. They are plain dicts at runtime, so existing
+# `.get()`/`[]` access (here and in the composer) keeps working — but static tooling now sees types.
+try:
+    from typing import TypedDict, List
+    class Beat(TypedDict, total=False):
+        i: int; line: str; emotion: str; gesture: str; environment: str; action: str
+        request_type: str; shot_type: str; source_strategy: str; technique: str
+        planned_technique: str; section: str; capability: str; model: str; prompt: str
+    class Strategy(TypedDict, total=False):
+        diagnosis: str; lagging_metric: str; angle: str; keep: list; change: list; fix: str
+    class Plan(TypedDict, total=False):
+        plan: dict; strategy: Strategy; script: str; entity_desc: str
+        beats: "List[Beat]"; critique: list; request_type: str
+except Exception:   # pragma: no cover — typing shim for very old runtimes
+    Beat = Strategy = Plan = dict  # type: ignore
+
+# Truncation limits (named, so they're consistent + tunable — no more scattered magic numbers).
+MAX_TRANSCRIPT = 1200      # loser/original transcript chars fed to a prompt
+MAX_WINNER_TX = 1200       # winner transcript chars (was inconsistently 900 vs 1200)
+MAX_HOOK = 300
+MAX_OFFER = 300
+MAX_PROMPT = 1900          # provider prompt hard cap
+
+# crude prompt-injection guard: transcripts/scripts can come from uploads, so strip the common
+# "ignore your instructions" style overrides before they reach an LLM prompt.
+import re as _re
+_INJECT = _re.compile(r"(?i)\b(ignore|disregard|forget)\b.{0,30}\b(previous|prior|above|earlier|all)\b"
+                      r".{0,30}\b(instructions?|prompts?|rules?)\b")
+
+
+def _sanitize(text: str, limit: int = MAX_TRANSCRIPT) -> str:
+    """Neutralize obvious prompt-injection and bound length for any user/transcript text."""
+    if not text:
+        return ""
+    t = _INJECT.sub("[redacted]", str(text))
+    t = t.replace("```", "'''")           # don't let content break out of fenced context
+    return t[:limit]
+
+
+_TYPE_DEFAULTS = {str: "", list: [], dict: {}, int: 0, float: 0.0, bool: False}
+
+
+def _coerce(data, spec: dict) -> dict:
+    """Validate/coerce an LLM dict to an expected {field: type} shape with safe defaults, so a
+    malformed LLM response (e.g. `approach` as a list) becomes a typed default instead of a runtime
+    crash downstream. Returns {} inputs as all-defaults."""
+    data = data if isinstance(data, dict) else {}
+    out = {}
+    for field, typ in spec.items():
+        v = data.get(field)
+        if isinstance(v, typ) and not (typ is str and not isinstance(v, str)):
+            out[field] = v
+        elif v is not None and typ is str:
+            out[field] = " ".join(map(str, v)) if isinstance(v, list) else str(v)  # salvage list→str
+        else:
+            out[field] = _TYPE_DEFAULTS.get(typ, None)
+    return out
 
 
 # ── 0. Creative Director (the smart leader) ───────────────────────────────────
@@ -261,10 +322,49 @@ Return STRICT JSON: {{"script": "the spoken script as plain sentences"}}"""
     out = await _gemini_json(prompt, temperature=0.6)
     if out and out.get("script"):
         return str(out["script"]).strip()
-    # fallback: enhance loser opening with winner hook, keep offer + CTA
+    return _script_heuristic(offer_desc, loser_transcript, winner_hook)
+
+
+def _script_heuristic(offer_desc: str, loser_transcript: str, winner_hook: str) -> str:
     base = (loser_transcript or offer_desc).strip()
     opener = (winner_hook.strip() + " ") if winner_hook else ""
     return f"{opener}{base}"[:600]
+
+
+_STRATEGY_SPEC = {"diagnosis": str, "lagging_metric": str, "angle": str,
+                  "keep": list, "change": list, "fix": str}
+
+
+async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: str,
+                               loser_transcript: str = "", loser_metrics: Optional[dict] = None,
+                               winner_hook: str = "", winner_transcript: str = "") -> tuple:
+    """MERGED Strategist + Script Writer in ONE round-trip (diagnosis + script together) — halves
+    latency/cost vs two sequential calls. Returns (strategy: Strategy, script: str). Falls back to
+    the two deterministic heuristics if the LLM is unavailable."""
+    metrics = loser_metrics or {}
+    prompt = f"""{_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
+Writer. First DIAGNOSE why this ad underperformed and pick the smallest high-leverage fix, THEN
+write the new spoken script implementing that fix. Keep the offer intact.
+
+OFFER: {_sanitize(offer_desc, MAX_OFFER)}
+VERTICAL: {vertical}   REQUEST TYPE: {request_type}
+LOSER METRICS (lower=worse): {json.dumps(metrics)[:500]}
+LOSER TRANSCRIPT: {_sanitize(loser_transcript, MAX_TRANSCRIPT)}
+WINNING HOOK to open on: {_sanitize(winner_hook, MAX_HOOK)}
+WINNER SCRIPT (proven structure): {_sanitize(winner_transcript, MAX_WINNER_TX)}
+
+Script rules: hook in the first sentence; one idea per sentence; clean CTA; 40-90 words; first-person;
+no stage directions or on-screen-text markers.
+Return STRICT JSON: {{"diagnosis": "...", "lagging_metric": "hook_rate|hold_rate|offer_cr|ctr|roas|unknown",
+  "angle": "...", "keep": ["..."], "change": ["..."], "fix": "one-line directive",
+  "script": "the spoken script as plain sentences"}}"""
+    out = await _gemini_json(prompt, temperature=0.5)
+    if out and out.get("script"):
+        strategy = _coerce(out, _STRATEGY_SPEC)
+        return strategy, str(out.get("script")).strip()
+    # fallback: deterministic diagnosis (metric-aware) + deterministic script
+    strategy = _strategist_heuristic(offer_desc, winner_hook, metrics)
+    return strategy, _script_heuristic(offer_desc, loser_transcript, winner_hook)
 
 
 # ── 3. Director (scene / emotion / gesture per beat) ──────────────────────────
@@ -395,8 +495,9 @@ def prompt_writer(*, beats: list, entity_desc: str, vertical: str,
 
 # ── 7. Critic (slop-risk judgment; optional vision QA) ────────────────────────
 async def critic(*, beats: list, frames_by_beat: Optional[dict] = None) -> list:
-    """Judge each beat's prompt (and, if provided, a generated frame) for slop risk.
-    Returns list of {i, verdict: pass|revise, issues, revised_prompt?}. Frames enable true QA."""
+    """PURE (no mutation): judge each beat's prompt (and, if provided, a generated frame) for slop
+    risk. Returns list of {i, verdict: pass|revise, issues, revised_prompt}. Apply the fixes with
+    apply_revisions() — separating judgment from mutation keeps this testable."""
     verdicts = []
     for b in beats:
         frames = (frames_by_beat or {}).get(b["i"])
@@ -411,15 +512,25 @@ PROMPT: {b.get('prompt','')[:1500]}
 Return STRICT JSON: {{"verdict": "pass" | "revise", "issues": ["..."],
   "revised_prompt": "only if revise: a corrected prompt string, else empty"}}"""
         out = await _gemini_json(prompt, temperature=0.2, frames=frames)
-        if not out:
-            verdicts.append({"i": b["i"], "verdict": "pass", "issues": [], "revised_prompt": ""})
-            continue
-        v = {"i": b["i"], "verdict": out.get("verdict", "pass"),
-             "issues": out.get("issues", []), "revised_prompt": out.get("revised_prompt", "")}
-        if v["verdict"] == "revise" and v["revised_prompt"]:
-            b["prompt"] = v["revised_prompt"][:1900]  # apply the fix in place
+        v = _coerce(out, {"verdict": str, "issues": list, "revised_prompt": str})
+        v["i"] = b["i"]
+        v["verdict"] = v["verdict"] or "pass"
         verdicts.append(v)
     return verdicts
+
+
+def apply_revisions(beats: list, verdicts: list) -> int:
+    """SIDE-EFFECTING counterpart to critic(): apply each 'revise' verdict's corrected prompt onto
+    its beat. Returns how many beats were revised. Separated from critic() so judgment is pure."""
+    by_i = {b.get("i"): b for b in beats}
+    n = 0
+    for v in verdicts:
+        if v.get("verdict") == "revise" and v.get("revised_prompt"):
+            b = by_i.get(v.get("i"))
+            if b is not None:
+                b["prompt"] = v["revised_prompt"][:MAX_PROMPT]
+                n += 1
+    return n
 
 
 # ── 8. Learner (grow the library from outcomes) ───────────────────────────────
@@ -463,17 +574,24 @@ Return STRICT JSON: {{"realism": <0-10>, "lipsync": <0-10>, "captions": <0-10>,
     return out
 
 
+def revised_prompt(prompt: str, issues: list) -> str:
+    """PURE: fold concrete eval issues into a prompt as an explicit correction line (testable)."""
+    if not issues:
+        return prompt or ""
+    fix = " CORRECTION (fix these on this attempt): " + "; ".join(issues[:4]) + "."
+    return ((prompt or "") + fix)[:MAX_PROMPT]
+
+
 def coach_from_eval(beat: dict, ev: dict) -> None:
     """Turn a failed eval into ACTION: dock + coach each faulted persona (the one-on-one), and fold
-    the concrete corrections into this beat's prompt so the retry is actually better."""
+    the concrete corrections into this beat's prompt so the retry is actually better. (Uses the pure
+    revised_prompt() for the prompt rewrite so that half is unit-testable.)"""
     issues = ev.get("issues") or []
     note = "; ".join(issues)[:200] or "output scored below the quality bar — tighten realism/delivery."
     for p in (ev.get("fault_personas") or []):
         act.coach(p, note)
-    # rebuild the beat prompt with an explicit correction so the next attempt improves
     if issues:
-        fix = " CORRECTION (fix these on this attempt): " + "; ".join(issues[:4]) + "."
-        beat["prompt"] = (beat.get("prompt", "") + fix)[:1900]
+        beat["prompt"] = revised_prompt(beat.get("prompt", ""), issues)
 
 
 def eval_passed(ev: dict) -> bool:
@@ -535,28 +653,30 @@ async def run_creative_team(
                           has_real_character=has_real_character, has_winner_video=has_winner_video),
                       helpfulness=lambda p: 1.0 if p.get("structure") else 0.5)
 
-    strategy = await _run("strategist", job_id, "diagnosing loser vs winner",
-                          strategist(offer_desc=offer_desc, vertical=vertical, request_type=request_type,
-                                     loser_transcript=loser_transcript, loser_metrics=loser_metrics,
-                                     winner_hook=winner_hook, winner_transcript=winner_transcript),
-                          helpfulness=lambda s: 1.0 if s.get("fix") else 0.5)
+    # 1+2) Strategist + Script Writer share ONE round-trip (merged), reported as both personas.
+    ts_s = act.start("strategist", job_id, "diagnosing loser vs winner")
+    ts_w = act.start("scriptwriter", job_id, "writing the script")
+    strategy, script = await strategize_and_write(
+        offer_desc=offer_desc, vertical=vertical, request_type=request_type,
+        loser_transcript=loser_transcript, loser_metrics=loser_metrics,
+        winner_hook=winner_hook, winner_transcript=winner_transcript)
+    act.finish("strategist", ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
+               helpfulness=1.0 if strategy.get("fix") else 0.5)
+    act.finish("scriptwriter", ts_w, ok=True, detail="script written",
+               helpfulness=min(1.0, len((script or "").split()) / 60))
 
-    script = await _run("scriptwriter", job_id, "writing the script",
-                        script_writer(offer_desc=offer_desc, vertical=vertical, strategy=strategy,
-                                      loser_transcript=loser_transcript, winner_hook=winner_hook,
-                                      winner_transcript=winner_transcript),
-                        helpfulness=lambda s: min(1.0, len((s or '').split()) / 60))
+    # 3+4) Director (needs the script) and Character Manager (independent) run CONCURRENTLY.
+    beats, character = await asyncio.gather(
+        _run("scene", job_id, "breaking script into beats",
+             director(script=script, request_type=request_type, vertical=vertical),
+             helpfulness=lambda b: 1.0 if b else 0.0),
+        _run("character", job_id, "locking the character",
+             character_manager(request_type=request_type, vertical=vertical,
+                               avatar_hint=avatar_hint, entity_desc=entity_desc),
+             helpfulness=lambda c: 1.0 if c else 0.0),
+    )
 
-    beats = await _run("scene", job_id, "breaking script into beats",
-                       director(script=script, request_type=request_type, vertical=vertical),
-                       helpfulness=lambda b: 1.0 if b else 0.0)
-
-    character = await _run("character", job_id, "locking the character",
-                           character_manager(request_type=request_type, vertical=vertical,
-                                             avatar_hint=avatar_hint, entity_desc=entity_desc),
-                           helpfulness=lambda c: 1.0 if c else 0.0)
-
-    # Shot Selector honors the leader's technique markers (lipsync vs hard-cut) where present.
+    # 5) Shot Selector: technique derived from source_strategy; leader's structure only annotates.
     ts = act.start("shots", job_id, "selecting shots + models")
     beats = shot_selector(beats=beats, request_type=request_type, model=model,
                           has_real_character=has_real_character, has_winner_video=has_winner_video)
@@ -564,17 +684,19 @@ async def run_creative_team(
     act.finish("shots", ts, ok=True, detail="shots + models chosen",
                helpfulness=1.0 if beats else 0.0)
 
+    # 6) Prompt Writer: compose anti-slop prompts from the reference library.
     ts = act.start("prompt", job_id, "composing anti-slop prompts")
     beats = prompt_writer(beats=beats, entity_desc=character, vertical=vertical,
                           n_reference_images=n_reference_images, has_reference_video=has_reference_video)
     act.finish("prompt", ts, ok=True, detail=f"{len(beats)} prompts composed",
                helpfulness=1.0 if beats else 0.0)
 
+    # 7) Critic: PURE judgment, then apply_revisions mutates (separation of concerns).
     critique = []
     if run_critic:
         ts = act.start("critic", job_id, "judging beats for slop")
         critique = await critic(beats=beats)  # prompt-only QA; vision QA runs post-generation
-        revised = sum(1 for c in critique if c.get("verdict") == "revise")
+        revised = apply_revisions(beats, critique)
         act.finish("critic", ts, ok=True, revised=bool(revised),
                    detail=f"{revised}/{len(critique)} beats revised",
                    helpfulness=1.0 - (revised / len(critique)) if critique else 1.0)
@@ -589,9 +711,12 @@ def _apply_director_structure(beats: list, structure: list) -> None:
     from source_strategy in shot_selector (single source of truth) so the two can't contradict."""
     if not structure or not beats:
         return
-    n = len(beats)
+    n = len(beats); S = len(structure)
     for i, b in enumerate(beats):
-        # map beat index onto the section it falls in (proportional)
-        sec = structure[min(int(i * len(structure) / n), len(structure) - 1)]
+        # linear interpolation that ANCHORS endpoints: first beat → first section (hook),
+        # last beat → last section (cta); middles distribute. (Avoids the last beat never
+        # reaching the CTA section when n < S.)
+        idx = 0 if n == 1 else round(i * (S - 1) / (n - 1))
+        sec = structure[min(idx, S - 1)]
         b["section"] = sec.get("section", "")
         b["planned_technique"] = sec.get("technique", "")   # leader's intent (for reporting/QA)
