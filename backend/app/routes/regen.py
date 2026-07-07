@@ -778,7 +778,8 @@ async def creative_team_activity(_auth: bool = Depends(require_service_key)):
 async def creative_team_reports(_auth: bool = Depends(require_service_key)):
     """Per-persona performance ledger: runs, accuracy, revise-rate, helpfulness, avg time."""
     from ..services import creative_team_activity as act
-    return {"success": True, **act.reports()}
+    from ..services import creative_team as team
+    return {"success": True, **act.reports(), "llm_health": team.llm_health()}
 
 
 @router.post("/creative-team/grade")

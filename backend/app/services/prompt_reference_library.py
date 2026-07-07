@@ -172,11 +172,24 @@ def retrieve(request_type: str, model: str = "", max_exemplars: int = 3) -> dict
     }
 
 
+MAX_EXEMPLARS_PER_TYPE = 12   # cap so the learned library can't bloat with near-duplicates
+
+
 def add_exemplar(request_type: str, pattern: str) -> None:
-    """Learner/admin grows the library at runtime (persist to DB/Langfuse in production)."""
+    """Learner/admin grows the library at runtime (persist to DB/Langfuse in production). Dedups on
+    normalized text and caps per request type so it can't slowly fill with near-duplicates."""
     rt = _norm(request_type)
-    if pattern and pattern.strip():
-        EXEMPLARS.append({"type": rt, "pattern": pattern.strip()})
+    p = (pattern or "").strip()
+    if not p:
+        return
+    key = " ".join(p.lower().split())
+    for e in EXEMPLARS:
+        if e["type"] == rt and " ".join(e["pattern"].lower().split()) == key:
+            return  # already have it
+    same = [e for e in EXEMPLARS if e["type"] == rt]
+    if len(same) >= MAX_EXEMPLARS_PER_TYPE:
+        EXEMPLARS.remove(same[0])   # evict the oldest for this type (FIFO)
+    EXEMPLARS.append({"type": rt, "pattern": p})
 
 
 def request_types() -> list:

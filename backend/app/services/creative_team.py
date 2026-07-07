@@ -59,20 +59,44 @@ def _coach_pre(persona: str) -> str:
 
 
 # ── shared LLM plumbing ───────────────────────────────────────────────────────
+# Observability: track how often we're silently falling back to heuristics (invisible degradation
+# is dangerous — if Gemini fails often, ads quietly go generic). Exposed via llm_health().
+_LLM_STATS = {"calls": 0, "ok": 0, "fallback": 0, "no_key": 0}
+
+
+def llm_health() -> dict:
+    s = dict(_LLM_STATS)
+    s["fallback_rate"] = round(s["fallback"] / s["calls"], 3) if s["calls"] else 0.0
+    return s
+
+
+async def _read_frame_b64(fp: str) -> Optional[dict]:
+    def _rd():
+        with open(fp, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    try:
+        import asyncio
+        data = await asyncio.to_thread(_rd)   # don't block the event loop on disk I/O
+        return {"inline_data": {"mime_type": "image/jpeg", "data": data}}
+    except Exception:
+        return None
+
+
 async def _gemini_json(prompt: str, *, temperature: float = 0.4,
-                       frames: Optional[list] = None) -> Optional[dict]:
-    """One strict-JSON call to Gemini (text, or text+frames for the vision Critic).
-    Returns None on any failure so callers fall back to deterministic heuristics."""
+                       frames: Optional[list] = None, _retry: bool = True) -> Optional[dict]:
+    """One strict-JSON call to Gemini (text, or text+frames for the vision Critic). Retries ONCE on
+    failure with a valid-JSON nudge before returning None (so callers drop to heuristics). Tracks a
+    fallback rate so degradation is observable, not invisible."""
+    _LLM_STATS["calls"] += 1
     if not settings.gemini_api_key:
+        _LLM_STATS["no_key"] += 1
+        _LLM_STATS["fallback"] += 1
         return None
     parts: list = [{"text": prompt}]
     for fp in (frames or []):
-        try:
-            with open(fp, "rb") as f:
-                parts.append({"inline_data": {"mime_type": "image/jpeg",
-                                              "data": base64.b64encode(f.read()).decode()}})
-        except Exception:
-            pass
+        part = await _read_frame_b64(fp)
+        if part:
+            parts.append(part)
     body = {"contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -82,9 +106,17 @@ async def _gemini_json(prompt: str, *, temperature: float = 0.4,
             r = await c.post(url, json=body)
             r.raise_for_status()
             data = r.json()
-        return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+        out = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+        _LLM_STATS["ok"] += 1
+        return out
     except Exception as e:
-        logger.warning(f"creative_team LLM call failed ({e}); using heuristic fallback")
+        if _retry:
+            logger.warning(f"creative_team LLM call failed ({e}); retrying once")
+            _LLM_STATS["calls"] -= 1   # the retry re-counts the call
+            return await _gemini_json(prompt + "\n\nReturn ONLY valid JSON matching the requested shape.",
+                                      temperature=temperature, frames=frames, _retry=False)
+        logger.warning(f"creative_team LLM call failed twice ({e}); using heuristic fallback")
+        _LLM_STATS["fallback"] += 1
         return None
 
 
@@ -169,15 +201,39 @@ Return STRICT JSON:
     out = await _gemini_json(prompt, temperature=0.3)
     if out:
         return out
-    # heuristic fallback: assume weak hook (most common failure)
-    return {
-        "diagnosis": "Weak opening hook — viewers scroll before the offer lands.",
-        "lagging_metric": "hook_rate",
-        "angle": f"Lead with the strongest proof point of the offer: {offer_desc[:120]}",
-        "keep": ["the offer", "the winning hook angle" if winner_hook else "the core message"],
-        "change": ["stronger first-2-seconds hook", "tighter pacing"],
-        "fix": f"Rewrite the opening to hook in 2s; keep the offer intact. {('Use hook: ' + winner_hook) if winner_hook else ''}".strip(),
-    }
+    # metric-aware heuristic fallback: read loser_metrics to pick the ACTUAL lagging metric via the
+    # domain model, so a down-LLM diagnosis still differs per creative instead of always "weak hook".
+    return _strategist_heuristic(offer_desc, winner_hook, metrics)
+
+
+def _strategist_heuristic(offer_desc: str, winner_hook: str, metrics: dict) -> dict:
+    """Deterministic diagnosis from real metrics (used when the LLM is unavailable)."""
+    v = cm.judge_creative(metrics) if metrics.get("spend") else {}
+    faults = v.get("faults") or []
+    if any(f.get("reason") == "low_offer_cr_delivery" for f in faults):
+        return {"diagnosis": "Offer CR is low — the delivery (character/voice/lip-sync) isn't landing.",
+                "lagging_metric": "offer_cr", "angle": f"Re-cast the delivery for: {offer_desc[:120]}",
+                "keep": ["the offer", "the winning hook angle" if winner_hook else "the core message"],
+                "change": ["stronger, more relatable on-camera delivery", "clearer read of the CTA"],
+                "fix": "Rebuild delivery: warmer, credible talent; keep the offer + script intact."}
+    hook = cm.as_pct(metrics.get("hook_rate"))
+    if hook is not None and hook < 25:
+        return {"diagnosis": f"Weak hook ({hook:.0f}%) — viewers scroll before the offer lands.",
+                "lagging_metric": "hook_rate", "angle": f"Lead with the strongest proof of: {offer_desc[:120]}",
+                "keep": ["the offer", "the winning hook angle" if winner_hook else "the core message"],
+                "change": ["stronger first-2-seconds hook", "tighter pacing"],
+                "fix": f"Rewrite the opening to hook in 2s; keep the offer intact. {('Use hook: ' + winner_hook) if winner_hook else ''}".strip()}
+    hold = cm.as_pct(metrics.get("hold_rate"))
+    if hold is not None and hold < 30:
+        return {"diagnosis": f"Body drags (hold {hold:.0f}%) — viewers drop mid-video.",
+                "lagging_metric": "hold_rate", "angle": f"Tighten the middle for: {offer_desc[:120]}",
+                "keep": ["the offer", "the hook"], "change": ["cut drag", "front-load value"],
+                "fix": "Tighten the body: remove filler, front-load the payoff; keep the offer."}
+    return {"diagnosis": "Conversion lags despite ok engagement — sharpen offer clarity + CTA.",
+            "lagging_metric": v.get("faults") and "offer_cr" or "roas",
+            "angle": f"Sharpen the offer + CTA for: {offer_desc[:120]}",
+            "keep": ["the offer", "the hook"], "change": ["sharper CTA", "clearer offer framing"],
+            "fix": "Sharpen the CTA and offer clarity; keep the winning structure."}
 
 
 # ── 2. Script Writer ──────────────────────────────────────────────────────────
@@ -298,9 +354,23 @@ def shot_selector(*, beats: list, request_type: str, model: str,
             else:
                 strategy, cap = "ai_human_antislop", "talking_head"
         chosen = MPV.route_capability(cap, model)
+        # technique is DERIVED from the chosen source strategy — single source of truth, so it can
+        # never contradict source_strategy (talking strategies → lipsync; inserts/clones → hard_cut).
+        technique = _TECHNIQUE_BY_STRATEGY.get(strategy, "lipsync")
         out.append({**b, "request_type": beat_rt, "shot_type": shot,
-                    "source_strategy": strategy, "capability": cap, "model": chosen})
+                    "source_strategy": strategy, "technique": technique,
+                    "capability": cap, "model": chosen})
     return out
+
+
+# maps each source strategy to its ONE technique (keeps technique/source_strategy consistent)
+_TECHNIQUE_BY_STRATEGY = {
+    "real_footage_lipsync": "lipsync",
+    "ai_human_antislop": "lipsync",
+    "winner_clone": "hard_cut",
+    "real_broll_recut": "hard_cut",
+    "ai_scene_no_face": "insert",
+}
 
 
 # ── 6. Prompt Writer (deterministic composition from the library) ─────────────
@@ -446,7 +516,12 @@ async def run_creative_team(
 ) -> dict:
     """Run the full team (led by the Creative Director) and return an executable CreativePlan:
     {plan, strategy, script, entity_desc, beats:[...], critique}. Every step reports live to the
-    office activity feed under job_id."""
+    office activity feed under job_id.
+
+    NOTE: this orchestrator produces the PLAN (incl. prompt-only critique). The per-beat
+    self-learning eval loop (evaluate_clip → coach_from_eval → bounded retry) runs in the COMPOSER
+    (routes/regen.py `_gen_beat_with_eval`) once each beat's clip is generated — that's where the
+    "grade its own output and coach" feature is wired, since it needs the rendered pixels."""
     # queue the whole team for this job so the office shows them lined up
     for r in act.ROSTER:
         act.enqueue(r["id"], job_id, "creative regeneration")
@@ -509,13 +584,14 @@ async def run_creative_team(
 
 
 def _apply_director_structure(beats: list, structure: list) -> None:
-    """Overlay the leader's per-section technique (lipsync/hard_cut/insert) onto the beats so
-    downstream generation knows where to lip-sync a real person vs hard-cut to an insert."""
+    """Annotate each beat with the SECTION it falls in (hook/body/proof/cta) and record the leader's
+    intended technique as `planned_technique`. It does NOT overwrite `technique` — that is derived
+    from source_strategy in shot_selector (single source of truth) so the two can't contradict."""
     if not structure or not beats:
         return
     n = len(beats)
     for i, b in enumerate(beats):
         # map beat index onto the section it falls in (proportional)
         sec = structure[min(int(i * len(structure) / n), len(structure) - 1)]
-        b["technique"] = sec.get("technique", b.get("technique", "lipsync"))
         b["section"] = sec.get("section", "")
+        b["planned_technique"] = sec.get("technique", "")   # leader's intent (for reporting/QA)
