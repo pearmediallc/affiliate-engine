@@ -1735,9 +1735,107 @@ async def recipe_from_assets(req: RunRequest) -> list:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+async def _veo_wait(op_name: str, timeout: int = 1200):
+    """Poll a Veo 3.1 operation until done (returns the completed status with video_path)."""
+    from ..services.video_creator import VideoCreatorService as VC
+    import time as _t
+    started = _t.time()
+    while _t.time() - started < timeout:
+        st = await asyncio.to_thread(VC.check_status, op_name)
+        if st.get("done"):
+            if st.get("status") == "failed" or not st.get("video_path"):
+                raise RuntimeError(f"Veo operation failed: {st.get('error')}")
+            return st
+        await asyncio.sleep(15)
+    raise RuntimeError("Veo operation timed out")
+
+
+async def recipe_generate(req: RunRequest) -> list:
+    """DIRECT generation from a PROMPT + optional REFERENCE IMAGE(S), engine of the user's choice:
+      • 'seedance' (Kie): reference-image-conditioned clip(s) — Seedance keeps subject/scene/voice
+        consistent within a clip; stitched if a longer duration is asked.
+      • 'veo-extend' (Google Veo 3.1): a base clip (from the image if given, else text) then NATIVE
+        +7s extends for seamless longer video.
+    Reads req.assets = {engine, prompt, image_urls[], seconds}."""
+    assets = req.assets or req.directive.get("assets", {}) or {}
+    engine = (assets.get("engine") or "seedance").lower()
+    prompt = (assets.get("prompt") or "").strip()
+    image_urls = [u for u in (assets.get("image_urls") or []) if u]
+    video_urls = [u for u in (assets.get("video_urls") or []) if u]
+    audio_urls = [u for u in (assets.get("audio_urls") or []) if u]
+    aspect_ratio = assets.get("aspect_ratio") or "9:16"
+    resolution = assets.get("resolution") or "720p"
+    generate_audio = assets.get("generate_audio", True)
+    seconds = int(assets.get("seconds") or (16 if engine == "veo-extend" else 15))
+    if not prompt:
+        raise RuntimeError("generate: prompt required")
+
+    work = tempfile.mkdtemp()
+    W, H = 1080, 1920
+    try:
+        name, out_path, url = _out_url(req, "genvideo")
+
+        if engine in ("veo-extend", "veo", "veo3-google"):
+            from ..services.video_creator import VideoCreatorService as VC
+            segs = max(1, min(4, round(seconds / 7.5)))   # base 8s + (segs-1)×7s
+            if image_urls:
+                imgp = await _download_to_temp(image_urls[0], suffix=".png")
+                base = await asyncio.to_thread(VC.generate_from_image, imgp, prompt, "9:16", 8)
+            else:
+                base = await asyncio.to_thread(VC.generate_video, prompt, "9:16", "720p", "8")
+            st = await _veo_wait(base["operation_name"])
+            paths = [st["video_path"]]; prev = base["operation_name"]
+            for k in range(1, segs):
+                await _abort_if_cancelled(req, f"veo extend {k}")
+                ext = await asyncio.to_thread(VC.extend_video, prev, prompt)
+                st = await _veo_wait(ext["operation_name"])
+                paths.append(st["video_path"]); prev = ext["operation_name"]
+            if len(paths) == 1:
+                import shutil; shutil.copy(paths[0], out_path)
+            else:
+                lst = os.path.join(work, "l.txt")
+                with open(lst, "w") as f:
+                    for p in paths:
+                        f.write(f"file '{p}'\n")
+                await asyncio.to_thread(_ffmpeg,
+                    ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+                     "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+            approx = 8 + 7 * (len(paths) - 1)
+            return [{"recipe": "Generate — Veo 3.1 extend", "video_url": url, "confidence": 0.7,
+                     "whats_changed": (f"Veo 3.1 {'image-to-video + ' if image_urls else ''}native extend — "
+                        f"{len(paths)} segment(s) (~{approx}s) from your prompt.")}]
+
+        # ── Seedance 2.0 (Kie) — native single clip up to 15s, full reference set ──
+        from ..services import kieai_service
+        dur = max(4, min(15, seconds))   # Seedance range 4-15s
+        res = await asyncio.to_thread(
+            kieai_service.generate_video_seedance,
+            prompt=prompt,
+            reference_image_urls=(image_urls or None),
+            reference_video_urls=(video_urls or None),
+            reference_audio_urls=(audio_urls or None),
+            duration=dur, resolution=resolution, aspect_ratio=aspect_ratio,
+            generate_audio=bool(generate_audio))
+        vp = res.get("local_path") or res.get("video_path")
+        if not vp or not os.path.exists(vp):
+            raise RuntimeError("generate: Seedance produced no clip (check Kie credits)")
+        import shutil; shutil.copy(vp, out_path)
+        refs = []
+        if image_urls: refs.append(f"{len(image_urls)} image(s)")
+        if video_urls: refs.append(f"{len(video_urls)} video(s)")
+        if audio_urls: refs.append(f"{len(audio_urls)} audio")
+        return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
+                 "whats_changed": (f"Seedance 2.0 · {dur}s · {aspect_ratio} · {resolution}"
+                    f"{' · refs: ' + ', '.join(refs) if refs else ''}"
+                    f"{' · audio' if generate_audio else ''} — from your prompt.")}]
+    finally:
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
 _RECIPES = {
     "Full Ad": recipe_full_ad,
     "Create from Assets": recipe_from_assets,
+    "Generate Video": recipe_generate,
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,
     "Hook Change Only": recipe_hook_change,
