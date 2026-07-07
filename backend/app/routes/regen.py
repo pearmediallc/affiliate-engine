@@ -537,6 +537,19 @@ class RunRequest(BaseModel):
     active_url: Optional[str] = None
 
 
+class CreativeTeamRequest(BaseModel):
+    offer_desc: str
+    job_id: Optional[str] = None
+    vertical: str = ""
+    request_type: str = "ugc"
+    model: str = "seedance-2"
+    loser_transcript: str = ""
+    winner_hook: str = ""
+    winner_transcript: str = ""
+    has_real_character: bool = False
+    has_winner_video: bool = False
+
+
 class Cancelled(Exception):
     """Raised when the user cancelled the job; stops before spending more credits."""
 
@@ -724,6 +737,40 @@ async def winner_db_test(vertical: str = "", _auth: bool = Depends(require_servi
     from ..services import winner_library
     vs = [vertical] if vertical else None
     return {"success": True, **winner_library.health(vs)}
+
+
+# ── Creative Team "office" (live feed + reports) ──────────────────────────────
+@router.get("/creative-team/activity")
+async def creative_team_activity(_auth: bool = Depends(require_service_key)):
+    """Live office state: every persona's desk, status (idle/queued/working), current job/task,
+    and the recent activity feed. Polled by the ORBIT Creative Team Room."""
+    from ..services import creative_team_activity as act
+    return {"success": True, **act.snapshot()}
+
+
+@router.get("/creative-team/reports")
+async def creative_team_reports(_auth: bool = Depends(require_service_key)):
+    """Per-persona performance ledger: runs, accuracy, revise-rate, helpfulness, avg time."""
+    from ..services import creative_team_activity as act
+    return {"success": True, **act.reports()}
+
+
+@router.post("/creative-team/plan")
+async def creative_team_plan(req: "CreativeTeamRequest", _auth: bool = Depends(require_service_key)):
+    """Run the creative team to produce a shot PLAN (no generation) — useful to preview what the
+    team decides and to drive the office UI on demand."""
+    from ..services import creative_team as team
+    try:
+        plan = await team.run_creative_team(
+            offer_desc=req.offer_desc, job_id=req.job_id or "plan-preview",
+            vertical=req.vertical, request_type=req.request_type, model=req.model,
+            loser_transcript=req.loser_transcript, winner_hook=req.winner_hook,
+            winner_transcript=req.winner_transcript,
+            has_real_character=req.has_real_character, has_winner_video=req.has_winner_video)
+        return {"success": True, "plan": plan}
+    except Exception as e:
+        logger.error(f"creative-team plan failed: {e}")
+        return {"success": False, "error": str(e)}
 
 
 @router.post("/interpret")
