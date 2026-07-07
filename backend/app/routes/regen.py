@@ -1427,20 +1427,6 @@ async def recipe_full_ad(req: RunRequest) -> list:
         lw = winner_library.fetch_winners(vertical, limit=1)
         winner_hook = lw[0].get("hook", "") if lw else ""
 
-        # SCRIPT: enhanced loser targeting the lagging metric, keeping the offer + winner hook angle
-        script = transcript
-        try:
-            d = await _gemini_json(
-                'Rewrite this into a tight first-person UGC ad script (~30-40s spoken) that KEEPS the '
-                f'offer and claims but hooks harder in the first line. {("Focus: "+hint) if hint else ""} '
-                f'{("Open with this winning angle: "+winner_hook) if winner_hook else ""} '
-                f'Original: "{transcript[:1200]}". Return JSON {{"script":"..."}}')
-            script = (d.get("script") or transcript).strip()
-        except Exception as e:
-            logger.warning(f"full_ad script rewrite failed: {e}")
-        if not script.strip():
-            raise RuntimeError("no script to compose from")
-
         # ENTITY ANCHOR = the loser's REAL spokesperson frame (real identity, reused every clip)
         anchor_url = _frame_to_public_url(orig, min(1.5, (dur or 3) * 0.3))
         entity_desc = ""
@@ -1453,23 +1439,37 @@ async def recipe_full_ad(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"entity describe failed: {e}")
 
-        clips_text = rpe.split_into_clips(script)[:4]   # cap 4 clips (~48s) to bound cost/time
-        model = MultiProviderVideoService.route_capability("reference_to_video", req.model) or \
-                MultiProviderVideoService.route_capability("image_to_video", req.model)
+        # THE CREATIVE TEAM runs the plan (leader → strategist → script → director → shots →
+        # prompts → critic). This lights up the office live-feed under this job's request_id, and
+        # returns per-beat anti-slop prompts composed from the Prompt Reference Library.
+        from ..services import creative_team as team
+        plan = await team.run_creative_team(
+            offer_desc=(hint or transcript[:300] or "the offer in this ad"),
+            job_id=req.request_id, vertical=vertical,
+            request_type=(req.variation_type or "ugc"), model=req.model or "seedance-2",
+            loser_transcript=transcript, winner_hook=winner_hook,
+            entity_desc=entity_desc,
+            has_real_character=bool(anchor_url), has_winner_video=bool(lw),
+            n_reference_images=1 if anchor_url else 0)
+        beats = (plan.get("beats") or [])[:4]   # cap 4 clips (~48s) to bound cost/time
+        script = plan.get("script", transcript)
+        if not beats:
+            raise RuntimeError("creative team produced no beats to compose from")
 
         shots, caps = [], []
-        for i, line in enumerate(clips_text):
-            await _abort_if_cancelled(req, f"clip {i+1}/{len(clips_text)}")
-            prompt = rpe.build_prompt(
-                model=model, action="the speaker talks directly to camera with a natural gesture",
-                request_type=(req.variation_type or "ugc"),
-                entity_desc=entity_desc, environment="authentic home interior, lived-in details",
-                line=line, vertical=vertical,
+        for i, b in enumerate(beats):
+            await _abort_if_cancelled(req, f"clip {i+1}/{len(beats)}")
+            line = b.get("line", "")
+            prompt = b.get("prompt") or rpe.build_prompt(
+                model=b.get("model") or "seedance-2", action=b.get("action", "talks to camera"),
+                request_type=b.get("request_type", "ugc"), entity_desc=entity_desc,
+                environment=b.get("environment", ""), line=line, vertical=vertical,
                 n_reference_images=1 if anchor_url else 0)
+            beat_model = b.get("model") or MultiProviderVideoService.route_capability("reference_to_video", req.model)
             try:
                 res = await asyncio.to_thread(
                     MultiProviderVideoService.generate, prompt=prompt, shot_type="b_roll",
-                    duration=min(12, max(6, len(line.split()) // 2 + 4)), preferred_model=model,
+                    duration=min(12, max(6, len(line.split()) // 2 + 4)), preferred_model=beat_model,
                     reference_image_urls=([anchor_url] if anchor_url else None), s3_prefix="regen")
                 vp = res.get("video_path")
                 if vp and os.path.exists(vp):
