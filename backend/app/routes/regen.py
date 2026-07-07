@@ -665,6 +665,50 @@ async def seedance_test_status(task_id: str, _auth: bool = Depends(require_servi
             "failMsg": d.get("failMsg"), "costTime": d.get("costTime")}
 
 
+@router.post("/tag-asset")
+async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: str = Form(""),
+                    _auth: bool = Depends(require_service_key)):
+    """Index one asset: transcribe + vision-tag so the composer can pull ACCURATE references.
+    Returns {transcript, duration, has_captions, role, character, scene, on_screen, emotion}."""
+    work = tempfile.mkdtemp()
+    p = None
+    try:
+        p = await _download_to_temp(url)
+        dur = await asyncio.to_thread(_ffprobe_duration, p)
+        transcript = ""
+        try:
+            transcript = await _transcribe_file(p)
+        except Exception as e:
+            logger.warning(f"tag-asset transcribe failed: {e}")
+        d = dur or 6.0
+        frames = await asyncio.to_thread(_extract_frames, p, [max(0.3, d*f) for f in (0.1, 0.4, 0.7, 0.9)], work)
+        tags = {}
+        if frames:
+            try:
+                tags = await _gemini_vision(frames,
+                    'These frames are from an ad-library video clip. Return STRICT JSON describing it for a '
+                    'creative reference index: {"role":"talking_head|map|broll|product|proof", '
+                    '"character":"<short: age/gender/look, or none>", "scene":"<setting in <=8 words>", '
+                    '"on_screen":"<key objects/proof e.g. document, phone, house, cash, or none>", '
+                    '"emotion":"<energy/expression in 1-2 words>"}')
+            except Exception as e:
+                logger.warning(f"tag-asset vision failed: {e}")
+        has_caps = _boxes_area(await _detect_caption_boxes(frames)) > 0.03 if frames else False
+        return {"success": True, "url": url, "kind": kind, "vertical": vertical,
+                "duration": round(dur or 0, 1), "has_captions": has_caps,
+                "transcript": (transcript or "")[:1500],
+                "role": tags.get("role") or kind, "character": tags.get("character") or "",
+                "scene": tags.get("scene") or "", "on_screen": tags.get("on_screen") or "",
+                "emotion": tags.get("emotion") or ""}
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:180]}"}
+    finally:
+        try:
+            if p: os.remove(p)
+        except OSError: pass
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
 @router.get("/winners")
 async def winners(vertical: str = "", limit: int = 12, _auth: bool = Depends(require_service_key)):
     """List competitor winners (scraper library) for a vertical — playable video_url + hook +
