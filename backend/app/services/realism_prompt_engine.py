@@ -80,49 +80,51 @@ def build_prompt(
     *,
     model: str,
     action: str,                       # the ONE continuous action for this clip
+    request_type: str = "ugc",         # ugc | testimonial | broll | product | cinematic | animated | map | image | fast_cuts
     entity_desc: str = "",             # locked character/subject description (reused every clip)
     environment: str = "",             # dense authentic setting detail
-    camera: str = "handheld selfie-style vertical 9:16",
-    lighting: str = "soft natural indoor light",
+    camera: Optional[str] = None,      # override; else the request-type profile's camera
+    lighting: Optional[str] = None,    # override; else the profile's lighting
     line: Optional[str] = None,        # exact spoken line (for lip-sync)
-    style: str = "realistic",
     vertical: str = "",
     n_reference_images: int = 0,
     has_reference_video: bool = False,
     audio: bool = True,
 ) -> str:
-    """Assemble a front-loaded, anti-slop, one-action prompt in the chosen model's dialect."""
-    style_layer = STYLE_LAYERS.get(style, REALISM_LAYER)
+    """Compose a front-loaded, one-action prompt for THIS request type by pulling the matching
+    STYLE PROFILE + rules from the Prompt Reference Library (not a hardcoded single style)."""
+    from . import prompt_reference_library as lib
+    ref = lib.retrieve(request_type, model)
+    prof = ref["profile"]
+    cam = camera or prof.get("camera", "vertical 9:16")
+    lit = lighting or prof.get("lighting", "natural light")
+
     parts = []
-    # 1) CAMERA (front-loaded)
-    parts.append(f"Camera: {camera}.")
-    # 2) SUBJECT (locked entity — identical every clip for consistency)
-    if entity_desc:
-        parts.append(f"Subject: {entity_desc}. Maintain identical face, hair and wardrobe throughout.")
-    # 3) ENVIRONMENT (dense authentic detail)
-    if environment:
+    parts.append(f"Camera: {cam}.")                                   # 1) front-loaded camera
+    if entity_desc:                                                    # 2) locked subject
+        parts.append(f"Subject: {entity_desc}. Keep identical face, hair and wardrobe throughout.")
+    if environment:                                                    # 3) environment
         parts.append(f"Environment: {environment}.")
-    # 4) LIGHTING
-    parts.append(f"Lighting: {lighting}.")
-    # 5) ONE ACTION (single continuous beat; no temporal chaining)
-    parts.append(f"Action (one continuous motion, no cuts): {action.strip()}.")
+    parts.append(f"Lighting: {lit}.")                                 # 4) lighting
+    parts.append(f"Action (one continuous motion, no cuts): {action.strip()}.")   # 5) one action
     if line:
         parts.append(f'They say exactly: "{line.strip()}" with matching lip movement and natural expression.')
-    # 6) STYLE + realism/anti-slop
-    parts.append(style_layer)
-    # 7) AUDIO
-    if audio:
-        parts.append(AUDIO_LAYER)
-    # 8) hard no-text rule (captions are added by us afterwards)
-    parts.append("Absolutely NO on-screen text, captions, subtitles or watermarks — clean footage only.")
+    parts.append(prof["look"])                                        # 6) request-type aesthetic (anti-slop)
+    if ref["exemplars"]:                                              # 7) reference patterns for this type
+        parts.append("Follow these proven patterns: " + " ".join(ref["exemplars"]))
+    if audio and prof.get("audio"):                                  # 8) audio guidance
+        parts.append(f"Audio: {prof['audio']}.")
+    parts.append("No on-screen text/captions/subtitles/watermarks — clean footage (captions added later).")
     prompt = " ".join(parts)
+    if ref["model_rule"]:
+        prompt += " " + ref["model_rule"]
     prompt += _mentions(model, n_reference_images, has_reference_video)
-    return prompt[:1900]  # keep well under model prompt caps
+    return prompt[:1900]
 
 
 def build_winner_clone_prompt(
     *, model: str, offer_desc: str, winner_hook: str = "", entity_desc: str = "",
-    vertical: str = "", n_reference_images: int = 0, style: str = "realistic",
+    vertical: str = "", n_reference_images: int = 0, request_type: str = "ugc",
 ) -> str:
     """Prompt for cloning a proven winner's structure onto THIS offer (reference-to-video)."""
     action = (
@@ -132,8 +134,7 @@ def build_winner_clone_prompt(
         + "The subject is already speaking energetically from the first frame — no intro or silent lead-in"
     )
     return build_prompt(
-        model=model, action=action, entity_desc=entity_desc,
+        model=model, action=action, request_type=request_type, entity_desc=entity_desc,
         environment="authentic lived-in real-world setting for the offer",
-        style=style, vertical=vertical, n_reference_images=n_reference_images,
-        has_reference_video=True,
+        vertical=vertical, n_reference_images=n_reference_images, has_reference_video=True,
     )

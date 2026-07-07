@@ -314,7 +314,7 @@ async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
 async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: int = 6,
                          model: Optional[str] = None, reference_video_urls: Optional[list] = None,
                          reference_image_urls: Optional[list] = None, winner_hook: Optional[str] = None,
-                         vertical: Optional[str] = None) -> Optional[str]:
+                         vertical: Optional[str] = None, request_type: str = "ugc") -> Optional[str]:
     """Generate a CONVERSION-FIRST clip.
 
     WINNER-CLONE mode (preferred, when a winning reference VIDEO is supplied): recreate a
@@ -337,13 +337,13 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
         if cloning:
             prompt = rpe.build_winner_clone_prompt(
                 model=(model or "seedance-2"), offer_desc=offer_desc, winner_hook=(winner_hook or ""),
-                vertical=(vertical or ""), n_reference_images=nimg, style="realistic")
+                vertical=(vertical or ""), n_reference_images=nimg, request_type=request_type)
         else:
             prompt = rpe.build_prompt(
-                model=(model or "higgsfield-v1"),
+                model=(model or "higgsfield-v1"), request_type=request_type,
                 action=f"a real-world scene that sells this offer: {offer_desc[:200]}",
                 environment="authentic lived-in real-world setting relevant to the offer",
-                style="realistic", vertical=(vertical or ""),
+                vertical=(vertical or ""),
                 n_reference_images=nimg, has_reference_video=bool(reference_video_urls))
     except Exception as e:
         logger.warning(f"realism prompt build failed, using offer_desc: {e}")
@@ -1081,7 +1081,7 @@ async def recipe_hook_change(req: RunRequest) -> list:
         if not src_path:
             ref_vids = [lib_winners[0]["url"]] if lib_winners else None  # Seedance motion ref
             gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=max(4, int(hook_end) + 1),
-                                       model=req.model, reference_video_urls=ref_vids)
+                                       model=req.model, reference_video_urls=ref_vids, request_type="broll")
             if gen:
                 src_path, src_label, is_winner = gen, "an AI-generated on-offer clip (Veo/Higgsfield)", False
         if not src_path:
@@ -1251,7 +1251,8 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                     model=MultiProviderVideoService.route_capability("reference_to_video", req.model),
                     reference_video_urls=[winner_clip],
                     reference_image_urls=(ref_imgs or None),
-                    winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"))
+                    winner_hook=_lw[0].get("hook"), vertical=req.context.get("vertical"),
+                    request_type=(req.variation_type or "ugc"))
                 if gen:
                     clip = {"local_path": gen, "id": "winner-clone (Seedance)"}
                 else:
@@ -1270,7 +1271,8 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
 
         # ── else: plain AI generation (no winner) ─────────────────────────────
         if not clip:
-            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=6, model=req.model)
+            gen = await _generate_clip(offer_desc, shot_type="b_roll", duration=6, model=req.model,
+                                       request_type="broll")
             if gen:
                 clip = {"local_path": gen, "id": "ai-generated"}
         if not clip:
@@ -1413,8 +1415,9 @@ async def recipe_full_ad(req: RunRequest) -> list:
             await _abort_if_cancelled(req, f"clip {i+1}/{len(clips_text)}")
             prompt = rpe.build_prompt(
                 model=model, action="the speaker talks directly to camera with a natural gesture",
+                request_type=(req.variation_type or "ugc"),
                 entity_desc=entity_desc, environment="authentic home interior, lived-in details",
-                line=line, style="realistic", vertical=vertical,
+                line=line, vertical=vertical,
                 n_reference_images=1 if anchor_url else 0)
             try:
                 res = await asyncio.to_thread(
