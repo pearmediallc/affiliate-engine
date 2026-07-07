@@ -535,6 +535,7 @@ class RunRequest(BaseModel):
     node: Optional[str] = None
     callback_url: Optional[str] = None
     active_url: Optional[str] = None
+    assets: dict = {}                # "Create from Assets": {image_urls:[], script, do_voiceover}
 
 
 class CreativeTeamRequest(BaseModel):
@@ -737,6 +738,31 @@ async def winner_db_test(vertical: str = "", _auth: bool = Depends(require_servi
     from ..services import winner_library
     vs = [vertical] if vertical else None
     return {"success": True, **winner_library.health(vs)}
+
+
+@router.post("/upload-images")
+async def upload_images(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Save base64 scenic images to the public /uploads dir and return their public URLs, so the
+    'Create from Assets' recipe (and image-to-video providers) can fetch them. Input:
+    {images:[{name, data_b64}]} → {urls:[...]}"""
+    import uuid as _uuid
+    urls = []
+    for im in (payload.get("images") or []):
+        data_b64 = im.get("data_b64") or ""
+        if "," in data_b64 and data_b64.strip().startswith("data:"):
+            data_b64 = data_b64.split(",", 1)[1]           # strip data URI prefix if present
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            continue
+        ext = os.path.splitext(im.get("name") or "")[1].lower() or ".png"
+        if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            ext = ".png"
+        name = f"asset_{_uuid.uuid4().hex[:8]}{ext}"
+        with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
+            f.write(raw)
+        urls.append(f"{AE_PUBLIC_URL}/api/v1/uploads/{name}")
+    return {"success": bool(urls), "urls": urls}
 
 
 # ── Creative Team "office" (live feed + reports) ──────────────────────────────
@@ -1516,8 +1542,120 @@ async def recipe_full_ad(req: RunRequest) -> list:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+async def recipe_from_assets(req: RunRequest) -> list:
+    """CREATE FROM ASSETS — the user brings their OWN scenic images + a script and we produce a
+    finished, narrated, captioned video end-to-end (no losing creative involved).
+      script -> creative team beats + anti-slop prompts -> per beat image-to-video from the
+      matching scenic image -> stitch -> voiceover (TTS of the script) -> clean captions -> save.
+    This runs through the creative team so the office lights up + the eval loop grades it."""
+    assets = req.assets or req.directive.get("assets", {}) or {}
+    image_urls = [u for u in (assets.get("image_urls") or []) if u]
+    script = (assets.get("script") or "").strip()
+    do_vo = assets.get("do_voiceover", True)
+    vertical = req.context.get("vertical", "")
+    if not image_urls:
+        raise RuntimeError("from_assets: no scenic images provided")
+    if not script:
+        raise RuntimeError("from_assets: no script provided")
+
+    work = tempfile.mkdtemp()
+    W, H = 1080, 1920
+    try:
+        from ..services import creative_team as team
+        # scenic images → 'broll' request type (no talking head); the team composes anti-slop prompts
+        plan = await team.run_creative_team(
+            offer_desc=script[:300], job_id=req.request_id, vertical=vertical,
+            request_type=(req.variation_type if req.variation_type in ("broll", "Broll") else "broll"),
+            model=req.model or "seedance-2", loser_transcript=script,
+            has_real_character=False, has_winner_video=False, n_reference_images=1)
+        beats = plan.get("beats") or []
+        if not beats:
+            beats = [{"i": i, "line": s, "prompt": "", "request_type": "broll"}
+                     for i, s in enumerate(rpe.split_into_clips(script))]
+        beats = beats[:6]  # bound cost/time
+
+        i2v_model = MultiProviderVideoService.route_capability("image_to_video", req.model)
+        shots, caps = [], []
+        for i, b in enumerate(beats):
+            await _abort_if_cancelled(req, f"asset clip {i+1}/{len(beats)}")
+            img = image_urls[i % len(image_urls)]      # cycle images across beats
+            line = b.get("line", "")
+            prompt = b.get("prompt") or rpe.build_prompt(
+                model=i2v_model, action="the scene comes alive with subtle natural motion",
+                request_type="broll", environment="the scene in the provided image",
+                vertical=vertical, n_reference_images=1)
+            try:
+                res = await asyncio.to_thread(
+                    MultiProviderVideoService.generate, prompt=prompt, shot_type="b_roll",
+                    duration=min(10, max(4, len(line.split()) // 2 + 4)), preferred_model=i2v_model,
+                    reference_image_urls=[img], s3_prefix="regen")
+                vp = res.get("video_path")
+                if vp and os.path.exists(vp):
+                    shots.append(vp); caps.append(line)
+            except Exception as e:
+                logger.warning(f"from_assets clip {i+1} gen failed: {e}")
+
+        if not shots:
+            raise RuntimeError("from_assets: no clips generated (check image-to-video provider/credits)")
+
+        # normalize + burn OUR clean caption per clip
+        norm = []
+        for i, (sp, line) in enumerate(zip(shots, caps)):
+            cap = " ".join(line.split()[:8])
+            cpng = os.path.join(work, f"c{i}.png")
+            await asyncio.to_thread(_make_caption_png, cap, W, H, cpng)
+            npath = os.path.join(work, f"n{i}.mp4")
+            await asyncio.to_thread(_ffmpeg,
+                ["-i", sp, "-i", cpng, "-filter_complex",
+                 f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[v0];[v0][1:v]overlay=0:0[v]",
+                 "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                 "-pix_fmt", "yuv420p", "-r", "30", npath], timeout=300)
+            norm.append(npath)
+
+        stitched = os.path.join(work, "stitched.mp4")
+        if len(norm) == 1:
+            import shutil; shutil.copy(norm[0], stitched)
+        else:
+            lst = os.path.join(work, "list.txt")
+            with open(lst, "w") as f:
+                for n in norm:
+                    f.write(f"file '{n}'\n")
+            await asyncio.to_thread(_ffmpeg,
+                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "22", "-pix_fmt", "yuv420p", stitched], timeout=600)
+
+        # VOICEOVER: narrate the script over the stitched scenic clips
+        name, out_path, url = _out_url(req, "assets")
+        vo_path = None
+        if do_vo:
+            try:
+                from ..services.speech_generator import SpeechGeneratorService
+                sp = await SpeechGeneratorService().generate_speech(script)
+                vo_path = os.path.join(work, "vo.mp3")
+                with open(vo_path, "wb") as f:
+                    f.write(sp["audio_data"])
+            except Exception as e:
+                logger.warning(f"from_assets voiceover failed (continuing silent): {e}")
+        if vo_path and os.path.exists(vo_path):
+            # loop/trim video to the voiceover length so narration is never cut off
+            await asyncio.to_thread(_ffmpeg,
+                ["-stream_loop", "-1", "-i", stitched, "-i", vo_path, "-map", "0:v", "-map", "1:a",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "192k", "-shortest", out_path], timeout=600)
+        else:
+            import shutil; shutil.copy(stitched, out_path)
+
+        return [{"recipe": "Create from Assets", "video_url": url, "confidence": 0.7,
+                 "whats_changed": (f"Built a {len(norm)}-clip video from your {len(image_urls)} scenic "
+                    f"image(s) + script: each scene animated (image-to-video), anti-slop prompts, "
+                    f"{'voiceover narration, ' if vo_path else ''}clean captions.")}]
+    finally:
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
 _RECIPES = {
     "Full Ad": recipe_full_ad,
+    "Create from Assets": recipe_from_assets,
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,
     "Hook Change Only": recipe_hook_change,
