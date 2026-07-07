@@ -582,14 +582,14 @@ def revised_prompt(prompt: str, issues: list) -> str:
     return ((prompt or "") + fix)[:MAX_PROMPT]
 
 
-def coach_from_eval(beat: dict, ev: dict) -> None:
+def coach_from_eval(beat: dict, ev: dict, job_id: Optional[str] = None) -> None:
     """Turn a failed eval into ACTION: dock + coach each faulted persona (the one-on-one), and fold
     the concrete corrections into this beat's prompt so the retry is actually better. (Uses the pure
     revised_prompt() for the prompt rewrite so that half is unit-testable.)"""
     issues = ev.get("issues") or []
     note = "; ".join(issues)[:200] or "output scored below the quality bar — tighten realism/delivery."
     for p in (ev.get("fault_personas") or []):
-        act.coach(p, note)
+        act.coach(p, note, job_id=job_id)
     if issues:
         beat["prompt"] = revised_prompt(beat.get("prompt", ""), issues)
 

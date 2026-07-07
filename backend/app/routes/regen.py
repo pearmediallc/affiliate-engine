@@ -776,10 +776,20 @@ async def creative_team_activity(_auth: bool = Depends(require_service_key)):
 
 @router.get("/creative-team/reports")
 async def creative_team_reports(_auth: bool = Depends(require_service_key)):
-    """Per-persona performance ledger: runs, accuracy, revise-rate, helpfulness, avg time."""
+    """Per-persona performance ledger (durable, aggregated from Postgres): runs, accuracy,
+    revise-rate, helpfulness, accountability, faults, coaching, avg time."""
     from ..services import creative_team_activity as act
     from ..services import creative_team as team
     return {"success": True, **act.reports(), "llm_health": team.llm_health()}
+
+
+@router.get("/creative-team/audit")
+async def creative_team_audit(job_id: str = "", persona: str = "", limit: int = 300,
+                              _auth: bool = Depends(require_service_key)):
+    """DURABLE per-task / per-persona audit trail (from Postgres). Pass job_id (=request_id) to see
+    exactly what every persona did for that job — steps, evals, faults, coaching, retries."""
+    from ..services import creative_team_activity as act
+    return {"success": True, **act.audit(job_id or None, persona or None, limit)}
 
 
 @router.post("/creative-team/grade")
@@ -1477,11 +1487,11 @@ async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -
                    helpfulness=float(ev.get("overall", 10)) / 10.0)
         if ok:
             for p in ("prompt", "character", "shots"):
-                act.reward(p)
+                act.reward(p, job_id=job_id)
             return clip
         if attempts >= team.MAX_BEAT_RETRIES:
             break
-        team.coach_from_eval(beat, ev)          # one-on-one + rewrite the beat prompt for the retry
+        team.coach_from_eval(beat, ev, job_id=job_id)   # one-on-one + rewrite the beat prompt for the retry
         attempts += 1
     return clip                                  # bounded: return the last (best-effort) attempt
 

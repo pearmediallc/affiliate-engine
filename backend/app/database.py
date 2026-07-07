@@ -29,6 +29,7 @@ def get_db():
 
 def init_db():
     """Initialize database - creates all tables, then runs additive migrations."""
+    from . import models  # noqa: F401 — ensure ALL models are registered on Base before create_all
     Base.metadata.create_all(bind=engine)
     # Apply additive column migrations (User.status, etc.) so existing DBs upgrade in place.
     try:

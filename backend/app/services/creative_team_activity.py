@@ -1,19 +1,26 @@
 """
-Creative Team Activity — the "office" live-feed + performance ledger
-====================================================================
-Tracks what every persona on the creative team is doing RIGHT NOW (for the visual office-room
-UI: who is working, who is queued, on which job, and how helpful the output was), plus a rolling
-per-persona performance ledger (accuracy / pass-rate / avg time) for the Reports section.
+Creative Team Activity — the "office" live-feed + DURABLE performance/audit ledger
+=================================================================================
+Two layers:
+  • LIVE (in-memory): who is working RIGHT NOW / queued — powers the office desks. Ephemeral,
+    per-worker, rebuilt continuously; losing it on restart is fine (it's "now").
+  • DURABLE (Postgres, creative_team_events): every completed step, eval, coaching and reward is
+    written as a row. This is the permanent audit trail — survives restarts/deploys, is drillable
+    per job (audit(job_id)), and (being in the shared DB) is consistent across workers.
 
-In-process singleton (single worker) — snapshot() feeds the live office UI, reports() feeds the
-Reports tab. Bounded history so it never grows unbounded.
+reports()/get_coaching()/audit() read from Postgres so history + accountability + coaching persist.
+snapshot() stays in-memory for live speed. DB writes are best-effort — if the DB is briefly down,
+the live view still works and nothing crashes.
 """
 from __future__ import annotations
 
 import time
+import logging
 import threading
 from collections import deque
 from typing import Optional, Any
+
+logger = logging.getLogger(__name__)
 
 # Fixed roster — desks in the office, in seating order. The Creative Director (leader) is first.
 ROSTER = [
@@ -55,29 +62,75 @@ _FEED: deque = deque(maxlen=200)
 _QUEUE: dict = {r["id"]: [] for r in ROSTER}
 
 
-def coach(persona: str, note: str, *, penalty: float = 8.0) -> None:
-    """Record a corrective 'one-on-one' for a persona after a fault: store the coaching note
-    (injected into its next prompt) and dock its accountability score. Recovers slowly on passes."""
+# accountability tuning (kept as constants so DB-derived score matches the intent)
+FAULT_PENALTY = 8.0
+REWARD_GAIN = 2.0
+
+
+def _persist(persona: str, event: str, *, job_id: Optional[str] = None, task: str = "",
+             detail: str = "", ms: Optional[int] = None, ok: Optional[bool] = None,
+             revised: Optional[bool] = None, helpfulness: Optional[float] = None) -> None:
+    """Best-effort write of ONE durable audit row to Postgres. Never raises to the caller."""
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreativeTeamEvent
+        db = SessionLocal()
+        try:
+            db.add(CreativeTeamEvent(
+                job_id=job_id, persona=persona, role=(_ROSTER_BY_ID.get(persona, {}) or {}).get("role"),
+                event=event, task=(task or "")[:2000], detail=(detail or "")[:2000],
+                ms=ms, ok=ok, revised=revised, helpfulness=helpfulness))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"creative_team audit persist failed ({event}/{persona}): {e}")
+
+
+def coach(persona: str, note: str, *, penalty: float = FAULT_PENALTY, job_id: Optional[str] = None) -> None:
+    """Record a corrective 'one-on-one' for a persona after a fault: persist it (durable), keep it
+    in the live feed, and dock the in-memory accountability. The DURABLE score is derived from the
+    persisted 'coached'/'reward' rows in reports()."""
     if persona not in _COACHING or not (note or "").strip():
         return
+    note = note.strip()
     with _LOCK:
-        _COACHING[persona].appendleft(note.strip())
+        _COACHING[persona].appendleft(note)
         led = _LEDGER.get(persona)
         if led is not None:
             led["faults"] += 1
             led["accountability"] = max(0.0, led["accountability"] - penalty)
-        _FEED.appendleft({"t": _now(), "persona": persona, "event": "coached", "detail": note.strip()[:160]})
+        _FEED.appendleft({"t": _now(), "persona": persona, "event": "coached", "detail": note[:160]})
+    _persist(persona, "coached", job_id=job_id, detail=note)
 
 
-def reward(persona: str, *, gain: float = 2.0) -> None:
+def reward(persona: str, *, gain: float = REWARD_GAIN, job_id: Optional[str] = None) -> None:
     """A clean pass nudges accountability back up (teams improve as they stop making the mistake)."""
     with _LOCK:
         led = _LEDGER.get(persona)
         if led is not None:
             led["accountability"] = min(100.0, led["accountability"] + gain)
+    _persist(persona, "reward", job_id=job_id)
 
 
 def get_coaching(persona: str) -> list:
+    """Latest coaching notes for a persona — from the DURABLE store so coaching survives restarts
+    and is shared across workers. Falls back to the in-memory deque if the DB is unavailable."""
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreativeTeamEvent
+        db = SessionLocal()
+        try:
+            rows = (db.query(CreativeTeamEvent.detail)
+                      .filter(CreativeTeamEvent.persona == persona, CreativeTeamEvent.event == "coached")
+                      .order_by(CreativeTeamEvent.created_at.desc()).limit(8).all())
+            notes = [r[0] for r in rows if r[0]]
+            if notes:
+                return notes
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"get_coaching DB read failed: {e}")
     with _LOCK:
         return list(_COACHING.get(persona, []))
 
@@ -117,6 +170,7 @@ def finish(persona: str, started: float, *, ok: bool = True, revised: bool = Fal
     ts = _now()
     ms = int((ts - (started or ts)) * 1000)
     with _LOCK:
+        jid = (_STATE.get(persona) or {}).get("job_id")   # capture before we reset to idle
         led = _LEDGER.get(persona)
         if led is not None:
             led["runs"] += 1
@@ -136,9 +190,11 @@ def finish(persona: str, started: float, *, ok: bool = True, revised: bool = Fal
                                "job_id": None, "task": None, "since": None,
                                "last": {"t": ts, "ms": ms, "ok": ok, "revised": revised,
                                         "detail": detail[:160]}}
-        _FEED.appendleft({"t": ts, "persona": persona,
-                          "event": "revise" if revised else ("done" if ok else "fail"),
-                          "ms": ms, "detail": detail[:160]})
+        event = "revise" if revised else ("done" if ok else "fail")
+        _FEED.appendleft({"t": ts, "persona": persona, "event": event, "ms": ms, "detail": detail[:160]})
+    # DURABLE: record the completed step (outside the lock — no DB I/O while holding it)
+    _persist(persona, event, job_id=jid, detail=detail, ms=ms,
+             ok=ok, revised=revised, helpfulness=helpfulness)
 
 
 def snapshot() -> dict:
@@ -157,8 +213,7 @@ def snapshot() -> dict:
                 "feed": list(_FEED)[:60], "ts": _now()}
 
 
-def reports() -> dict:
-    """Per-persona performance ledger for the Reports section."""
+def _reports_from_memory() -> dict:
     with _LOCK:
         rows = []
         for r in ROSTER:
@@ -168,13 +223,94 @@ def reports() -> dict:
             helpful = round(100 * led["helpful_sum"] / led["helpful_n"], 1) if led["helpful_n"] else None
             rows.append({"id": r["id"], "role": r["role"], "emoji": r["emoji"],
                          "runs": runs, "passes": led["passes"], "revises": led["revises"],
-                         "fails": led["fails"], "accuracy_pct": acc,
-                         "helpfulness_pct": helpful,
+                         "fails": led["fails"], "accuracy_pct": acc, "helpfulness_pct": helpful,
                          "accountability_pct": round(led["accountability"], 1),
                          "attributed_faults": led["faults"],
                          "coaching": list(_COACHING.get(r["id"], []))[:3],
                          "avg_ms": int(led["total_ms"] / runs) if runs else 0})
-        return {"rows": rows, "ts": _now()}
+        return {"rows": rows, "ts": _now(), "source": "memory"}
+
+
+def reports() -> dict:
+    """Per-persona performance ledger — aggregated from the DURABLE Postgres audit so it survives
+    restarts and is consistent across workers. Falls back to the in-memory ledger if the DB is down."""
+    try:
+        from sqlalchemy import func, case
+        from ..database import SessionLocal
+        from ..models.creative_team import CreativeTeamEvent as E
+        db = SessionLocal()
+        try:
+            agg = dict()
+            q = (db.query(
+                    E.persona,
+                    func.count().label("total"),
+                    func.sum(case((E.event == "done", 1), else_=0)).label("passes"),
+                    func.sum(case((E.event == "revise", 1), else_=0)).label("revises"),
+                    func.sum(case((E.event == "fail", 1), else_=0)).label("fails"),
+                    func.sum(case((E.event == "coached", 1), else_=0)).label("faults"),
+                    func.sum(case((E.event == "reward", 1), else_=0)).label("rewards"),
+                    func.avg(case((E.event.in_(("done", "revise", "fail")), E.ms))).label("avg_ms"),
+                    func.avg(E.helpfulness).label("helpful"))
+                 .group_by(E.persona))
+            for row in q.all():
+                agg[row.persona] = row
+            # latest coaching per persona (small N of personas → one query each is fine)
+            coaching = {}
+            for r in ROSTER:
+                notes = (db.query(E.detail).filter(E.persona == r["id"], E.event == "coached")
+                           .order_by(E.created_at.desc()).limit(3).all())
+                coaching[r["id"]] = [n[0] for n in notes if n[0]]
+
+            rows = []
+            for r in ROSTER:
+                a = agg.get(r["id"])
+                passes = int(a.passes or 0) if a else 0
+                revises = int(a.revises or 0) if a else 0
+                fails = int(a.fails or 0) if a else 0
+                faults = int(a.faults or 0) if a else 0
+                rewards = int(a.rewards or 0) if a else 0
+                runs = passes + revises + fails
+                acc = round(100 * passes / runs, 1) if runs else 0.0
+                accountability = max(0.0, min(100.0, 100.0 - FAULT_PENALTY * faults + REWARD_GAIN * rewards))
+                rows.append({"id": r["id"], "role": r["role"], "emoji": r["emoji"],
+                             "runs": runs, "passes": passes, "revises": revises, "fails": fails,
+                             "accuracy_pct": acc,
+                             "helpfulness_pct": round(100 * float(a.helpful), 1) if (a and a.helpful is not None) else None,
+                             "accountability_pct": round(accountability, 1),
+                             "attributed_faults": faults, "coaching": coaching.get(r["id"], []),
+                             "avg_ms": int(a.avg_ms) if (a and a.avg_ms is not None) else 0})
+            return {"rows": rows, "ts": _now(), "source": "db"}
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"reports DB aggregation failed, using memory: {e}")
+        return _reports_from_memory()
+
+
+def audit(job_id: Optional[str] = None, persona: Optional[str] = None, limit: int = 300) -> dict:
+    """DURABLE per-task / per-persona drill-down: every recorded step for a job (or persona), in
+    order. This is the permanent record — 'show me everything the team did for job X'."""
+    try:
+        from ..models.creative_team import CreativeTeamEvent as E
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            q = db.query(E)
+            if job_id:
+                q = q.filter(E.job_id == job_id)
+            if persona:
+                q = q.filter(E.persona == persona)
+            rows = q.order_by(E.created_at.asc()).limit(min(limit, 1000)).all()
+            events = [{"persona": e.persona, "role": e.role, "event": e.event, "task": e.task,
+                       "detail": e.detail, "ms": e.ms, "ok": e.ok, "revised": e.revised,
+                       "helpfulness": e.helpfulness, "job_id": e.job_id,
+                       "at": e.created_at.isoformat() if e.created_at else None} for e in rows]
+            return {"job_id": job_id, "persona": persona, "count": len(events), "events": events}
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"audit DB read failed: {e}")
+        return {"job_id": job_id, "persona": persona, "count": 0, "events": [], "error": str(e)}
 
 
 def reset_ledger() -> None:

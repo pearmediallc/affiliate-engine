@@ -9,6 +9,7 @@ from .job import Job
 from .audit_log import AuditLog
 from .campaign import Character, SceneSetting, Campaign, Shot, Variation
 from .harness import GenerationEvent, UserPromptProfile
+from .creative_team import CreativeTeamEvent
 
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",
@@ -18,4 +19,5 @@ __all__ = [
     "AuditLog",
     "Character", "SceneSetting", "Campaign", "Shot", "Variation",
     "GenerationEvent", "UserPromptProfile",
+    "CreativeTeamEvent",
 ]
