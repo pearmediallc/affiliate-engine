@@ -330,43 +330,24 @@ async def _generate_clip(offer_desc: str, shot_type: str = "b_roll", duration: i
     if cloning:
         model = MultiProviderVideoService.route_capability("reference_to_video", model)
     seedance = bool(model and "seedance" in model.lower())
+    # Realism Prompt Engine: anti-slop, front-loaded, one-action, entity-consistent, per-model.
+    from ..services import realism_prompt_engine as rpe
+    nimg = len(reference_image_urls or [])
     try:
         if cloning:
-            nimg = len(reference_image_urls or [])
-            roles = ''
-            if nimg >= 1:
-                roles += 'Feature the real spokesperson/person from @Image1 (preserve their identity/face). '
-            if nimg >= 2:
-                roles += 'Show the product/offer/proof from @Image2. '
-            ask = (
-                'Write ONE direct-response video generation prompt that RECREATES the proven '
-                'winning ad shown in @Video1 — its hook, pacing and shot structure — but for THIS '
-                f'offer: "{offer_desc[:300]}". '
-                + roles
-                + (f'Preserve this winning hook angle: "{winner_hook[:120]}". ' if winner_hook else '')
-                + 'The subject is ALREADY speaking energetically from the very FIRST frame — no intro, '
-                'no silent/smiling lead-in, no dead air; open directly ON the hook line. '
-                + f'Vertical: {vertical or "direct-response"}. Vertical 9:16. Photorealistic, native-UGC feel. '
-                'CRITICAL: the video MUST contain ABSOLUTELY NO text, letters, words, subtitles, '
-                'captions, watermarks or writing anywhere in the frame — a completely clean image with '
-                'zero on-screen text (captions are added afterward). Ignore/do not reproduce any text '
-                'that appears in the reference video. Return JSON {"prompt":"..."}')
+            prompt = rpe.build_winner_clone_prompt(
+                model=(model or "seedance-2"), offer_desc=offer_desc, winner_hook=(winner_hook or ""),
+                vertical=(vertical or ""), n_reference_images=nimg, style="realistic")
         else:
-            ask = (
-                'Write ONE vivid text-to-video prompt (a single sentence) for an on-brand opening '
-                f'B-roll shot for this ad offer: "{offer_desc[:300]}". Concrete real-world scene with '
-                'subtle camera motion; NO on-screen text, photorealistic, vertical 9:16. '
-                'Return JSON {"prompt":"..."}')
-        d = await _gemini_json(ask)
-        prompt = (d.get("prompt") or offer_desc)[:1000]
-    except Exception:
+            prompt = rpe.build_prompt(
+                model=(model or "higgsfield-v1"),
+                action=f"a real-world scene that sells this offer: {offer_desc[:200]}",
+                environment="authentic lived-in real-world setting relevant to the offer",
+                style="realistic", vertical=(vertical or ""),
+                n_reference_images=nimg, has_reference_video=bool(reference_video_urls))
+    except Exception as e:
+        logger.warning(f"realism prompt build failed, using offer_desc: {e}")
         prompt = offer_desc[:500]
-    if seedance and reference_video_urls:
-        prompt += " @Video1"
-        for i in range(len(reference_image_urls or [])):
-            prompt += f" @Image{i+1}"
-        if cloning:
-            prompt += " — IMPORTANT: absolutely no text, captions, subtitles or words on screen; clean footage only."
     try:
         result = await asyncio.to_thread(
             MultiProviderVideoService.generate,
