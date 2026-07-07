@@ -1357,7 +1357,117 @@ async def recipe_special(req: RunRequest) -> list:
                               else f"Could not map to a recipe. Parsed: {req.directive.get('recipe_steps')}"}]
 
 
+async def recipe_full_ad(req: RunRequest) -> list:
+    """Regeneration Composer — a full-length (~30-45s) UGC ad, composed the way editors do:
+      script (enhanced loser + winner's hook angle) -> split into ONE-ACTION clips ->
+      generate each clip with the REALISM PROMPT ENGINE (anti-slop) anchored to the loser's
+      REAL spokesperson frame (@Image1) so the SAME person carries every clip (consistency) ->
+      stitch -> OUR clean captions per clip (from the script) -> save.
+    Multi-clip stitch is how we get real duration (each model clip caps ~12s)."""
+    from ..services import realism_prompt_engine as rpe
+    orig = await _download_to_temp(req.context.get("download_url", ""))
+    work = tempfile.mkdtemp()
+    try:
+        W, H = await asyncio.to_thread(_ffprobe_dims, orig)
+        dur = await asyncio.to_thread(_ffprobe_duration, orig)
+        transcript = await _transcribe_file(orig)
+        vertical = req.context.get("vertical", "")
+        hint = (req.context.get("diagnosis", {}) or {}).get("directive_hint", "")
+
+        from ..services import winner_library
+        lw = winner_library.fetch_winners(vertical, limit=1)
+        winner_hook = lw[0].get("hook", "") if lw else ""
+
+        # SCRIPT: enhanced loser targeting the lagging metric, keeping the offer + winner hook angle
+        script = transcript
+        try:
+            d = await _gemini_json(
+                'Rewrite this into a tight first-person UGC ad script (~30-40s spoken) that KEEPS the '
+                f'offer and claims but hooks harder in the first line. {("Focus: "+hint) if hint else ""} '
+                f'{("Open with this winning angle: "+winner_hook) if winner_hook else ""} '
+                f'Original: "{transcript[:1200]}". Return JSON {{"script":"..."}}')
+            script = (d.get("script") or transcript).strip()
+        except Exception as e:
+            logger.warning(f"full_ad script rewrite failed: {e}")
+        if not script.strip():
+            raise RuntimeError("no script to compose from")
+
+        # ENTITY ANCHOR = the loser's REAL spokesperson frame (real identity, reused every clip)
+        anchor_url = _frame_to_public_url(orig, min(1.5, (dur or 3) * 0.3))
+        entity_desc = ""
+        try:
+            fr = await asyncio.to_thread(_extract_frames, orig, [min(1.5, (dur or 3) * 0.3)], work)
+            if fr:
+                ed = await _gemini_vision(fr, 'Describe this person as a consistent character reference '
+                    '(age, gender, hair, clothing, look) in <=25 words. JSON {"desc":"..."}')
+                entity_desc = ed.get("desc", "")
+        except Exception as e:
+            logger.warning(f"entity describe failed: {e}")
+
+        clips_text = rpe.split_into_clips(script)[:4]   # cap 4 clips (~48s) to bound cost/time
+        model = MultiProviderVideoService.route_capability("reference_to_video", req.model) or \
+                MultiProviderVideoService.route_capability("image_to_video", req.model)
+
+        shots, caps = [], []
+        for i, line in enumerate(clips_text):
+            await _abort_if_cancelled(req, f"clip {i+1}/{len(clips_text)}")
+            prompt = rpe.build_prompt(
+                model=model, action="the speaker talks directly to camera with a natural gesture",
+                entity_desc=entity_desc, environment="authentic home interior, lived-in details",
+                line=line, style="realistic", vertical=vertical,
+                n_reference_images=1 if anchor_url else 0)
+            try:
+                res = await asyncio.to_thread(
+                    MultiProviderVideoService.generate, prompt=prompt, shot_type="b_roll",
+                    duration=min(12, max(6, len(line.split()) // 2 + 4)), preferred_model=model,
+                    reference_image_urls=([anchor_url] if anchor_url else None), s3_prefix="regen")
+                vp = res.get("video_path")
+                if vp and os.path.exists(vp):
+                    shots.append(vp); caps.append(line)
+            except Exception as e:
+                logger.warning(f"full_ad clip {i+1} gen failed: {e}")
+
+        if not shots:
+            raise RuntimeError("full_ad: no clips generated (check generation provider/credits)")
+
+        # normalize + burn OUR clean caption per clip, then concat
+        norm = []
+        for i, (sp, line) in enumerate(zip(shots, caps)):
+            cap = " ".join(line.split()[:8])  # short on-screen line from the script
+            cpng = os.path.join(work, f"c{i}.png")
+            await asyncio.to_thread(_make_caption_png, cap, W, H, cpng)
+            npath = os.path.join(work, f"n{i}.mp4")
+            await asyncio.to_thread(_ffmpeg,
+                ["-i", sp, "-i", cpng, "-filter_complex",
+                 f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[v0];[v0][1:v]overlay=0:0[v]",
+                 "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                 "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "192k", "-shortest", npath], timeout=300)
+            norm.append(npath)
+
+        name, out_path, url = _out_url(req, "fullad")
+        if len(norm) == 1:
+            import shutil; shutil.copy(norm[0], out_path)
+        else:
+            lst = os.path.join(work, "list.txt")
+            with open(lst, "w") as f:
+                for n in norm:
+                    f.write(f"file '{n}'\n")
+            await asyncio.to_thread(_ffmpeg,
+                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+
+        return [{"recipe": "Full Ad (composed)", "video_url": url, "confidence": 0.7,
+                 "whats_changed": (f"Composed {len(norm)}-clip UGC ad (~{len(norm)*10}s): enhanced script"
+                    + (f" w/ winning hook angle" if winner_hook else "")
+                    + ", same spokesperson across clips (anchored to your real frame), anti-slop realism prompts, clean captions.")}]
+    finally:
+        try: os.remove(orig)
+        except OSError: pass
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
 _RECIPES = {
+    "Full Ad": recipe_full_ad,
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,
     "Hook Change Only": recipe_hook_change,
