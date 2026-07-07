@@ -1507,6 +1507,13 @@ async def recipe_full_ad(req: RunRequest) -> list:
         lw = winner_library.fetch_winners(vertical, limit=1)
         winner_hook = lw[0].get("hook", "") if lw else ""
 
+        # "Use as reference": creatives the user hand-picked in the library (proxied URLs). Prepped
+        # like a winner clip (scrubbed/trimmed) and passed as a reference video to generation.
+        user_refs = req.context.get("reference_urls") or []
+        ref_video = None
+        if user_refs:
+            ref_video = await _prep_winner_clip(user_refs[0], work)
+
         # ENTITY ANCHOR = the loser's REAL spokesperson frame (real identity, reused every clip)
         anchor_url = _frame_to_public_url(orig, min(1.5, (dur or 3) * 0.3))
         entity_desc = ""
@@ -1552,7 +1559,8 @@ async def recipe_full_ad(req: RunRequest) -> list:
                     res = await asyncio.to_thread(
                         MultiProviderVideoService.generate, prompt=bt.get("prompt"), shot_type="b_roll",
                         duration=min(12, max(6, len(_line.split()) // 2 + 4)), preferred_model=_model,
-                        reference_image_urls=([anchor_url] if anchor_url else None), s3_prefix="regen")
+                        reference_image_urls=([anchor_url] if anchor_url else None),
+                        reference_video_urls=([ref_video] if ref_video else None), s3_prefix="regen")
                     vp = res.get("video_path")
                     return vp if (vp and os.path.exists(vp)) else None
                 except Exception as e:
