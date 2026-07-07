@@ -44,11 +44,42 @@ _STATE: dict = {r["id"]: {"status": "idle", "job_id": None, "task": None,
                           "since": None, "last": None} for r in ROSTER}
 # rolling performance ledger per persona
 _LEDGER: dict = {r["id"]: {"runs": 0, "passes": 0, "revises": 0, "fails": 0,
-                           "total_ms": 0, "helpful_sum": 0.0, "helpful_n": 0} for r in ROSTER}
+                           "total_ms": 0, "helpful_sum": 0.0, "helpful_n": 0,
+                           # accountability: starts perfect, drops on attributed faults, recovers on clean passes
+                           "accountability": 100.0, "faults": 0} for r in ROSTER}
+# coaching notes per persona (the "one-on-one" — injected into that persona's next prompt)
+_COACHING: dict = {r["id"]: deque(maxlen=8) for r in ROSTER}
 # recent event feed (newest first) for the office ticker
 _FEED: deque = deque(maxlen=200)
 # queue: jobs waiting per persona (job_ids)
 _QUEUE: dict = {r["id"]: [] for r in ROSTER}
+
+
+def coach(persona: str, note: str, *, penalty: float = 8.0) -> None:
+    """Record a corrective 'one-on-one' for a persona after a fault: store the coaching note
+    (injected into its next prompt) and dock its accountability score. Recovers slowly on passes."""
+    if persona not in _COACHING or not (note or "").strip():
+        return
+    with _LOCK:
+        _COACHING[persona].appendleft(note.strip())
+        led = _LEDGER.get(persona)
+        if led is not None:
+            led["faults"] += 1
+            led["accountability"] = max(0.0, led["accountability"] - penalty)
+        _FEED.appendleft({"t": _now(), "persona": persona, "event": "coached", "detail": note.strip()[:160]})
+
+
+def reward(persona: str, *, gain: float = 2.0) -> None:
+    """A clean pass nudges accountability back up (teams improve as they stop making the mistake)."""
+    with _LOCK:
+        led = _LEDGER.get(persona)
+        if led is not None:
+            led["accountability"] = min(100.0, led["accountability"] + gain)
+
+
+def get_coaching(persona: str) -> list:
+    with _LOCK:
+        return list(_COACHING.get(persona, []))
 
 
 def _now() -> float:
@@ -139,6 +170,9 @@ def reports() -> dict:
                          "runs": runs, "passes": led["passes"], "revises": led["revises"],
                          "fails": led["fails"], "accuracy_pct": acc,
                          "helpfulness_pct": helpful,
+                         "accountability_pct": round(led["accountability"], 1),
+                         "attributed_faults": led["faults"],
+                         "coaching": list(_COACHING.get(r["id"], []))[:3],
                          "avg_ms": int(led["total_ms"] / runs) if runs else 0})
         return {"rows": rows, "ts": _now()}
 
@@ -147,4 +181,6 @@ def reset_ledger() -> None:
     with _LOCK:
         for k in _LEDGER:
             _LEDGER[k] = {"runs": 0, "passes": 0, "revises": 0, "fails": 0,
-                          "total_ms": 0, "helpful_sum": 0.0, "helpful_n": 0}
+                          "total_ms": 0, "helpful_sum": 0.0, "helpful_n": 0,
+                          "accountability": 100.0, "faults": 0}
+            _COACHING[k].clear()

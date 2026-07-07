@@ -31,14 +31,31 @@ from typing import Optional, Any
 
 import httpx
 
+import os
+
 from ..config import settings
 from . import prompt_reference_library as lib
 from . import realism_prompt_engine as rpe
 from . import creative_team_activity as act
+from . import creative_metrics as cm
 
 logger = logging.getLogger(__name__)
 
 _GEMINI_MODEL = getattr(settings, "gemini_model", None) or "gemini-2.5-flash"
+
+# Eval self-learning loop knobs (bounded to protect generation credits).
+EVAL_PASS_THRESHOLD = float(os.getenv("EVAL_PASS_THRESHOLD", "7"))   # 0-10; below → coach + retry
+MAX_BEAT_RETRIES = int(os.getenv("EVAL_MAX_RETRIES", "1"))           # extra attempts per beat
+
+
+def _coach_pre(persona: str) -> str:
+    """Injected 'one-on-one' preamble: the corrections this persona earned on past reviews, so it
+    stops repeating the mistake (the self-improvement half of the loop)."""
+    notes = act.get_coaching(persona)
+    if not notes:
+        return ""
+    return ("COACHING — apply these corrections from prior reviews so you don't repeat them:\n- "
+            + "\n- ".join(notes[:4]) + "\n\n")
 
 
 # ── shared LLM plumbing ───────────────────────────────────────────────────────
@@ -131,7 +148,7 @@ async def strategist(*, offer_desc: str, vertical: str, request_type: str,
     """Diagnose the loser against winner references + ROI data, decide the fix.
     Returns {diagnosis, fix, angle, keep, change, lagging_metric}."""
     metrics = loser_metrics or {}
-    prompt = f"""You are the Strategist on a direct-response creative team. Diagnose why this ad
+    prompt = f"""{_coach_pre('strategist')}You are the Strategist on a direct-response creative team. Diagnose why this ad
 underperformed and decide the SMALLEST high-leverage fix. Keep the offer and what already works.
 
 OFFER: {offer_desc}
@@ -169,7 +186,7 @@ async def script_writer(*, offer_desc: str, vertical: str, strategy: dict,
                         winner_transcript: str = "") -> str:
     """Write/enhance the spoken script per the Strategist's fix. Keep the offer; open on the
     winning hook. Returns plain script text (spoken lines only, no stage directions)."""
-    prompt = f"""You are the Script Writer on a direct-response creative team. Write a tight,
+    prompt = f"""{_coach_pre('scriptwriter')}You are the Script Writer on a direct-response creative team. Write a tight,
 natural spoken script (first-person, conversational, no stage directions, no on-screen text
 markers) for a short vertical ad.
 
@@ -199,7 +216,7 @@ async def director(*, script: str, request_type: str, vertical: str) -> list:
     """Break the script into timed beats and direct each: scene, emotion, gesture, environment,
     and the ONE continuous action. Returns list of beat dicts."""
     clips = rpe.split_into_clips(script, max_words=30)
-    prompt = f"""You are the Director on a creative team. For each spoken beat below, direct the
+    prompt = f"""{_coach_pre('scene')}You are the Director on a creative team. For each spoken beat below, direct the
 performance for a realistic vertical ad. ONE continuous physical action per beat (never sequence
 two actions). Emotions and gestures must feel candid, not staged.
 
@@ -237,16 +254,18 @@ async def character_manager(*, request_type: str, vertical: str,
         return entity_desc
     hint = avatar_hint or {}
     if hint:
-        age = hint.get("age", "35-45"); gender = hint.get("gender", "person"); region = hint.get("region", "American")
+        age = hint.get("age", "45+"); gender = hint.get("gender", "woman"); region = hint.get("region", "American")
         return (f"a real, ordinary {region} {gender} aged {age}, natural un-retouched skin with pores, "
                 f"minimal makeup, everyday casual clothes, believable candid demeanor")
-    prompt = f"""You are the Character Manager. Describe ONE believable, ordinary real person to be
-the consistent on-camera talent for a {vertical} {request_type} ad. Anti-slop: no model looks,
-natural skin, everyday clothes. Return STRICT JSON: {{"entity_desc": "one vivid sentence"}}"""
+    prompt = f"""{_coach_pre('character')}You are the Character Manager. Describe ONE believable, ordinary
+real person to be the consistent on-camera talent for a {vertical} {request_type} ad. Anti-slop: no
+model looks, natural skin, everyday clothes. {cm.CHARACTER_CASTING}
+Return STRICT JSON: {{"entity_desc": "one vivid sentence"}}"""
     out = await _gemini_json(prompt, temperature=0.5)
     if out and out.get("entity_desc"):
         return str(out["entity_desc"]).strip()
-    return ("a real, ordinary middle-aged American person, natural un-retouched skin with visible "
+    # casting rule fallback: default to a real 45+ woman (per the team's casting guidance)
+    return ("a real, ordinary American woman aged 45+, natural un-retouched skin with visible "
             "pores, minimal makeup, everyday casual clothes, relaxed candid demeanor")
 
 
@@ -339,6 +358,56 @@ def learner(*, request_type: str, winning_prompt_pattern: str) -> None:
     the Prompt Reference Library so future prompts inherit what worked (closed learning loop)."""
     if winning_prompt_pattern and winning_prompt_pattern.strip():
         lib.add_exemplar(request_type, winning_prompt_pattern.strip())
+
+
+# ── Eval self-learning loop (vision QA → fault attribution → coaching → retry) ─
+_FAULT_PERSONAS = {"character", "shots", "prompt", "scriptwriter", "scene", "editor", "director"}
+
+
+async def evaluate_clip(frame_paths: list, beat: dict) -> dict:
+    """Vision-QA a GENERATED clip's frame(s): score realism, lip-sync, captions, and attribute any
+    failure to the responsible persona(s). This is what lets the team grade its OWN output and learn.
+    Returns {overall, realism, lipsync, captions, issues, fault_personas}. Degrades to a pass if no
+    vision available (never blocks generation)."""
+    is_talking = beat.get("shot_type") == "talking_head"
+    prompt = f"""You are the Critic doing VISUAL QA on a generated ad clip. Inspect the attached
+frame(s) hard for AI-slop and defects.
+
+Beat intent: shot={beat.get('shot_type')}, line spoken={'yes' if is_talking else 'no'}.
+Score 0-10 (10 = flawless, real):
+- realism: plastic/waxy skin, dead eyes, over-smooth, fake sterile interior, warped hands/text → low
+- lipsync: {'do the lips match a person speaking?' if is_talking else 'n/a — no talking, score 10'}
+- captions: garbled/duplicated/baked-in wrong text on screen → low (clean/none → high)
+
+Attribute EACH problem to the responsible role, choosing from:
+  character (wrong/plastic person or casting), shots (wrong technique/lip-sync/model),
+  prompt (prompt lacked anti-slop cues), scriptwriter (bad line), scene (bad direction),
+  editor (caption/stitch defect).
+
+Return STRICT JSON: {{"realism": <0-10>, "lipsync": <0-10>, "captions": <0-10>,
+  "overall": <0-10>, "issues": ["short concrete defect"], "fault_personas": ["character", ...]}}"""
+    out = await _gemini_json(prompt, temperature=0.2, frames=frame_paths)
+    if not out:
+        return {"overall": 10, "realism": 10, "lipsync": 10, "captions": 10, "issues": [], "fault_personas": []}
+    out["fault_personas"] = [p for p in (out.get("fault_personas") or []) if p in _FAULT_PERSONAS]
+    return out
+
+
+def coach_from_eval(beat: dict, ev: dict) -> None:
+    """Turn a failed eval into ACTION: dock + coach each faulted persona (the one-on-one), and fold
+    the concrete corrections into this beat's prompt so the retry is actually better."""
+    issues = ev.get("issues") or []
+    note = "; ".join(issues)[:200] or "output scored below the quality bar — tighten realism/delivery."
+    for p in (ev.get("fault_personas") or []):
+        act.coach(p, note)
+    # rebuild the beat prompt with an explicit correction so the next attempt improves
+    if issues:
+        fix = " CORRECTION (fix these on this attempt): " + "; ".join(issues[:4]) + "."
+        beat["prompt"] = (beat.get("prompt", "") + fix)[:1900]
+
+
+def eval_passed(ev: dict) -> bool:
+    return float(ev.get("overall", 10)) >= EVAL_PASS_THRESHOLD
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

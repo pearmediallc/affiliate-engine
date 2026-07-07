@@ -781,6 +781,25 @@ async def creative_team_reports(_auth: bool = Depends(require_service_key)):
     return {"success": True, **act.reports()}
 
 
+@router.post("/creative-team/grade")
+async def creative_team_grade(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Grade a LIVE creative's real metrics against the team model (ROI, $500 gate, offer-CR,
+    EPC tiers, CPC/state) and COACH the faulted personas — closing the learning loop from real
+    outcomes to persona accountability. Input: the metrics dict (+ is_image). Returns the verdict."""
+    from ..services import creative_metrics as cm
+    from ..services import creative_team_activity as act
+    metrics = payload.get("metrics") or payload
+    verdict = cm.judge_creative(metrics, is_image=bool(payload.get("is_image")))
+    coached = []
+    if verdict.get("eligible"):
+        for f in verdict.get("faults", []):
+            note = f"Live ROI review: {f.get('reason')} on a real creative (spend ${metrics.get('spend')})."
+            for p in f.get("personas", []):
+                act.coach(p, note)
+                coached.append(p)
+    return {"success": True, "verdict": verdict, "coached": coached}
+
+
 @router.post("/creative-team/plan")
 async def creative_team_plan(req: "CreativeTeamRequest", _auth: bool = Depends(require_service_key)):
     """Run the creative team to produce a shot PLAN (no generation) — useful to preview what the
@@ -1432,6 +1451,40 @@ async def recipe_special(req: RunRequest) -> list:
                               else f"Could not map to a recipe. Parsed: {req.directive.get('recipe_steps')}"}]
 
 
+async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -> Optional[str]:
+    """Generate ONE beat, then run the eval self-learning loop: vision-QA the result, and if it
+    scores below the bar, coach the faulted persona(s) + fold the correction into the beat prompt
+    and regenerate — bounded by MAX_BEAT_RETRIES to protect credits. Returns the best clip path."""
+    from ..services import creative_team as team
+    from ..services import creative_team_activity as act
+    clip = None
+    attempts = 0
+    while attempts <= team.MAX_BEAT_RETRIES:
+        clip = await gen_attempt(beat)          # reads beat['prompt'] each time (coaching mutates it)
+        if not clip:
+            return None
+        frames = []
+        try:
+            frames = await asyncio.to_thread(_extract_frames, clip, [1.0], work)
+        except Exception:
+            pass
+        ts = act.start("critic", job_id, f"visual QA beat {beat.get('i')}")
+        ev = await team.evaluate_clip(frames, beat)
+        ok = team.eval_passed(ev)
+        act.finish("critic", ts, ok=True, revised=(not ok),
+                   detail=f"beat {beat.get('i')} scored {ev.get('overall')}/10",
+                   helpfulness=float(ev.get("overall", 10)) / 10.0)
+        if ok:
+            for p in ("prompt", "character", "shots"):
+                act.reward(p)
+            return clip
+        if attempts >= team.MAX_BEAT_RETRIES:
+            break
+        team.coach_from_eval(beat, ev)          # one-on-one + rewrite the beat prompt for the retry
+        attempts += 1
+    return clip                                  # bounded: return the last (best-effort) attempt
+
+
 async def recipe_full_ad(req: RunRequest) -> list:
     """Regeneration Composer — a full-length (~30-45s) UGC ad, composed the way editors do:
       script (enhanced loser + winner's hook angle) -> split into ONE-ACTION clips ->
@@ -1486,22 +1539,27 @@ async def recipe_full_ad(req: RunRequest) -> list:
         for i, b in enumerate(beats):
             await _abort_if_cancelled(req, f"clip {i+1}/{len(beats)}")
             line = b.get("line", "")
-            prompt = b.get("prompt") or rpe.build_prompt(
+            b["prompt"] = b.get("prompt") or rpe.build_prompt(
                 model=b.get("model") or "seedance-2", action=b.get("action", "talks to camera"),
                 request_type=b.get("request_type", "ugc"), entity_desc=entity_desc,
                 environment=b.get("environment", ""), line=line, vertical=vertical,
                 n_reference_images=1 if anchor_url else 0)
             beat_model = b.get("model") or MultiProviderVideoService.route_capability("reference_to_video", req.model)
-            try:
-                res = await asyncio.to_thread(
-                    MultiProviderVideoService.generate, prompt=prompt, shot_type="b_roll",
-                    duration=min(12, max(6, len(line.split()) // 2 + 4)), preferred_model=beat_model,
-                    reference_image_urls=([anchor_url] if anchor_url else None), s3_prefix="regen")
-                vp = res.get("video_path")
-                if vp and os.path.exists(vp):
-                    shots.append(vp); caps.append(line)
-            except Exception as e:
-                logger.warning(f"full_ad clip {i+1} gen failed: {e}")
+
+            async def _attempt(bt, _line=line, _model=beat_model):
+                try:
+                    res = await asyncio.to_thread(
+                        MultiProviderVideoService.generate, prompt=bt.get("prompt"), shot_type="b_roll",
+                        duration=min(12, max(6, len(_line.split()) // 2 + 4)), preferred_model=_model,
+                        reference_image_urls=([anchor_url] if anchor_url else None), s3_prefix="regen")
+                    vp = res.get("video_path")
+                    return vp if (vp and os.path.exists(vp)) else None
+                except Exception as e:
+                    logger.warning(f"full_ad clip gen failed: {e}"); return None
+
+            clip = await _gen_beat_with_eval(req.request_id, b, work, _attempt)
+            if clip:
+                shots.append(clip); caps.append(line)
 
         if not shots:
             raise RuntimeError("full_ad: no clips generated (check generation provider/credits)")
@@ -1580,20 +1638,25 @@ async def recipe_from_assets(req: RunRequest) -> list:
             await _abort_if_cancelled(req, f"asset clip {i+1}/{len(beats)}")
             img = image_urls[i % len(image_urls)]      # cycle images across beats
             line = b.get("line", "")
-            prompt = b.get("prompt") or rpe.build_prompt(
+            b["prompt"] = b.get("prompt") or rpe.build_prompt(
                 model=i2v_model, action="the scene comes alive with subtle natural motion",
                 request_type="broll", environment="the scene in the provided image",
                 vertical=vertical, n_reference_images=1)
-            try:
-                res = await asyncio.to_thread(
-                    MultiProviderVideoService.generate, prompt=prompt, shot_type="b_roll",
-                    duration=min(10, max(4, len(line.split()) // 2 + 4)), preferred_model=i2v_model,
-                    reference_image_urls=[img], s3_prefix="regen")
-                vp = res.get("video_path")
-                if vp and os.path.exists(vp):
-                    shots.append(vp); caps.append(line)
-            except Exception as e:
-                logger.warning(f"from_assets clip {i+1} gen failed: {e}")
+
+            async def _attempt(bt, _line=line, _img=img):
+                try:
+                    res = await asyncio.to_thread(
+                        MultiProviderVideoService.generate, prompt=bt.get("prompt"), shot_type="b_roll",
+                        duration=min(10, max(4, len(_line.split()) // 2 + 4)), preferred_model=i2v_model,
+                        reference_image_urls=[_img], s3_prefix="regen")
+                    vp = res.get("video_path")
+                    return vp if (vp and os.path.exists(vp)) else None
+                except Exception as e:
+                    logger.warning(f"from_assets clip gen failed: {e}"); return None
+
+            clip = await _gen_beat_with_eval(req.request_id, b, work, _attempt)
+            if clip:
+                shots.append(clip); caps.append(line)
 
         if not shots:
             raise RuntimeError("from_assets: no clips generated (check image-to-video provider/credits)")
