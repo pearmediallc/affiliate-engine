@@ -767,11 +767,19 @@ async def upload_images(payload: dict, _auth: bool = Depends(require_service_key
 
 # ── Creative Team "office" (live feed + reports) ──────────────────────────────
 @router.get("/creative-team/activity")
-async def creative_team_activity(_auth: bool = Depends(require_service_key)):
-    """Live office state: every persona's desk, status (idle/queued/working), current job/task,
-    and the recent activity feed. Polled by the ORBIT Creative Team Room."""
+async def creative_team_activity(job_id: str = "", _auth: bool = Depends(require_service_key)):
+    """Live office state for ONE job (the same room shows whichever job is selected): each persona's
+    desk, status, current task, the feed, plus that job's progress % + ETA. Omit job_id for the most
+    recent running job."""
     from ..services import creative_team_activity as act
-    return {"success": True, **act.snapshot()}
+    return {"success": True, **act.snapshot(job_id or None)}
+
+
+@router.get("/creative-team/jobs")
+async def creative_team_jobs(_auth: bool = Depends(require_service_key)):
+    """List recent jobs with live progress % + ETA — powers the job switcher."""
+    from ..services import creative_team_activity as act
+    return {"success": True, "jobs": act.jobs_list()}
 
 
 @router.get("/creative-team/reports")
@@ -848,13 +856,27 @@ async def run(req: RunRequest, background: BackgroundTasks, _auth: bool = Depend
     return {"success": True, "job_id": job_id, "status": "running"}
 
 
+# rough per-recipe expected wall-clock (seconds) — seeds the progress bar / ETA; recipes refine it.
+_EXPECTED_SEC = {
+    "Full Ad": 300, "Create from Assets": 240, "Generate Video": 200,
+    "Avatar/UGC": 180, "map + ugc": 180, "Script": 120, "Broll": 150, "Stock Video": 150,
+    "Hook Change Only": 90, "Caption Change Only": 60, "Reclean/Minor Mod": 60,
+    "Image": 120, "Image + Voiceover": 150, "Special Request": 180,
+}
+
+
 async def _execute(req: RunRequest):
     """Pick recipe by variation_type → produce variants → POST back to callback."""
+    from ..services import creative_team_activity as act
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
+    label = f"{vtype} · {(req.context.get('creative_filename') or req.assets.get('prompt') or req.request_id)[:60]}"
+    act.begin_job(req.request_id, label=label, expected_sec=_EXPECTED_SEC.get(vtype, 180))
+    ok = False
     try:
         await _abort_if_cancelled(req, "start")
         recipe = _RECIPES.get(vtype, recipe_special)
         variants = await recipe(req)
+        ok = True
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "ready", "variants": variants})
     except Cancelled as c:
         logger.info(f"regen run cancelled for {req.request_id}: {c}")
@@ -862,6 +884,8 @@ async def _execute(req: RunRequest):
     except Exception as e:
         logger.exception(f"regen run failed for {req.request_id}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": str(e), "variants": []})
+    finally:
+        act.end_job(req.request_id, ok=ok)
 
 
 async def _callback(url: Optional[str], payload: dict):
@@ -1482,7 +1506,7 @@ async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -
         ts = act.start("critic", job_id, f"visual QA beat {beat.get('i')}")
         ev = await team.evaluate_clip(frames, beat)
         ok = team.eval_passed(ev)
-        act.finish("critic", ts, ok=True, revised=(not ok),
+        act.finish("critic", job_id, ts, ok=True, revised=(not ok),
                    detail=f"beat {beat.get('i')} scored {ev.get('overall')}/10",
                    helpfulness=float(ev.get("overall", 10)) / 10.0)
         if ok:
@@ -1552,10 +1576,13 @@ async def recipe_full_ad(req: RunRequest) -> list:
         script = plan.get("script", transcript)
         if not beats:
             raise RuntimeError("creative team produced no beats to compose from")
+        from ..services import creative_team_activity as act
+        act.set_expected_sec(req.request_id, 60 + len(beats) * 90)   # refine ETA now beats are known
 
         shots, caps = [], []
         for i, b in enumerate(beats):
             await _abort_if_cancelled(req, f"clip {i+1}/{len(beats)}")
+            act.tick(req.request_id, f"generating clip {i+1}/{len(beats)}")
             line = b.get("line", "")
             b["prompt"] = b.get("prompt") or rpe.build_prompt(
                 model=b.get("model") or "seedance-2", action=b.get("action", "talks to camera"),
@@ -1650,11 +1677,14 @@ async def recipe_from_assets(req: RunRequest) -> list:
             beats = [{"i": i, "line": s, "prompt": "", "request_type": "broll"}
                      for i, s in enumerate(rpe.split_into_clips(script))]
         beats = beats[:6]  # bound cost/time
+        from ..services import creative_team_activity as act
+        act.set_expected_sec(req.request_id, 40 + len(beats) * 80)
 
         i2v_model = MultiProviderVideoService.route_capability("image_to_video", req.model)
         shots, caps = [], []
         for i, b in enumerate(beats):
             await _abort_if_cancelled(req, f"asset clip {i+1}/{len(beats)}")
+            act.tick(req.request_id, f"animating scene {i+1}/{len(beats)}")
             img = image_urls[i % len(image_urls)]      # cycle images across beats
             line = b.get("line", "")
             b["prompt"] = b.get("prompt") or rpe.build_prompt(
@@ -1777,17 +1807,27 @@ async def recipe_generate(req: RunRequest) -> list:
 
         if engine in ("veo-extend", "veo", "veo3-google"):
             from ..services.video_creator import VideoCreatorService as VC
-            segs = max(1, min(4, round(seconds / 7.5)))   # base 8s + (segs-1)×7s
+            from ..services import creative_team_activity as act
+            # MULTI-SCENE: one scene per line → base is scene 0, each extension advances to the next
+            # scene (cycles if fewer lines than segments). Single-line prompts reuse the same prompt.
+            scenes = [s.strip() for s in prompt.splitlines() if s.strip()] or [prompt]
+            # base 8s + (segs-1)×7s. Cap 21 segments (Veo ceiling) → up to ~148s.
+            segs = max(len(scenes), max(1, round((seconds - 8) / 7) + 1))
+            segs = max(1, min(21, segs))
+            act.set_expected_sec(req.request_id, segs * 240)   # Veo ~2-4 min/segment
+            def _scene(i): return scenes[i % len(scenes)]
             if image_urls:
                 imgp = await _download_to_temp(image_urls[0], suffix=".png")
-                base = await asyncio.to_thread(VC.generate_from_image, imgp, prompt, "9:16", 8)
+                base = await asyncio.to_thread(VC.generate_from_image, imgp, _scene(0), aspect_ratio, 8)
             else:
-                base = await asyncio.to_thread(VC.generate_video, prompt, "9:16", "720p", "8")
+                base = await asyncio.to_thread(VC.generate_video, _scene(0), aspect_ratio, "720p", "8")
+            act.tick(req.request_id, f"Veo base clip (scene 1/{segs})")
             st = await _veo_wait(base["operation_name"])
             paths = [st["video_path"]]; prev = base["operation_name"]
             for k in range(1, segs):
                 await _abort_if_cancelled(req, f"veo extend {k}")
-                ext = await asyncio.to_thread(VC.extend_video, prev, prompt)
+                act.tick(req.request_id, f"Veo extend (scene {k+1}/{segs})")
+                ext = await asyncio.to_thread(VC.extend_video, prev, _scene(k))
                 st = await _veo_wait(ext["operation_name"])
                 paths.append(st["video_path"]); prev = ext["operation_name"]
             if len(paths) == 1:
@@ -1807,7 +1847,10 @@ async def recipe_generate(req: RunRequest) -> list:
 
         # ── Seedance 2.0 (Kie) — native single clip up to 15s, full reference set ──
         from ..services import kieai_service
+        from ..services import creative_team_activity as act
         dur = max(4, min(15, seconds))   # Seedance range 4-15s
+        act.set_expected_sec(req.request_id, 180)   # Seedance ~2-4 min per clip
+        act.tick(req.request_id, f"Seedance {dur}s · {aspect_ratio} · {resolution}")
         res = await asyncio.to_thread(
             kieai_service.generate_video_seedance,
             prompt=prompt,

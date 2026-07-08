@@ -605,10 +605,10 @@ async def _run(persona: str, job_id: str, task: str, coro, *, helpfulness=None):
     try:
         result = await coro
         h = helpfulness(result) if callable(helpfulness) else helpfulness
-        act.finish(persona, ts, ok=True, detail=task, helpfulness=h)
+        act.finish(persona, job_id, ts, ok=True, detail=task, helpfulness=h)
         return result
     except Exception as e:
-        act.finish(persona, ts, ok=False, detail=f"{task}: {e}")
+        act.finish(persona, job_id, ts, ok=False, detail=f"{task}: {e}")
         raise
 
 
@@ -640,9 +640,8 @@ async def run_creative_team(
     self-learning eval loop (evaluate_clip → coach_from_eval → bounded retry) runs in the COMPOSER
     (routes/regen.py `_gen_beat_with_eval`) once each beat's clip is generated — that's where the
     "grade its own output and coach" feature is wired, since it needs the rendered pixels."""
-    # queue the whole team for this job so the office shows them lined up
-    for r in act.ROSTER:
-        act.enqueue(r["id"], job_id, "creative regeneration")
+    # ensure this job has a room (idempotent — the recipe usually begins it with a better label)
+    act.begin_job(job_id, label=job_id, expected_sec=60)
 
     # 0) The leader sets the master plan first.
     plan = await _run("director", job_id, "orchestrating the master plan",
@@ -660,9 +659,9 @@ async def run_creative_team(
         offer_desc=offer_desc, vertical=vertical, request_type=request_type,
         loser_transcript=loser_transcript, loser_metrics=loser_metrics,
         winner_hook=winner_hook, winner_transcript=winner_transcript)
-    act.finish("strategist", ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
+    act.finish("strategist", job_id, ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
                helpfulness=1.0 if strategy.get("fix") else 0.5)
-    act.finish("scriptwriter", ts_w, ok=True, detail="script written",
+    act.finish("scriptwriter", job_id, ts_w, ok=True, detail="script written",
                helpfulness=min(1.0, len((script or "").split()) / 60))
 
     # 3+4) Director (needs the script) and Character Manager (independent) run CONCURRENTLY.
@@ -681,14 +680,14 @@ async def run_creative_team(
     beats = shot_selector(beats=beats, request_type=request_type, model=model,
                           has_real_character=has_real_character, has_winner_video=has_winner_video)
     _apply_director_structure(beats, plan.get("structure") or [])
-    act.finish("shots", ts, ok=True, detail="shots + models chosen",
+    act.finish("shots", job_id, ts, ok=True, detail="shots + models chosen",
                helpfulness=1.0 if beats else 0.0)
 
     # 6) Prompt Writer: compose anti-slop prompts from the reference library.
     ts = act.start("prompt", job_id, "composing anti-slop prompts")
     beats = prompt_writer(beats=beats, entity_desc=character, vertical=vertical,
                           n_reference_images=n_reference_images, has_reference_video=has_reference_video)
-    act.finish("prompt", ts, ok=True, detail=f"{len(beats)} prompts composed",
+    act.finish("prompt", job_id, ts, ok=True, detail=f"{len(beats)} prompts composed",
                helpfulness=1.0 if beats else 0.0)
 
     # 7) Critic: PURE judgment, then apply_revisions mutates (separation of concerns).
@@ -697,7 +696,7 @@ async def run_creative_team(
         ts = act.start("critic", job_id, "judging beats for slop")
         critique = await critic(beats=beats)  # prompt-only QA; vision QA runs post-generation
         revised = apply_revisions(beats, critique)
-        act.finish("critic", ts, ok=True, revised=bool(revised),
+        act.finish("critic", job_id, ts, ok=True, revised=bool(revised),
                    detail=f"{revised}/{len(critique)} beats revised",
                    helpfulness=1.0 - (revised / len(critique)) if critique else 1.0)
 
