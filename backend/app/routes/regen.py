@@ -1843,8 +1843,28 @@ async def recipe_generate(req: RunRequest) -> list:
 
     work = tempfile.mkdtemp()
     W, H = 1080, 1920
+    NO_TEXT = (" ABSOLUTELY NO on-screen text, captions, subtitles, burned-in words, logos or "
+               "watermarks anywhere in the frame — clean footage only.")
     try:
         name, out_path, url = _out_url(req, "genvideo")
+
+        # EVERYTHING goes through the creative office (nothing bypassed): the team refines the
+        # prompt (anti-slop + no-on-screen-text) and the desks light up under this job_id.
+        try:
+            from ..services import creative_team as team
+            vertical = req.context.get("vertical", "") if isinstance(req.context, dict) else ""
+            plan = await team.run_creative_team(
+                offer_desc=prompt, job_id=req.request_id, vertical=vertical,
+                request_type=("broll" if (video_urls or image_urls) else "ugc"),
+                model=engine, loser_transcript=prompt,
+                has_winner_video=bool(video_urls), n_reference_images=len(image_urls),
+                run_critic=True)
+            refined = (plan.get("beats") or [{}])[0].get("prompt")
+            if refined:
+                prompt = f"{prompt}. {refined}"
+        except Exception as e:
+            logger.warning(f"generate: team pass skipped ({e})")
+        prompt = (prompt + NO_TEXT)[:1900]
 
         if engine in ("veo-extend", "veo", "veo3-google"):
             from ..services.video_creator import VideoCreatorService as VC
