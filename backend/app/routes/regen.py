@@ -1924,27 +1924,68 @@ async def recipe_generate(req: RunRequest) -> list:
             pv = await _prep_winner_clip(vu, work)
             if pv:
                 prepped_vids.append(pv)
-        act.tick(req.request_id, f"Seedance {dur}s · {aspect_ratio} · {resolution}")
-        res = await asyncio.to_thread(
-            KieAIService.generate_video_seedance,
-            prompt=prompt,
-            reference_image_urls=(image_urls or None),
-            reference_video_urls=(prepped_vids or None),
-            reference_audio_urls=(audio_urls or None),
-            duration=dur, resolution=resolution, aspect_ratio=aspect_ratio,
-            generate_audio=bool(generate_audio))
-        vp = res.get("local_path") or res.get("video_path")
-        if not vp or not os.path.exists(vp):
+        # Seedance caps ~15s/clip. For longer requests, STITCH multiple clips: each clip after the
+        # first is anchored to the previous clip's LAST FRAME (+ the original refs) so the character/
+        # scene stays consistent across the cut. e.g. 45s → 3 × 15s clips.
+        import math as _math
+        n_clips = max(1, _math.ceil(seconds / 15))
+        per = max(4, min(15, _math.ceil(seconds / n_clips)))
+        act.set_expected_sec(req.request_id, 180 * n_clips)
+        W2, H2 = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
+        clip_paths = []
+        for ci in range(n_clips):
+            await _abort_if_cancelled(req, f"seedance clip {ci+1}/{n_clips}")
+            act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per}s · {aspect_ratio}")
+            imgs = list(image_urls or [])
+            cprompt = prompt
+            if ci > 0 and clip_paths:
+                _pd = await asyncio.to_thread(_ffprobe_duration, clip_paths[-1])
+                cont = _frame_to_public_url(clip_paths[-1], max(0.5, (_pd or per) - 0.4))   # last frame → seamless continuation
+                if cont:
+                    imgs = [cont] + imgs
+                cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
+                           "wardrobe, setting and lighting; one continuous action, match-cut.")[:1900]
+            res = await asyncio.to_thread(
+                KieAIService.generate_video_seedance,
+                prompt=cprompt,
+                reference_image_urls=(imgs or None),
+                reference_video_urls=(prepped_vids or None) if ci == 0 else None,
+                reference_audio_urls=(audio_urls or None) if ci == 0 else None,
+                duration=per, resolution=resolution, aspect_ratio=aspect_ratio,
+                generate_audio=bool(generate_audio))
+            cp = res.get("local_path") or res.get("video_path")
+            if cp and os.path.exists(cp):
+                clip_paths.append(cp)
+        if not clip_paths:
             raise RuntimeError("generate: Seedance produced no clip (check Kie credits)")
-        import shutil; shutil.copy(vp, out_path)
+        if len(clip_paths) == 1:
+            import shutil; shutil.copy(clip_paths[0], out_path)
+        else:
+            # normalize every clip to uniform W:H:fps + aac, then concat (perfect frames + audio)
+            norm = []
+            for i, cp in enumerate(clip_paths):
+                npath = os.path.join(work, f"sd{i}.mp4")
+                await asyncio.to_thread(_ffmpeg,
+                    ["-i", cp, "-vf", f"scale={W2}:{H2}:force_original_aspect_ratio=increase,crop={W2}:{H2},fps=30",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "192k", "-ar", "48000", npath], timeout=300)
+                norm.append(npath)
+            lst = os.path.join(work, "sdlist.txt")
+            with open(lst, "w") as f:
+                for n2 in norm:
+                    f.write(f"file '{n2}'\n")
+            await asyncio.to_thread(_ffmpeg,
+                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
         refs = []
         if image_urls: refs.append(f"{len(image_urls)} image(s)")
         if video_urls: refs.append(f"{len(video_urls)} video(s)")
         if audio_urls: refs.append(f"{len(audio_urls)} audio")
         return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
-                 "whats_changed": (f"Seedance 2.0 · {dur}s · {aspect_ratio} · {resolution}"
+                 "whats_changed": (f"Seedance 2.0 · {len(clip_paths)}×{per}s (~{len(clip_paths)*per}s) · {aspect_ratio} · {resolution}"
                     f"{' · refs: ' + ', '.join(refs) if refs else ''}"
-                    f"{' · audio' if generate_audio else ''} — from your prompt.")}]
+                    f"{' · audio' if generate_audio else ''}"
+                    + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "") + ".")}]
     finally:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
