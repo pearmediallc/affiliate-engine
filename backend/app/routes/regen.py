@@ -1850,12 +1850,20 @@ async def recipe_generate(req: RunRequest) -> list:
         from ..services import creative_team_activity as act
         dur = max(4, min(15, seconds))   # Seedance range 4-15s
         act.set_expected_sec(req.request_id, 180)   # Seedance ~2-4 min per clip
+        # PREP reference videos (library/scraper clips): trim to ≤12s + scrub captions + re-host to
+        # our /uploads so Kie gets a clean, non-expiring ref under its 15s cap. Keep up to 3.
+        prepped_vids = []
+        for vu in (video_urls or [])[:3]:
+            act.tick(req.request_id, "preparing reference clip")
+            pv = await _prep_winner_clip(vu, work)
+            if pv:
+                prepped_vids.append(pv)
         act.tick(req.request_id, f"Seedance {dur}s · {aspect_ratio} · {resolution}")
         res = await asyncio.to_thread(
             kieai_service.generate_video_seedance,
             prompt=prompt,
             reference_image_urls=(image_urls or None),
-            reference_video_urls=(video_urls or None),
+            reference_video_urls=(prepped_vids or None),
             reference_audio_urls=(audio_urls or None),
             duration=dur, resolution=resolution, aspect_ratio=aspect_ratio,
             generate_audio=bool(generate_audio))
