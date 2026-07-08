@@ -1287,6 +1287,18 @@ def _out_url(req, kind):
     return name, os.path.join(UPLOAD_DIR, name), f"{AE_PUBLIC_URL}/api/v1/uploads/{name}"
 
 
+def _ae_persist(out_path: str, name: str) -> None:
+    """Durable copy of a produced video into the AFFILIATE-ENGINE's own S3 bucket (best-effort), so
+    the video lives in BOTH buckets (AE S3 + creative-library S3) — not just AE's ephemeral /uploads."""
+    try:
+        from ..services.storage import StorageService
+        u = StorageService.upload_file(out_path, f"regen/{name}")
+        if u:
+            logger.info(f"[regen] AE S3 persisted {name} → {u}")
+    except Exception as e:
+        logger.warning(f"AE S3 persist failed for {name}: {e}")
+
+
 async def recipe_caption_change(req: RunRequest) -> list:
     """Add/refresh a bold on-screen CTA caption over the original (drives CTR). Keeps
     everything else; overlays one new caption band across the video."""
@@ -1845,6 +1857,8 @@ async def recipe_generate(req: RunRequest) -> list:
     W, H = 1080, 1920
     NO_TEXT = (" ABSOLUTELY NO on-screen text, captions, subtitles, burned-in words, logos or "
                "watermarks anywhere in the frame — clean footage only.")
+    HOOK = (" The subject is ALREADY speaking energetically from the very first frame — hook in the "
+            "first 2 seconds, no silent lead-in, no dead air, no slow intro.")
     try:
         name, out_path, url = _out_url(req, "genvideo")
 
@@ -1864,7 +1878,7 @@ async def recipe_generate(req: RunRequest) -> list:
                 prompt = f"{prompt}. {refined}"
         except Exception as e:
             logger.warning(f"generate: team pass skipped ({e})")
-        prompt = (prompt + NO_TEXT)[:1900]
+        prompt = (prompt + HOOK + NO_TEXT)[:1900]
 
         if engine in ("veo-extend", "veo", "veo3-google"):
             from ..services.video_creator import VideoCreatorService as VC
@@ -1901,6 +1915,7 @@ async def recipe_generate(req: RunRequest) -> list:
                 await asyncio.to_thread(_ffmpeg,
                     ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
                      "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+            _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
             approx = 8 + 7 * (len(paths) - 1)
             return [{"recipe": "Generate — Veo 3.1 extend", "video_url": url, "confidence": 0.7,
                      "whats_changed": (f"Veo 3.1 {'image-to-video + ' if image_urls else ''}native extend — "
@@ -1932,6 +1947,7 @@ async def recipe_generate(req: RunRequest) -> list:
         per = max(4, min(15, _math.ceil(seconds / n_clips)))
         act.set_expected_sec(req.request_id, 180 * n_clips)
         W2, H2 = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
+        is_talk = bool(video_urls) or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc)\b", prompt, re.I))
         clip_paths = []
         for ci in range(n_clips):
             await _abort_if_cancelled(req, f"seedance clip {ci+1}/{n_clips}")
@@ -1945,15 +1961,23 @@ async def recipe_generate(req: RunRequest) -> list:
                     imgs = [cont] + imgs
                 cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
                            "wardrobe, setting and lighting; one continuous action, match-cut.")[:1900]
-            res = await asyncio.to_thread(
-                KieAIService.generate_video_seedance,
-                prompt=cprompt,
-                reference_image_urls=(imgs or None),
-                reference_video_urls=(prepped_vids or None) if ci == 0 else None,
-                reference_audio_urls=(audio_urls or None) if ci == 0 else None,
-                duration=per, resolution=resolution, aspect_ratio=aspect_ratio,
-                generate_audio=bool(generate_audio))
-            cp = res.get("local_path") or res.get("video_path")
+            # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
+            # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
+            beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": ""}
+
+            async def _attempt(bt, _imgs=imgs, _first=(ci == 0)):
+                res = await asyncio.to_thread(
+                    KieAIService.generate_video_seedance,
+                    prompt=bt.get("prompt"),
+                    reference_image_urls=(_imgs or None),
+                    reference_video_urls=(prepped_vids or None) if _first else None,
+                    reference_audio_urls=(audio_urls or None) if _first else None,
+                    duration=per, resolution=resolution, aspect_ratio=aspect_ratio,
+                    generate_audio=bool(generate_audio))
+                cp2 = res.get("local_path") or res.get("video_path")
+                return cp2 if (cp2 and os.path.exists(cp2)) else None
+
+            cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
             if cp and os.path.exists(cp):
                 clip_paths.append(cp)
         if not clip_paths:
@@ -1977,6 +2001,7 @@ async def recipe_generate(req: RunRequest) -> list:
             await asyncio.to_thread(_ffmpeg,
                 ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
+        _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         refs = []
         if image_urls: refs.append(f"{len(image_urls)} image(s)")
         if video_urls: refs.append(f"{len(video_urls)} video(s)")
