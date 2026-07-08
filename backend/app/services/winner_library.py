@@ -110,14 +110,26 @@ def _get_s3():
     return _s3_client
 
 
+# cache presigned URLs so repeated /winners calls return the SAME url for a key (stops the browser
+# re-downloading the video every poll → the "constant refresh" churn). Re-sign well before expiry.
+_PRESIGN_CACHE: dict = {}   # key -> (url, expires_at_epoch)
+_PRESIGN_TTL = 3600         # sign for 1h; serve cached until 10 min before expiry
+
+
 def _presign(s3_key):
-    """Presigned GET for a private winner object (1h). None on failure/no key."""
+    """Presigned GET for a private winner object, cached + stable within the hour. None on failure."""
     if not s3_key:
         return None
     key = s3_key.lstrip("/")
+    import time as _t
+    hit = _PRESIGN_CACHE.get(key)
+    if hit and hit[1] - 600 > _t.time():   # still valid for >10 min → reuse the SAME url
+        return hit[0]
     try:
-        return _get_s3().generate_presigned_url(
-            "get_object", Params={"Bucket": settings.winner_s3_bucket, "Key": key}, ExpiresIn=3600)
+        url = _get_s3().generate_presigned_url(
+            "get_object", Params={"Bucket": settings.winner_s3_bucket, "Key": key}, ExpiresIn=_PRESIGN_TTL)
+        _PRESIGN_CACHE[key] = (url, _t.time() + _PRESIGN_TTL)
+        return url
     except Exception as e:
         logger.warning(f"winner presign failed for {key}: {e}")
         base = (settings.winner_media_base or "").rstrip("/")

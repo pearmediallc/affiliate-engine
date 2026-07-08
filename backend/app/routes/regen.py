@@ -782,6 +782,43 @@ async def creative_team_jobs(_auth: bool = Depends(require_service_key)):
     return {"success": True, "jobs": act.jobs_list()}
 
 
+@router.post("/creative-team/enhance")
+async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_service_key)):
+    """LLM assist for the Studio composer:
+      • mode='enhance' → rewrite the user's prompt into a vivid, front-loaded, anti-slop engine prompt.
+      • mode='script'  → expand it into a time-frame-wise scene script (one scene per line w/ timing),
+        which the user approves and we then generate from.
+    Returns {text}. Falls back to the original prompt if the LLM is unavailable."""
+    prompt = (payload.get("prompt") or "").strip()
+    mode = (payload.get("mode") or "enhance").lower()
+    engine = (payload.get("engine") or "seedance").lower()
+    vertical = payload.get("vertical") or ""
+    seconds = int(payload.get("seconds") or 15)
+    if not prompt:
+        return {"success": False, "error": "prompt required"}
+    from ..services import realism_prompt_engine as rpe  # noqa (rules reference)
+    if mode == "script":
+        seg = 7 if engine == "veo-extend" else max(4, min(15, seconds))
+        n = max(1, round(seconds / seg))
+        ask = (f"You are a direct-response video director. Expand this idea into a SHORT shot script of "
+               f"{n} scene(s) for a {vertical} ad, ONE scene per line, each line prefixed with its time "
+               f"window (e.g. '0-{seg}s:'). Each line = one continuous action, front-loaded (camera → "
+               f"subject → environment → lighting → action), candid/anti-slop, no on-screen text. "
+               f"Idea: \"{prompt}\". Return STRICT JSON {{\"script\": \"line1\\nline2\"}}.")
+    else:
+        ask = (f"Rewrite this into ONE vivid, front-loaded video-generation prompt (camera → subject → "
+               f"environment → lighting → single continuous action), candid consumer-camera realism, "
+               f"anti-slop, no on-screen text, for a {vertical} ad. Keep it faithful to the intent. "
+               f"Idea: \"{prompt}\". Return STRICT JSON {{\"prompt\": \"...\"}}.")
+    try:
+        out = await _gemini_json(ask)
+        text = (out.get("script") if mode == "script" else out.get("prompt")) or prompt
+        return {"success": True, "text": str(text).strip(), "mode": mode}
+    except Exception as e:
+        logger.warning(f"enhance failed: {e}")
+        return {"success": True, "text": prompt, "mode": mode, "fallback": True}
+
+
 @router.get("/creative-team/reports")
 async def creative_team_reports(_auth: bool = Depends(require_service_key)):
     """Per-persona performance ledger (durable, aggregated from Postgres): runs, accuracy,
