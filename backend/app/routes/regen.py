@@ -908,21 +908,25 @@ async def _execute(req: RunRequest):
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
     label = f"{vtype} · {(req.context.get('creative_filename') or req.assets.get('prompt') or req.request_id)[:60]}"
     act.begin_job(req.request_id, label=label, expected_sec=_EXPECTED_SEC.get(vtype, 180))
-    ok = False
+    logger.info(f"[regen] JOB START id={req.request_id} type={vtype} model={req.model} label={label!r}")
+    ok = False; err_msg = ""
     try:
         await _abort_if_cancelled(req, "start")
         recipe = _RECIPES.get(vtype, recipe_special)
         variants = await recipe(req)
         ok = True
+        logger.info(f"[regen] JOB DONE id={req.request_id} type={vtype} variants={len(variants)}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "ready", "variants": variants})
     except Cancelled as c:
+        err_msg = str(c)
         logger.info(f"regen run cancelled for {req.request_id}: {c}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "cancelled", "error": str(c), "variants": []})
     except Exception as e:
+        err_msg = str(e)
         logger.exception(f"regen run failed for {req.request_id}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": str(e), "variants": []})
     finally:
-        act.end_job(req.request_id, ok=ok)
+        act.end_job(req.request_id, ok=ok, error=err_msg)
 
 
 async def _callback(url: Optional[str], payload: dict):
@@ -1883,21 +1887,26 @@ async def recipe_generate(req: RunRequest) -> list:
                         f"{len(paths)} segment(s) (~{approx}s) from your prompt.")}]
 
         # ── Seedance 2.0 (Kie) — native single clip up to 15s, full reference set ──
-        from ..services import kieai_service
+        from ..services.kieai_service import KieAIService
         from ..services import creative_team_activity as act
         dur = max(4, min(15, seconds))   # Seedance range 4-15s
         act.set_expected_sec(req.request_id, 180)   # Seedance ~2-4 min per clip
         # PREP reference videos (library/scraper clips): trim to ≤12s + scrub captions + re-host to
-        # our /uploads so Kie gets a clean, non-expiring ref under its 15s cap. Keep up to 3.
+        # our /uploads so Kie gets a clean, non-expiring ref under its 15s cap. Skip non-video refs
+        # (e.g. an image winner) — those go through reference_image_urls instead. Keep up to 3.
         prepped_vids = []
         for vu in (video_urls or [])[:3]:
+            if re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", vu, re.I):
+                if vu not in (image_urls or []):
+                    image_urls = (image_urls or []) + [vu]   # treat image refs as image references
+                continue
             act.tick(req.request_id, "preparing reference clip")
             pv = await _prep_winner_clip(vu, work)
             if pv:
                 prepped_vids.append(pv)
         act.tick(req.request_id, f"Seedance {dur}s · {aspect_ratio} · {resolution}")
         res = await asyncio.to_thread(
-            kieai_service.generate_video_seedance,
+            KieAIService.generate_video_seedance,
             prompt=prompt,
             reference_image_urls=(image_urls or None),
             reference_video_urls=(prepped_vids or None),

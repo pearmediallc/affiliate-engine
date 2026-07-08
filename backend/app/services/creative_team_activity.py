@@ -103,12 +103,15 @@ def set_expected_sec(job_id: str, expected_sec: float) -> None:
             j["expected_sec"] = max(15.0, float(expected_sec))
 
 
-def end_job(job_id: str, ok: bool = True) -> None:
+def end_job(job_id: str, ok: bool = True, error: str = "") -> None:
     with _LOCK:
         j = _JOBS.get(job_id)
         if j:
             j["status"] = "done" if ok else "failed"
+            j["error"] = (error or "")[:400]
             j["updated"] = _now()
+            if not ok and error:
+                j["feed"].appendleft({"t": _now(), "persona": "system", "event": "fail", "detail": error[:200]})
 
 
 def tick(job_id: str, note: str = "") -> None:
@@ -203,7 +206,7 @@ def jobs_list() -> list:
             if not j:
                 continue
             out.append({"job_id": jid, "label": j["label"], "status": j["status"],
-                        "progress": _progress(j), "eta_sec": _eta(j),
+                        "progress": _progress(j), "eta_sec": _eta(j), "error": j.get("error", ""),
                         "elapsed_sec": int(_now() - j["started"]), "updated": j["updated"],
                         "working": [p for p, st in j["personas"].items() if st["status"] == "working"]})
         out.sort(key=lambda x: (x["status"] != "running", -x["updated"]))
@@ -227,7 +230,7 @@ def snapshot(job_id: Optional[str] = None) -> dict:
                           "busy_ms": int((_now() - st["since"]) * 1000) if st["since"] else 0,
                           "queued": 0, "last": st["last"]})
         return {"job_id": job_id, "label": (j["label"] if j else None),
-                "status": (j["status"] if j else "idle"),
+                "status": (j["status"] if j else "idle"), "error": (j.get("error", "") if j else ""),
                 "progress": (_progress(j) if j else 0), "eta_sec": (_eta(j) if j else None),
                 "elapsed_sec": (int(_now() - j["started"]) if j else 0),
                 "desks": desks, "feed": (list(j["feed"])[:60] if j else []),
