@@ -681,14 +681,21 @@ async def seedance_test_status(task_id: str, _auth: bool = Depends(require_servi
 
 @router.post("/tag-asset")
 async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: str = Form(""),
+                    age_band: str = Form(""), gender: str = Form(""), state: str = Form(""),
                     _auth: bool = Depends(require_service_key)):
-    """Index one asset: transcribe + vision-tag so the composer can pull ACCURATE references.
-    Returns {transcript, duration, has_captions, role, character, scene, on_screen, emotion}."""
+    """Index one asset: ffprobe + transcribe + vision-tag so the brain can pick the RIGHT reference.
+    Folder-priors (age_band/gender/state/kind/vertical) come in as ground truth; vision confirms +
+    enriches (face_score, wardrobe, setting, style, captions). Returns the full tag record."""
     work = tempfile.mkdtemp()
     p = None
     try:
-        p = await _download_to_temp(url)
+        p = await _download_to_temp(url, suffix=os.path.splitext(url.split("?")[0])[1] or ".mp4")
         dur = await asyncio.to_thread(_ffprobe_duration, p)
+        try:
+            W_, H_ = await asyncio.to_thread(_ffprobe_dims, p)
+        except Exception:
+            W_, H_ = 0, 0
+        aspect = "9:16" if (H_ and W_ and H_ > W_) else ("16:9" if W_ else "")
         transcript = ""
         try:
             transcript = await _transcribe_file(p)
@@ -700,18 +707,35 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
         if frames:
             try:
                 tags = await _gemini_vision(frames,
-                    'These frames are from an ad-library video clip. Return STRICT JSON describing it for a '
-                    'creative reference index: {"role":"talking_head|map|broll|product|proof", '
-                    '"character":"<short: age/gender/look, or none>", "scene":"<setting in <=8 words>", '
+                    'These frames are from a creative-library reference clip. Return STRICT JSON for a '
+                    'reference index: {"role":"talking_head|map|broll|product|proof", '
+                    '"age_band":"<one of: under35|35-44|45-55|55plus, or none>", '
+                    '"gender":"<male|female|none>", "ethnicity":"<short or none>", '
+                    '"wardrobe":"<short or none>", "scene":"<setting in <=8 words>", '
+                    '"style":"<ugc_handheld|cinematic|animated|studio, or none>", '
+                    '"face_score":<0.0-1.0 how clean/front-facing a single talking face is; 0 if no face>, '
+                    '"num_people":<int>, '
                     '"on_screen":"<key objects/proof e.g. document, phone, house, cash, or none>", '
                     '"emotion":"<energy/expression in 1-2 words>"}')
             except Exception as e:
                 logger.warning(f"tag-asset vision failed: {e}")
         has_caps = _boxes_area(await _detect_caption_boxes(frames)) > 0.03 if frames else False
+        role = tags.get("role") or kind
+        face = float(tags.get("face_score") or 0)
+        # usable_as: a clean front-facing talker is a lip-sync avatar; else its role
+        usable_as = "avatar_lipsync" if (role == "talking_head" and face >= 0.6) else role
+        # reusable talking length ≈ duration when it's a talker (approx; refined by clean-seg later)
+        max_talk_sec = round(dur or 0, 1) if usable_as == "avatar_lipsync" else 0
         return {"success": True, "url": url, "kind": kind, "vertical": vertical,
-                "duration": round(dur or 0, 1), "has_captions": has_caps,
+                "duration": round(dur or 0, 1), "aspect": aspect, "has_captions": has_caps,
                 "transcript": (transcript or "")[:1500],
-                "role": tags.get("role") or kind, "character": tags.get("character") or "",
+                "role": role, "usable_as": usable_as, "face_score": round(face, 2),
+                "age_band": age_band or tags.get("age_band") or "",
+                "gender": gender or tags.get("gender") or "",
+                "state": state or "", "max_talk_sec": max_talk_sec,
+                "ethnicity": tags.get("ethnicity") or "", "wardrobe": tags.get("wardrobe") or "",
+                "style": tags.get("style") or "", "num_people": tags.get("num_people"),
+                "character": tags.get("character") or ((f"{age_band} {gender}".strip()) or ""),
                 "scene": tags.get("scene") or "", "on_screen": tags.get("on_screen") or "",
                 "emotion": tags.get("emotion") or ""}
     except Exception as e:
