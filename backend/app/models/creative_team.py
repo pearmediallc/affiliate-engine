@@ -27,3 +27,25 @@ class CreativeTeamEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     __table_args__ = (Index("ix_cte_job_persona", "job_id", "persona"),)
+
+
+class CreativeLesson(Base):
+    """Self-learning failure memory: every mistake the team makes is recorded here with WHY it
+    happened and the corrective RULE, deduped by a signature so repeats increment `hits` instead of
+    duplicating. The brain reads applicable lessons before every job so a failure never recurs."""
+    __tablename__ = "creative_lessons"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    sig = Column(String, unique=True, index=True)   # dedup signature (scope+trigger+rule)
+    scope = Column(String, index=True)              # routing | quality | engine | asset | cost | job
+    style = Column(String, nullable=True, index=True)
+    engine = Column(String, nullable=True)
+    vertical = Column(String, nullable=True, index=True)
+    trigger = Column(Text, nullable=True)           # what happened / what was asked
+    reason = Column(Text, nullable=True)            # WHY it failed
+    rule = Column(Text, nullable=True)              # HOW to avoid it next time (the corrective)
+    job_id = Column(String, nullable=True)
+    hits = Column(Integer, default=1)               # how many times this failure recurred
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

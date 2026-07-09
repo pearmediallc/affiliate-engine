@@ -806,6 +806,22 @@ async def creative_team_jobs(_auth: bool = Depends(require_service_key)):
     return {"success": True, "jobs": act.jobs_list()}
 
 
+@router.get("/creative-team/playbook")
+async def creative_team_playbook(_auth: bool = Depends(require_service_key)):
+    """The brain's full knowledge: every style/engine/resource + policy + the learned lessons."""
+    from ..services import creative_playbook as pb
+    from ..services import creative_learning as learn
+    return {"success": True, "playbook": pb.describe(), "lessons": learn.get_lessons(limit=50)}
+
+
+@router.get("/creative-team/lessons")
+async def creative_team_lessons(scope: str = "", style: str = "", vertical: str = "",
+                                _auth: bool = Depends(require_service_key)):
+    """The self-learning failure memory — what went wrong, why, and the corrective rule."""
+    from ..services import creative_learning as learn
+    return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
+
+
 @router.post("/creative-team/enhance")
 async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_service_key)):
     """LLM assist for the Studio composer:
@@ -951,6 +967,15 @@ async def _execute(req: RunRequest):
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": str(e), "variants": []})
     finally:
         act.end_job(req.request_id, ok=ok, error=err_msg)
+        if not ok and err_msg:   # SELF-LEARNING: record the failure + a corrective rule
+            try:
+                from ..services import creative_learning as learn
+                learn.record_lesson("job", trigger=f"{vtype} generation", reason=err_msg,
+                                    rule=f"When running '{vtype}', guard against: {err_msg[:160]}",
+                                    style=vtype, vertical=(req.context.get('vertical') if isinstance(req.context, dict) else ''),
+                                    job_id=req.request_id)
+            except Exception:
+                pass
 
 
 async def _callback(url: Optional[str], payload: dict):
@@ -1900,6 +1925,11 @@ async def recipe_generate(req: RunRequest) -> list:
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
                 prompt = f"{prompt}. {refined}"
+            # AUTO: let the brain's Playbook route pick the engine (ChatGPT-style — user needn't choose)
+            if engine in ("", "auto"):
+                routed = ((plan.get("plan") or {}).get("route") or {}).get("engine") or "seedance"
+                engine = "veo-extend" if routed == "veo_extend" else ("seedance" if routed in ("seedance", "avatar_lipsync", "image_to_video") else "seedance")
+                logger.info(f"[generate] brain routed engine → {engine} (from {routed})")
         except Exception as e:
             logger.warning(f"generate: team pass skipped ({e})")
         prompt = (prompt + HOOK + NO_TEXT)[:1900]

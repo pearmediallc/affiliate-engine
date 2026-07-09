@@ -190,9 +190,21 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
     """The leader. Sets the MASTER PLAN the rest of the team executes: the creative approach,
     which references to use where, the model routing intent, and — crucially — WHERE in the
     timeline we lip-sync a real character vs hard-cut to b-roll/map/product inserts.
-    Returns {approach, reference_plan, model_intent, structure:[{beat_kind, technique}], notes}."""
+    Returns {approach, reference_plan, model_intent, structure, notes, route}. `route` is the concrete
+    Playbook decision (style/engine/resources) so nothing bypasses what we can actually execute."""
+    from . import creative_playbook as pb
+    from . import creative_learning as learn
     refs = available_references or {}
-    prompt = f"""You are the Creative Director — the leader of a direct-response video team. You
+    # deterministic route from the Playbook (never picks a path/engine we can't run) + learned avoids
+    plan_route = pb.route(request_type=request_type, vertical=vertical,
+                          has_real_character=has_real_character, has_winner_video=has_winner_video,
+                          needs_talking=True, engine_hint=("" if (model or "").lower() in ("", "auto") else model))
+    avoid = learn.learned_engine_avoid(style=plan_route["style"], vertical=vertical)
+    if plan_route["engine"] in avoid:
+        plan_route["notes"] = (plan_route.get("notes", "") + f" (learned: avoid {plan_route['engine']} for {plan_route['style']})").strip()
+    playbook = pb.summary_for_prompt()
+    lessons = learn.lessons_for_prompt(style=plan_route["style"], vertical=vertical)
+    prompt = f"""{playbook}\n\n{lessons}\n\nYou are the Creative Director — the leader of a direct-response video team. You
 decide the whole plan and delegate. Be concrete about REFERENCES, MODEL, and where we LIP-SYNC a
 talking person vs HARD-CUT to an insert (b-roll / map / product).
 
@@ -215,10 +227,12 @@ Return STRICT JSON:
   "notes": "risks or must-keeps"}}"""
     out = await _gemini_json(prompt, temperature=0.4)
     if out:
+        out["route"] = plan_route
         return out
     # heuristic master plan: real character → lipsync body with b-roll inserts; else winner-clone
     technique = "lipsync" if has_real_character else ("hard_cut" if has_winner_video else "lipsync")
     return {
+        "route": plan_route,
         "approach": f"Hook fast on the winning angle, then deliver the offer with a real talking person and cut to relevant inserts.",
         "reference_plan": ("Open on the winning hook; use the real character for spoken beats; "
                            "cut to b-roll/map inserts on proof points; clean CTA card." if has_real_character
@@ -341,10 +355,16 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
     """MERGED Strategist + Script Writer in ONE round-trip (diagnosis + script together) — halves
     latency/cost vs two sequential calls. Returns (strategy: Strategy, script: str). Falls back to
     the two deterministic heuristics if the LLM is unavailable."""
+    from . import creative_playbook as pb
+    from . import creative_learning as learn
     metrics = loser_metrics or {}
-    prompt = f"""{_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
-Writer. First DIAGNOSE why this ad underperformed and pick the smallest high-leverage fix, THEN
-write the new spoken script implementing that fix. Keep the offer intact.
+    prompt = f"""{pb.MISSION}
+
+{learn.lessons_for_prompt(vertical=vertical)}
+
+{_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
+Writer on THIS project (above). First DIAGNOSE why this ad underperformed and pick the smallest
+high-leverage fix, THEN write the new spoken script implementing that fix. Keep the offer intact.
 
 OFFER: {_sanitize(offer_desc, MAX_OFFER)}
 VERTICAL: {vertical}   REQUEST TYPE: {request_type}
@@ -592,6 +612,15 @@ def coach_from_eval(beat: dict, ev: dict, job_id: Optional[str] = None) -> None:
         act.coach(p, note, job_id=job_id)
     if issues:
         beat["prompt"] = revised_prompt(beat.get("prompt", ""), issues)
+        # SELF-LEARNING: a Critic rejection is a wrongdoing → record it + the corrective rule
+        try:
+            from . import creative_learning as learn
+            learn.record_lesson("quality", trigger=f"beat scored {ev.get('overall')}/10",
+                                reason="; ".join(issues)[:200],
+                                rule="Pre-empt in the prompt: " + "; ".join(issues[:3]),
+                                job_id=job_id)
+        except Exception:
+            pass
 
 
 def eval_passed(ev: dict) -> bool:
