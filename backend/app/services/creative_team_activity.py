@@ -94,6 +94,8 @@ def begin_job(job_id: str, label: str = "", expected_sec: float = 120.0) -> None
         if label:
             j["label"] = label
         j["status"] = "running"
+    logger.info(f"[office] JOB START {job_id} · {label}")
+    _persist("system", "job_start", job_id=job_id, detail=label)   # durable timeline
 
 
 def set_expected_sec(job_id: str, expected_sec: float) -> None:
@@ -112,6 +114,12 @@ def end_job(job_id: str, ok: bool = True, error: str = "") -> None:
             j["updated"] = _now()
             if not ok and error:
                 j["feed"].appendleft({"t": _now(), "persona": "system", "event": "fail", "detail": error[:200]})
+    if ok:
+        logger.info(f"[office] JOB DONE {job_id}")
+    else:
+        logger.error(f"[office] JOB FAILED {job_id}: {(error or '')[:300]}")
+    # durable job outcome (distinct event names so they never skew persona pass/fail metrics)
+    _persist("system", "job_done" if ok else "job_fail", job_id=job_id, detail=(error or "")[:400], ok=ok)
 
 
 def tick(job_id: str, note: str = "") -> None:
@@ -122,6 +130,9 @@ def tick(job_id: str, note: str = "") -> None:
             j["updated"] = _now()
             if note:
                 j["feed"].appendleft({"t": _now(), "persona": "generation", "event": "progress", "detail": note[:160]})
+    if note:
+        logger.info(f"[office] {job_id} progress: {note[:160]}")
+        _persist("generation", "progress", job_id=job_id, detail=note[:160])   # durable
 
 
 # ── per-persona step events ────────────────────────────────────────────────────
@@ -134,6 +145,8 @@ def start(persona: str, job_id: str, task: str = "") -> float:
             j["personas"][persona] = {"status": "working", "task": task, "since": ts,
                                       "last": j["personas"][persona].get("last")}
         j["feed"].appendleft({"t": ts, "persona": persona, "event": "start", "task": task})
+    logger.info(f"[office] {job_id} {persona} START: {(task or '')[:100]}")
+    _persist(persona, "start", job_id=job_id, detail=task)   # durable timeline (not counted in reports)
     return ts
 
 

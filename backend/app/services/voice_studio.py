@@ -253,6 +253,11 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
         provider = "chatterbox"
     if not provider and sample_url:
         provider = "chatterbox"
+    # a voice_id like 'elevenlabs:<id>' / 'deepgram:<model>' explicitly names the provider
+    if not provider and voice_id and ":" in voice_id:
+        pref = voice_id.split(":", 1)[0]
+        if pref in ("openai", "deepgram", "elevenlabs", "kokoro", "chatterbox"):
+            provider = pref
     native = (voice_id.split(":", 1)[1] if voice_id and ":" in voice_id else None)
 
     # build the attempt order: chosen provider first, then the cheap→premium chain
