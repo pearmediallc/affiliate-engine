@@ -510,7 +510,7 @@ def require_service_key(x_service_key: str = Header(default="")):
 
 VARIATION_TYPES = [
     "Caption Change Only", "Hook Change Only", "Reclean/Minor Mod", "Script",
-    "Broll", "Stock Video", "Avatar/UGC", "map + ugc", "Image",
+    "Broll", "Stock Video", "Avatar/UGC", "Avatar Lipsync", "map + ugc", "Image",
     "Image + Voiceover", "Special Request",
 ]
 
@@ -987,7 +987,7 @@ async def run(req: RunRequest, background: BackgroundTasks, _auth: bool = Depend
 # rough per-recipe expected wall-clock (seconds) — seeds the progress bar / ETA; recipes refine it.
 _EXPECTED_SEC = {
     "Full Ad": 300, "Create from Assets": 240, "Generate Video": 200,
-    "Avatar/UGC": 180, "map + ugc": 180, "Script": 120, "Broll": 150, "Stock Video": 150,
+    "Avatar/UGC": 180, "map + ugc": 180, "Avatar Lipsync": 220, "Script": 120, "Broll": 150, "Stock Video": 150,
     "Hook Change Only": 90, "Caption Change Only": 60, "Reclean/Minor Mod": 60,
     "Image": 120, "Image + Voiceover": 150, "Special Request": 180,
 }
@@ -2120,8 +2120,105 @@ async def recipe_generate(req: RunRequest) -> list:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+async def recipe_avatar_lipsync(req: RunRequest) -> list:
+    """The team's real CapCut flow, automated end-to-end: take a REAL character clip from
+    our own asset library, write/adapt a natural spoken script (inserting the offer value),
+    generate a matching voice (optionally CLONED from the character's own footage for max
+    naturalness), then re-lipsync the footage to that voice with LatentSync. No synthetic
+    avatar — it's our own person, so it never looks 'AIfied'."""
+    from ..services import voice_studio as vs
+    from ..services.lip_sync import LipSyncService
+    from ..services import creative_team_activity as act
+    from ..services.storage import StorageService
+
+    a = req.assets or {}
+    char_url = a.get("character_video_url") or req.active_url
+    if not char_url:
+        raise RuntimeError("avatar-lipsync: no character video provided")
+    seconds = int(a.get("seconds") or 20)
+    offer_value = (a.get("offer_value") or "").strip()
+    vertical = a.get("vertical") or req.context.get("vertical") or ""
+    base = (a.get("script") or "").strip()
+    brief = (a.get("brief") or req.expectation or "").strip()
+
+    # 1) SCRIPT — natural, first-person spoken VO that states the offer value
+    t0 = act.start("scriptwriter", req.request_id, "writing the spoken script")
+    script = base or brief
+    try:
+        prompt = (
+            "Write a natural, first-person spoken voiceover for a short UGC ad. "
+            f"Vertical: {vertical or 'direct-response'}. Target ~{seconds}s (~{int(seconds * 2.6)} words). "
+            + (f'Adapt this base script, keeping its message and offer: \"{base[:1200]}\". ' if base else "")
+            + (f'Creative brief: \"{brief[:600]}\". ' if brief else "")
+            + (f'You MUST naturally say this offer/value: {offer_value}. ' if offer_value else "")
+            + "Talk like a real person to camera — casual, warm, no ad-speak, NO stage directions or captions. "
+            'Hook hard in the first line. Return JSON {"script":"..."}.'
+        )
+        d = await _gemini_json(prompt)
+        script = (d.get("script") or script).strip()
+    except Exception as e:
+        logger.warning(f"avatar-lipsync script gen failed, using base/brief: {e}")
+    if not script:
+        raise RuntimeError("avatar-lipsync: no script and could not generate one")
+    act.finish("scriptwriter", req.request_id, t0, detail=script[:160])
+
+    await _abort_if_cancelled(req, "avatar-lipsync voice")
+
+    # 2) VOICE — clone the character's own voice (most natural) else cast a catalog voice
+    t1 = act.start("character", req.request_id, "casting the voice")
+    sample_url = None
+    if a.get("clone_voice"):
+        try:
+            raw = await _download_to_temp(char_url, ".mp4")
+            wav = raw.rsplit(".", 1)[0] + ".wav"
+            await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
+            sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
+        except Exception as e:
+            logger.warning(f"voice-clone sample extract failed, using preset: {e}")
+    voice_id = a.get("voice_id")
+    if not voice_id and not sample_url:
+        voice_id = vs.pick_voice(gender=a.get("gender"), age_band=a.get("age_band")).get("id")
+    out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
+    voice_res = await asyncio.to_thread(lambda: vs.synthesize(
+        script, voice_id=("chatterbox:character" if sample_url else voice_id),
+        sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational"))
+    audio_url = StorageService.upload_file(out_audio, f"voice/vo_{req.request_id[:8]}.mp3")
+    if not audio_url:
+        raise RuntimeError("avatar-lipsync: could not host the voice-over for lip-sync")
+    act.finish("character", req.request_id, t1, detail=f"voice={voice_res.get('provider')} (fallback={voice_res.get('fallback')})")
+
+    await _abort_if_cancelled(req, "avatar-lipsync render")
+
+    # 3) LIP-SYNC — LatentSync video→video for a natural, non-AIfied result
+    t2 = act.start("shots", req.request_id, "lip-syncing with LatentSync")
+    job = await asyncio.to_thread(lambda: LipSyncService.start_generation(char_url, audio_url, "latentsync"))
+    result = None
+    for _ in range(90):   # up to ~6 min
+        await asyncio.sleep(4)
+        st = await asyncio.to_thread(lambda: LipSyncService.check_status(job))
+        if st.get("local_path") or st.get("video_url") or st.get("status") in ("succeeded", "completed"):
+            result = st; break
+        if st.get("status") in ("failed", "canceled"):
+            raise RuntimeError(f"lip-sync failed: {st.get('error')}")
+    if not result:
+        raise RuntimeError("lip-sync timed out")
+    act.finish("shots", req.request_id, t2, detail="lip-sync done")
+
+    # 4) SAVE — normalize + persist to BOTH buckets
+    name, out_path, out_url = _out_url(req, "avatar_lipsync")
+    src = result.get("local_path")
+    if not src and result.get("video_url"):
+        src = await _download_to_temp(result["video_url"], ".mp4")
+    await asyncio.to_thread(_ffmpeg, ["-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
+    _ae_persist(out_path, name)
+    return [{"recipe": "Avatar Lipsync (LatentSync)", "video_url": out_url, "script": script,
+             "voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url)}]
+
+
 _RECIPES = {
     "Full Ad": recipe_full_ad,
+    "Avatar Lipsync": recipe_avatar_lipsync,
     "Create from Assets": recipe_from_assets,
     "Generate Video": recipe_generate,
     "Avatar/UGC": recipe_avatar,
