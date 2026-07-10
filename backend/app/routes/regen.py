@@ -2244,6 +2244,21 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
         script, voice_id=("chatterbox:character" if sample_url else voice_id),
         sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational"))
+    # sync.so's free plan caps audio at 20s → gently speed the VO to fit (then hard-trim as backstop)
+    try:
+        import subprocess
+        pd = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=nw=1:nk=1", out_audio], capture_output=True, text=True, timeout=30)
+        dur = float((pd.stdout or "0").strip() or 0)
+        if dur > 19.5:
+            factor = min(1.35, dur / 19.0)
+            fit = out_audio.rsplit(".", 1)[0] + "_fit.mp3"
+            await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}", "-t", "19.6", fit], 120)
+            out_audio = fit
+            logger.info(f"[avatar-lipsync] fit VO {dur:.1f}s → ~19.5s (atempo {factor:.2f})")
+    except Exception as e:
+        logger.warning(f"audio duration-fit skipped: {e}")
+
     audio_url = StorageService.upload_file(out_audio, f"voice/vo_{req.request_id[:8]}.mp3")
     if not audio_url:
         raise RuntimeError("avatar-lipsync: could not host the voice-over for lip-sync")
