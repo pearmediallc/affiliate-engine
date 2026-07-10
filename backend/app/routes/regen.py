@@ -2141,23 +2141,47 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     base = (a.get("script") or "").strip()
     brief = (a.get("brief") or req.expectation or "").strip()
 
-    # 1) SCRIPT — natural, first-person spoken VO that states the offer value
-    t0 = act.start("scriptwriter", req.request_id, "writing the spoken script")
+    # 1) SCRIPT — run the FULL creative team: Strategist diagnoses + Script Writer drafts
+    #    (MISSION + learned-lessons grounded), then the Critic hardens the hook. Same brain
+    #    the other recipes use — not a lone GPT call.
+    t0 = act.start("scriptwriter", req.request_id, "strategizing + writing the script")
     script = base or brief
+    offer_desc = " ".join(x for x in [
+        brief,
+        (f"Adapt this base script, keep its message and offer: {base[:1000]}" if base else ""),
+        (f"You MUST naturally state the offer/value {offer_value}." if offer_value else ""),
+        f"Spoken UGC voiceover, first person, ~{seconds}s.",
+    ] if x).strip()
     try:
-        prompt = (
-            "Write a natural, first-person spoken voiceover for a short UGC ad. "
-            f"Vertical: {vertical or 'direct-response'}. Target ~{seconds}s (~{int(seconds * 2.6)} words). "
-            + (f'Adapt this base script, keeping its message and offer: \"{base[:1200]}\". ' if base else "")
-            + (f'Creative brief: \"{brief[:600]}\". ' if brief else "")
-            + (f'You MUST naturally say this offer/value: {offer_value}. ' if offer_value else "")
-            + "Talk like a real person to camera — casual, warm, no ad-speak, NO stage directions or captions. "
-            'Hook hard in the first line. Return JSON {"script":"..."}.'
-        )
-        d = await _gemini_json(prompt)
-        script = (d.get("script") or script).strip()
+        from ..services import creative_team as team
+        _strategy, script = await team.strategize_and_write(
+            offer_desc=offer_desc, vertical=(vertical or "home_insurance"), request_type="ugc")
+        script = (script or base or brief).strip()
+        # Critic pass — score the opening hook; rewrite only if weak (guards against slop)
+        try:
+            cr = await _gemini_json(
+                "You are the Critic guarding against weak hooks and AI-slop. Score this UGC ad "
+                "script's FIRST line 0-10 for scroll-stopping power. If under 8, rewrite ONLY to hook "
+                f"harder in the first sentence while keeping the offer{(' ' + offer_value) if offer_value else ''}, "
+                f"~{seconds}s, first-person, no stage directions. "
+                f'Script: "{script[:1500]}". Return JSON {{"score": n, "script": "..."}}')
+            if cr and cr.get("script") and int(cr.get("score", 10)) < 8:
+                script = str(cr["script"]).strip()
+                act.tick(req.request_id, "critic hardened the hook")
+        except Exception as e:
+            logger.warning(f"script critic pass skipped: {e}")
     except Exception as e:
-        logger.warning(f"avatar-lipsync script gen failed, using base/brief: {e}")
+        logger.warning(f"team script failed, falling back to direct generation: {e}")
+        try:
+            d = await _gemini_json(
+                "Write a natural, first-person spoken UGC voiceover. "
+                f"Vertical: {vertical or 'direct-response'}. ~{seconds}s (~{int(seconds * 2.6)} words). "
+                + (f'Base: "{base[:1000]}". ' if base else "") + (f'Brief: "{brief[:500]}". ' if brief else "")
+                + (f'Must say {offer_value}. ' if offer_value else "")
+                + 'Hook hard in the first line, no stage directions. Return JSON {"script":"..."}.')
+            script = (d.get("script") or script).strip()
+        except Exception:
+            pass
     if not script:
         raise RuntimeError("avatar-lipsync: no script and could not generate one")
     act.finish("scriptwriter", req.request_id, t0, detail=script[:160])
