@@ -36,8 +36,9 @@ logger = logging.getLogger(__name__)
 DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# The default fallback order — cheapest first, ElevenLabs strictly last.
-FALLBACK_ORDER = ["kokoro", "openai", "deepgram", "elevenlabs"]
+# Default fallback order — keep it OFF Replicate (openai/deepgram/elevenlabs are plain HTTP);
+# Kokoro (Replicate) is last so the Replicate rate-limit/credit is reserved for lip-sync.
+FALLBACK_ORDER = ["openai", "deepgram", "elevenlabs", "kokoro"]
 
 # ── Curated preset catalog (casting-tagged so the brain can pick the right voice) ──
 # age_band ∈ {under35,35-44,45-55,55plus}; gender ∈ {female,male}
@@ -247,6 +248,11 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
                 break
 
     provider = (v or {}).get("provider")
+    # explicit clone request: voice_id 'chatterbox:*' or a raw sample → route to chatterbox
+    if not provider and voice_id and voice_id.startswith("chatterbox"):
+        provider = "chatterbox"
+    if not provider and sample_url:
+        provider = "chatterbox"
     native = (voice_id.split(":", 1)[1] if voice_id and ":" in voice_id else None)
 
     # build the attempt order: chosen provider first, then the cheap→premium chain

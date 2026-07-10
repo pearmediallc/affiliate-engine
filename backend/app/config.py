@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     chatterbox_api_url: Optional[str] = None   # e.g. http://host:4123
     chatterbox_api_key: Optional[str] = None   # optional bearer if the server is protected
 
+    # Video→video re-lipsync (reuse our own footage, swap only the mouth — the CapCut flow).
+    sync_so_api_key: Optional[str] = None      # sync.so (3 free videos, then paid) — x-api-key
+    fal_key: Optional[str] = None              # fal.ai (veed/lipsync) — Authorization: Key <FAL_KEY>
+
     # AWS S3 — persistent storage for generated images/videos
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None

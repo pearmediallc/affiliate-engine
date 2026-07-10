@@ -2189,20 +2189,13 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     await _abort_if_cancelled(req, "avatar-lipsync render")
 
-    # 3) LIP-SYNC — LatentSync video→video for a natural, non-AIfied result
-    t2 = act.start("shots", req.request_id, "lip-syncing with LatentSync")
-    job = await asyncio.to_thread(lambda: LipSyncService.start_generation(char_url, audio_url, "latentsync"))
-    result = None
-    for _ in range(90):   # up to ~6 min
-        await asyncio.sleep(4)
-        st = await asyncio.to_thread(lambda: LipSyncService.check_status(job))
-        if st.get("local_path") or st.get("video_url") or st.get("status") in ("succeeded", "completed"):
-            result = st; break
-        if st.get("status") in ("failed", "canceled"):
-            raise RuntimeError(f"lip-sync failed: {st.get('error')}")
-    if not result:
-        raise RuntimeError("lip-sync timed out")
-    act.finish("shots", req.request_id, t2, detail="lip-sync done")
+    # 3) LIP-SYNC — video→video re-sync on OUR real footage (reuse the clip, swap only the
+    #    mouth). Free/cheapest first: sync.so → fal veed → Replicate LatentSync/Wav2Lip.
+    from ..services.lip_sync import relipsync_video
+    t2 = act.start("shots", req.request_id, "re-syncing the mouth on the real footage")
+    prefer = a.get("lipsync_provider")   # optional override: sync | fal | latentsync | wav2lip
+    result = await asyncio.to_thread(lambda: relipsync_video(char_url, audio_url, prefer=prefer))
+    act.finish("shots", req.request_id, t2, detail=f"lip-sync via {result.get('provider')}")
 
     # 4) SAVE — normalize + persist to BOTH buckets
     name, out_path, out_url = _out_url(req, "avatar_lipsync")
