@@ -822,6 +822,57 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.get("/voices")
+async def list_voices(gender: str = "", age_band: str = "", _auth: bool = Depends(require_service_key)):
+    """The full pickable voice catalog (Kokoro/OpenAI/Deepgram presets, casting-tagged),
+    plus the brain's recommended voice for the given casting. More options than 11Labs, cheapest-first."""
+    from ..services import voice_studio as vs
+    voices = vs.list_voices()
+    if gender: voices = [v for v in voices if v.get("gender") == gender]
+    if age_band: voices = [v for v in voices if v.get("age_band") == age_band]
+    return {"success": True, "count": len(voices), "voices": voices,
+            "recommended": vs.pick_voice(gender=gender or None, age_band=age_band or None)}
+
+
+@router.post("/tts")
+async def tts(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Synthesize a voice-over, cheapest-first with automatic fallback (ElevenLabs last).
+    body: {text, voice_id?, style?, sample_url?}  → {url, provider, voice, cost_usd, fallback}."""
+    from ..services import voice_studio as vs
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    try:
+        res = vs.synthesize(text, voice_id=payload.get("voice_id"), style=payload.get("style"),
+                            sample_url=payload.get("sample_url"))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"tts failed: {e}")
+    url = None
+    try:
+        from ..services.storage import StorageService
+        url = StorageService.upload_file(res["path"], f"voice/{os.path.basename(res['path'])}")
+    except Exception as e:
+        logger.warning(f"tts s3 upload failed: {e}")
+    return {"success": True, "url": url, "provider": res.get("provider"), "voice": res.get("voice"),
+            "cost_usd": res.get("cost_usd"), "fallback": res.get("fallback")}
+
+
+@router.post("/voice/clone")
+async def voice_clone(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Register a reusable cloned voice from a ~10s sample (Chatterbox; ElevenLabs fallback).
+    body: {sample_url, name} → {voice_id, provider, sample_url, name}."""
+    from ..services import voice_studio as vs
+    sample_url = (payload.get("sample_url") or "").strip()
+    name = (payload.get("name") or "Cloned voice").strip()
+    if not sample_url:
+        raise HTTPException(status_code=400, detail="sample_url required")
+    try:
+        ref = vs.clone_voice(sample_url, name)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"clone failed: {e}")
+    return {"success": True, **ref}
+
+
 @router.post("/creative-team/enhance")
 async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_service_key)):
     """LLM assist for the Studio composer:

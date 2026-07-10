@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # Voice cloning (ElevenLabs) — set ELEVENLABS_API_KEY to enable voiced script rewrites
     elevenlabs_api_key: Optional[str] = None
 
+    # Chatterbox TTS — self-hosted OpenAI-compatible server (POST {url}/v1/audio/speech).
+    # Primary cheap cloning/preset path when set; else we fall back to Replicate/ElevenLabs.
+    chatterbox_api_url: Optional[str] = None   # e.g. http://host:4123
+    chatterbox_api_key: Optional[str] = None   # optional bearer if the server is protected
+
     # AWS S3 — persistent storage for generated images/videos
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None

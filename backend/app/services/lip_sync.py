@@ -105,6 +105,9 @@ def _check_kieai(task_id: str) -> dict:
 _REPLICATE_MODELS = {
     "sadtalker": {"owner": "cjwbw", "model": "sadtalker", "input_keys": {"image": "source_image", "audio": "driven_audio"}, "extras": {"enhancer": "gfpgan"}},
     "wav2lip":   {"owner": "cjwbw", "model": "wav2lip",   "input_keys": {"image": "face", "audio": "audio"}, "extras": {}},
+    # LatentSync — video→video re-lipsync (the CapCut equivalent): feed the avatar's
+    # own footage as `video` + the new voice as `audio`; the mouth is re-synced.
+    "latentsync": {"owner": "bytedance", "model": "latentsync", "input_keys": {"image": "video", "audio": "audio"}, "extras": {}},
 }
 
 
@@ -178,6 +181,11 @@ MODELS = {
     "wav2lip": {
         "name": "Wav2Lip",
         "description": "Fast lip-sync for existing video clips (legacy, via Replicate)",
+        "provider": "replicate",
+    },
+    "latentsync": {
+        "name": "LatentSync",
+        "description": "High-quality video→video re-lipsync (CapCut equivalent) — avatar footage + new voice",
         "provider": "replicate",
     },
 }
