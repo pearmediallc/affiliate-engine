@@ -100,7 +100,7 @@ def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
         if v.get("gender") == gender: s += 3
         if v.get("age_band") == age_band: s += 3
         if style and style.lower() in (v.get("style") or "").lower(): s += 2
-        if v.get("provider") == "kokoro": s += 1   # cheapest tiebreak
+        if v.get("provider") in ("openai", "deepgram", "elevenlabs"): s += 1   # avoid Replicate for auto-cast
         if v.get("cloned"): s += 1                  # prefer our own cloned voices when present
         scored.append((s, v))
     scored.sort(key=lambda x: x[0], reverse=True)

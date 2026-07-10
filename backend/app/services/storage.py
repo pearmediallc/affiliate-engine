@@ -117,6 +117,24 @@ class StorageService:
             return False
 
     @staticmethod
+    def presign_url(s3_key: str, expires: int = 3600) -> str | None:
+        """Presigned GET URL so an EXTERNAL service (sync.so / fal / Replicate) can fetch a
+        private-bucket object. Accepts a key or a full S3 URL."""
+        if not s3_key:
+            return None
+        if s3_key.startswith("http"):
+            s3_key = StorageService.parse_s3_key(s3_key) or s3_key
+        client = StorageService._client()
+        if not client:
+            return None
+        try:
+            return client.generate_presigned_url(
+                "get_object", Params={"Bucket": settings.aws_s3_bucket, "Key": s3_key}, ExpiresIn=expires)
+        except Exception as e:
+            logger.warning(f"S3 presign failed for {s3_key}: {e}")
+            return None
+
+    @staticmethod
     def parse_s3_key(url: str) -> str | None:
         """If `url` is a URL pointing at our configured bucket, return the
         object key. Otherwise None. Handles both virtual-hosted-style and

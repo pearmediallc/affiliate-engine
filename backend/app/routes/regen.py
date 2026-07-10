@@ -2247,6 +2247,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     audio_url = StorageService.upload_file(out_audio, f"voice/vo_{req.request_id[:8]}.mp3")
     if not audio_url:
         raise RuntimeError("avatar-lipsync: could not host the voice-over for lip-sync")
+    # our bucket is private → presign so sync.so/fal/Replicate can actually fetch the audio
+    audio_url = StorageService.presign_url(audio_url) or audio_url
     act.finish("character", req.request_id, t1, detail=f"voice={voice_res.get('provider')} (fallback={voice_res.get('fallback')})")
 
     await _abort_if_cancelled(req, "avatar-lipsync render")
