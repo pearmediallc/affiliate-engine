@@ -873,6 +873,44 @@ async def voice_clone(payload: dict, _auth: bool = Depends(require_service_key))
     return {"success": True, **ref}
 
 
+@router.post("/image")
+async def regen_image(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Generate a STATIC image via the Gemini Imagen → OpenAI → FAL chain (NOT Kie video).
+    Wraps the prompt with anti-slop realism so we get authentic, non-AI-looking creative.
+    body: {prompt, vertical?} → {url, provider, model, cost_usd}."""
+    from ..services.image_generator import ImageGeneratorService
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt required")
+    # anti-slop realism wrapper (adaptive). Text-aware: if the user actually wants a
+    # headline/CTA, keep it so the chain smart-routes to Ideogram; else forbid on-screen text.
+    wants_text = any(k in prompt.lower() for k in ('"', 'headline', 'cta', 'text', 'caption', 'banner', 'title', 'sign that says'))
+    notext = "" if wants_text else "NO on-screen text, captions or watermark; "
+    full = (f"{prompt}. "
+            "Photorealistic, authentic UGC/editorial look — natural skin texture with real pores, "
+            "realistic lighting and depth, believable everyday setting, correct anatomy and hands. "
+            f"{notext}no plastic AI skin, no over-smoothing, no distorted hands, no cartoon/3D-render look.")
+    svc = ImageGeneratorService()
+    try:
+        data = await svc._generate_with_provider(full)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"image generation failed: {e}")
+    url, path = data.get("url"), data.get("path")
+    if path:
+        try:
+            from ..services.storage import StorageService
+            u = StorageService.upload_file(path, f"regen/image_{os.path.basename(path)}")
+            if u:
+                url = u
+        except Exception as e:
+            logger.warning(f"image s3 upload failed: {e}")
+    model = data.get("model") or ""
+    provider = ("gemini" if ("imagen" in model or "gemini" in model)
+                else "openai" if ("dall" in model or "gpt" in model)
+                else "fal" if "flux" in model else (model or "image"))
+    return {"success": True, "url": url, "provider": provider, "model": model, "cost_usd": data.get("cost_usd")}
+
+
 @router.post("/creative-team/enhance")
 async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_service_key)):
     """LLM assist for the Studio composer:
