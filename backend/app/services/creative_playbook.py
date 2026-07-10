@@ -124,6 +124,29 @@ POLICY = {
 }
 
 
+# ── Editors' UGC style REFERENCE (patterns distilled from the team's working doc) ──
+# These are ADAPTIVE patterns, not fixed copy. Always fill them with the ACTUAL vertical,
+# offer, value and details from the request — never reproduce any example's specifics
+# (state, dollar amounts, exact CTA wording) verbatim.
+EDITOR_PLAYBOOK = (
+    "EDITORS' UGC STYLE REFERENCE (patterns to adapt to THIS request's vertical/offer/value — "
+    "never copy the illustrative specifics):\n"
+    "- SCRIPT ARC (shape, not script): Hook → Problem → Realization → Solution (quick, low-effort "
+    "action) → Result (a concrete, believable outcome for THIS offer) → CTA (one clear next step "
+    "for THIS funnel). First-person, spoken, one idea per sentence.\n"
+    "- PERFORMER STYLES to choose from: fast-talking woman in a living room (rapid, hand gestures, "
+    "room echo, selfie phone); casual man walking outdoors (handheld bounce, grainy); two-person "
+    "kitchen conversation (warm indoor light). Pick one that fits the avatar and stay consistent.\n"
+    "- HOOK PATTERNS: relatable pattern-interrupt in the first line tailored to the audience; "
+    "slip-and-catch; news-anchor format; neighbor-story with b-roll beats. (Write the actual line "
+    "from the request, don't reuse an example.)\n"
+    "- AUTHENTICITY MARKERS (the core strategy): raw, no grading/filter, imperfect framing, autofocus "
+    "breathing, natural skin texture, slight handheld shake, mild compression/grain, real ambience.\n"
+    "- HARD NEGATIVES: NO subtitles/captions/on-screen text; no plastic AI skin, no robotic lip-sync, "
+    "no polished commercial look, no distorted hands, no frozen expressions."
+)
+
+
 def _norm(request_type: str) -> str:
     rt = (request_type or "").strip().lower().replace(" ", "_").replace("/", "_").replace("-", "_")
     alias = {
@@ -192,7 +215,8 @@ def summary_for_prompt() -> str:
         "identity) — fall back to Seedance if unavailable. Veo is $$$$ (long-form only, avoid bulk).\n"
         f"- Resources: tagged asset library (avatars by age/gender/face, maps by state, brolls by "
         "vertical, voices), script_database, winner_library.\n"
-        f"- POLICY: {POLICY['casting']} {POLICY['cost']} {POLICY['quality']}"
+        f"- POLICY: {POLICY['casting']} {POLICY['cost']} {POLICY['quality']}\n\n"
+        + EDITOR_PLAYBOOK
     )
 
 
