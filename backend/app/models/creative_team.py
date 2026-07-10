@@ -49,3 +49,23 @@ class CreativeLesson(Base):
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LipsyncJob(Base):
+    """Durable handle for an in-flight video→video lip-sync so a long render SURVIVES an AE
+    restart: we persist the provider + provider job id + everything needed to finalize, and a
+    startup resumer re-polls and delivers it (no more orphaned 'running' jobs)."""
+    __tablename__ = "lipsync_jobs"
+
+    id = Column(String, primary_key=True)                    # = the regen request_id
+    provider = Column(String, nullable=False)                # sync | fal | latentsync | wav2lip
+    provider_job = Column(String, nullable=False)            # the provider's generation/prediction id
+    audio_url = Column(Text, nullable=True)
+    char_url = Column(Text, nullable=True)
+    callback_url = Column(Text, nullable=True)
+    out_name = Column(String, nullable=True)
+    script = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="polling", index=True)   # polling | done | failed
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

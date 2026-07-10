@@ -2158,6 +2158,105 @@ async def recipe_generate(req: RunRequest) -> list:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+# ── Durable lip-sync resume (long renders survive an AE restart) ──────────────
+def _persist_lipsync(request_id, provider, job, audio_url, char_url, callback_url, out_name, script=""):
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import LipsyncJob
+        db = SessionLocal()
+        try:
+            row = db.query(LipsyncJob).filter(LipsyncJob.id == request_id).first()
+            if row:
+                row.provider, row.provider_job, row.status, row.error = provider, job, "polling", None
+            else:
+                db.add(LipsyncJob(id=request_id, provider=provider, provider_job=job, audio_url=audio_url,
+                                  char_url=char_url, callback_url=callback_url, out_name=out_name,
+                                  script=script, status="polling"))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"persist lipsync job failed: {e}")
+
+
+def _set_lipsync_status(request_id, status, error=None):
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import LipsyncJob
+        db = SessionLocal()
+        try:
+            row = db.query(LipsyncJob).filter(LipsyncJob.id == request_id).first()
+            if row:
+                row.status, row.error = status, (error or None)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"update lipsync status failed: {e}")
+
+
+async def _produce_lipsync_variant(request_id, out_name, result, script=""):
+    src = result.get("local_path")
+    if not src and result.get("video_url"):
+        src = await _download_to_temp(result["video_url"], ".mp4")
+    out_path = os.path.join(UPLOAD_DIR, out_name)
+    out_url = f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}"
+    await asyncio.to_thread(_ffmpeg, ["-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
+    _ae_persist(out_path, out_name)
+    return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script}
+
+
+async def _resume_one_lipsync(row):
+    from ..services import lip_sync
+    from ..services import creative_team_activity as act
+    rid = row["id"]
+    try:
+        result = None
+        for _ in range(150):   # ~10 min
+            await asyncio.sleep(4)
+            stt, res = await asyncio.to_thread(lambda: lip_sync.poll_relipsync(row["provider"], row["provider_job"]))
+            if stt == "done":
+                result = res; break
+        if not result:
+            logger.warning(f"[resume] lipsync {rid} still processing; will retry on next restart")
+            return
+        variant = await _produce_lipsync_variant(rid, row["out_name"] or f"regen_avatar_lipsync_{rid[:8]}.mp4", result, row.get("script") or "")
+        await _callback(row["callback_url"], {"request_id": rid, "status": "ready", "variants": [variant]})
+        act.end_job(rid, ok=True)
+        _set_lipsync_status(rid, "done")
+        logger.info(f"[resume] lipsync {rid} RECOVERED + delivered")
+    except Exception as e:
+        logger.error(f"[resume] lipsync {rid} failed: {e}")
+        try:
+            await _callback(row["callback_url"], {"request_id": rid, "status": "failed", "error": str(e)[:300]})
+            act.end_job(rid, ok=False, error=str(e)[:300])
+        except Exception:
+            pass
+        _set_lipsync_status(rid, "failed", str(e)[:300])
+
+
+async def resume_pending_lipsync():
+    """Startup hook: re-poll any lip-sync mid-flight when AE last restarted, and deliver it."""
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import LipsyncJob
+        db = SessionLocal()
+        try:
+            rows = db.query(LipsyncJob).filter(LipsyncJob.status == "polling").all()
+            pending = [{"id": r.id, "provider": r.provider, "provider_job": r.provider_job,
+                        "callback_url": r.callback_url, "out_name": r.out_name, "script": r.script} for r in rows]
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"resume_pending_lipsync load failed: {e}")
+        return
+    if pending:
+        logger.info(f"[resume] recovering {len(pending)} in-flight lip-sync job(s)")
+    for row in pending:
+        asyncio.create_task(_resume_one_lipsync(row))
+
+
 async def recipe_avatar_lipsync(req: RunRequest) -> list:
     """The team's real CapCut flow, automated end-to-end: take a REAL character clip from
     our own asset library, write/adapt a natural spoken script (inserting the offer value),
@@ -2188,7 +2287,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         brief,
         (f"Adapt this base script, keep its message and offer: {base[:1000]}" if base else ""),
         (f"You MUST naturally state the offer/value {offer_value}." if offer_value else ""),
-        f"Spoken UGC voiceover, first person, ~{seconds}s.",
+        f"Spoken UGC voiceover, first person. Keep it SHORT — at most {int(seconds * 2.5)} words so it "
+        f"speaks in about {seconds}s (hard ceiling {seconds}s).",
     ] if x).strip()
     try:
         from ..services import creative_team as team
@@ -2244,18 +2344,21 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
         script, voice_id=("chatterbox:character" if sample_url else voice_id),
         sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational"))
-    # sync.so's free plan caps audio at 20s → gently speed the VO to fit (then hard-trim as backstop)
+    # Fit the VO to the requested length (and under sync.so's 20s free cap): gently speed it up
+    # (natural, atempo≤1.35) then hard-trim as a backstop.
+    voice_cap = min(float(seconds) + 1.0, 19.5)
     try:
         import subprocess
         pd = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                              "-of", "default=nw=1:nk=1", out_audio], capture_output=True, text=True, timeout=30)
         dur = float((pd.stdout or "0").strip() or 0)
-        if dur > 19.5:
-            factor = min(1.35, dur / 19.0)
+        if dur > voice_cap:
+            factor = min(1.35, dur / max(1.0, voice_cap - 0.4))
             fit = out_audio.rsplit(".", 1)[0] + "_fit.mp3"
-            await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}", "-t", "19.6", fit], 120)
+            await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}",
+                                              "-t", f"{voice_cap:.1f}", fit], 120)
             out_audio = fit
-            logger.info(f"[avatar-lipsync] fit VO {dur:.1f}s → ~19.5s (atempo {factor:.2f})")
+            logger.info(f"[avatar-lipsync] fit VO {dur:.1f}s → ≤{voice_cap:.1f}s (atempo {factor:.2f})")
     except Exception as e:
         logger.warning(f"audio duration-fit skipped: {e}")
 
@@ -2268,24 +2371,33 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     await _abort_if_cancelled(req, "avatar-lipsync render")
 
-    # 3) LIP-SYNC — video→video re-sync on OUR real footage (reuse the clip, swap only the
-    #    mouth). Free/cheapest first: sync.so → fal veed → Replicate LatentSync/Wav2Lip.
-    from ..services.lip_sync import relipsync_video
+    # 3) LIP-SYNC — video→video re-sync on OUR real footage. Submit → PERSIST the provider job
+    #    (so an AE restart doesn't orphan it) → poll. Free/cheapest first: sync.so → fal → Replicate.
+    from ..services import lip_sync
     t2 = act.start("shots", req.request_id, "re-syncing the mouth on the real footage")
     prefer = a.get("lipsync_provider")   # optional override: sync | fal | latentsync | wav2lip
-    result = await asyncio.to_thread(lambda: relipsync_video(char_url, audio_url, prefer=prefer))
-    act.finish("shots", req.request_id, t2, detail=f"lip-sync via {result.get('provider')}")
+    name, out_path, out_url = _out_url(req, "avatar_lipsync")
+    sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer))
+    _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
+    result = None
+    try:
+        for _ in range(150):   # ~10 min; a restart mid-poll is recovered by resume_pending_lipsync()
+            await asyncio.sleep(4)
+            stt, res = await asyncio.to_thread(lambda: lip_sync.poll_relipsync(sub["provider"], sub["job"]))
+            if stt == "done":
+                result = res; break
+    except Exception:
+        _set_lipsync_status(req.request_id, "failed")
+        raise
+    if not result:
+        raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
+    act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
 
     # 4) SAVE — normalize + persist to BOTH buckets
-    name, out_path, out_url = _out_url(req, "avatar_lipsync")
-    src = result.get("local_path")
-    if not src and result.get("video_url"):
-        src = await _download_to_temp(result["video_url"], ".mp4")
-    await asyncio.to_thread(_ffmpeg, ["-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
-    _ae_persist(out_path, name)
-    return [{"recipe": "Avatar Lipsync (LatentSync)", "video_url": out_url, "script": script,
-             "voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url)}]
+    variant = await _produce_lipsync_variant(req.request_id, name, result, script)
+    _set_lipsync_status(req.request_id, "done")
+    variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url)})
+    return [variant]
 
 
 _RECIPES = {

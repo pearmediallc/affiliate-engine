@@ -73,6 +73,14 @@ async def startup_event():
     finally:
         db.close()
 
+    # Recover any lip-sync renders that were mid-flight when we last restarted (no orphaned jobs)
+    try:
+        import asyncio
+        from .routes.regen import resume_pending_lipsync
+        asyncio.create_task(resume_pending_lipsync())
+    except Exception as e:
+        logger.warning(f"lip-sync resume hook failed to start: {e}")
+
 
 # Include all routes under /api/v1
 api_router = create_router()

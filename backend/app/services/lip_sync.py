@@ -192,8 +192,9 @@ MODELS = {
 
 
 # ── Video→video re-lipsync (reuse OUR footage, change only the mouth = the CapCut flow) ──
-def _sync_so_relipsync(video_url: str, audio_url: str, model: str = "lipsync-2") -> str:
-    """sync.so — true video→video lip-sync. Returns the output video URL."""
+# Split into SUBMIT (returns a provider job id) + POLL (one check), so the caller can persist
+# the job id and a resumer can re-poll it after an AE restart — long renders never get orphaned.
+def _sync_so_submit(video_url: str, audio_url: str, model: str = "lipsync-2") -> str:
     key = settings.sync_so_api_key
     if not key:
         raise RuntimeError("no sync.so key")
@@ -207,93 +208,109 @@ def _sync_so_relipsync(video_url: str, audio_url: str, model: str = "lipsync-2")
     gid = r.json().get("id")
     if not gid:
         raise RuntimeError(f"sync.so no id: {r.text[:160]}")
-    for _ in range(150):   # up to ~10 min
-        time.sleep(4)
-        s = requests.get(f"https://api.sync.so/v2/generate/{gid}",
-                         headers={"x-api-key": key}, timeout=30).json()
-        st = (s.get("status") or "").upper()
-        if st in ("COMPLETED", "DONE", "SUCCEEDED"):
-            out = s.get("outputUrl") or s.get("output_url") or (s.get("output") or {}).get("url")
-            if out:
-                return out
+    return gid
+
+
+def _sync_so_status(gid: str):
+    key = settings.sync_so_api_key
+    s = requests.get(f"https://api.sync.so/v2/generate/{gid}", headers={"x-api-key": key}, timeout=30).json()
+    st = (s.get("status") or "").upper()
+    if st in ("COMPLETED", "DONE", "SUCCEEDED"):
+        out = s.get("outputUrl") or s.get("output_url") or (s.get("output") or {}).get("url")
+        if not out:
             raise RuntimeError(f"sync.so completed without output: {s}")
-        if st in ("FAILED", "ERROR", "REJECTED", "CANCELED", "TIMED_OUT"):
-            raise RuntimeError(f"sync.so {st}: {s.get('error')}")
-    raise RuntimeError("sync.so timed out")
+        return ("done", out)
+    if st in ("FAILED", "ERROR", "REJECTED", "CANCELED", "TIMED_OUT"):
+        raise RuntimeError(f"sync.so {st}: {s.get('error') or s.get('message')}")
+    return ("processing", None)
 
 
-def _fal_veed_relipsync(video_url: str, audio_url: str) -> str:
-    """fal.ai veed/lipsync — video→video. Returns the output video URL."""
+def _fal_submit(video_url: str, audio_url: str) -> str:
     key = settings.fal_key
     if not key:
         raise RuntimeError("no fal key")
-    base = "https://queue.fal.run/veed/lipsync"
-    h = {"Authorization": f"Key {key}", "Content-Type": "application/json"}
-    r = requests.post(base, headers=h, json={"video_url": video_url, "audio_url": audio_url}, timeout=30)
+    r = requests.post("https://queue.fal.run/veed/lipsync",
+                      headers={"Authorization": f"Key {key}", "Content-Type": "application/json"},
+                      json={"video_url": video_url, "audio_url": audio_url}, timeout=30)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"fal {r.status_code}: {r.text[:200]}")
-    d = r.json()
-    rid = d.get("request_id")
-    status_url = d.get("status_url") or f"{base}/requests/{rid}/status"
-    resp_url = d.get("response_url") or f"{base}/requests/{rid}"
-    for _ in range(150):
-        time.sleep(4)
-        s = requests.get(status_url, headers=h, timeout=30).json()
-        st = (s.get("status") or "").upper()
-        if st == "COMPLETED":
-            res = requests.get(resp_url, headers=h, timeout=30).json()
-            out = (res.get("video") or {}).get("url")
-            if out:
-                return out
+    rid = r.json().get("request_id")
+    if not rid:
+        raise RuntimeError(f"fal no request_id: {r.text[:160]}")
+    return rid
+
+
+def _fal_status(rid: str):
+    key = settings.fal_key
+    base = "https://queue.fal.run/veed/lipsync"
+    h = {"Authorization": f"Key {key}"}
+    s = requests.get(f"{base}/requests/{rid}/status", headers=h, timeout=30).json()
+    st = (s.get("status") or "").upper()
+    if st == "COMPLETED":
+        res = requests.get(f"{base}/requests/{rid}", headers=h, timeout=30).json()
+        out = (res.get("video") or {}).get("url")
+        if not out:
             raise RuntimeError(f"fal completed without video url: {res}")
-        if st in ("FAILED", "ERROR"):
-            raise RuntimeError(f"fal {st}: {s}")
-    raise RuntimeError("fal timed out")
+        return ("done", out)
+    if st in ("FAILED", "ERROR"):
+        raise RuntimeError(f"fal {st}: {s}")
+    return ("processing", None)
 
 
-def relipsync_video(video_url: str, audio_url: str, prefer: str = None) -> dict:
-    """
-    Reuse our REAL footage and re-sync only the mouth to `audio_url`. Provider chain,
-    free/cheapest first: sync.so (free tier) → fal veed → Replicate LatentSync → Wav2Lip.
-    Returns {provider, video_url|local_path}. Never touches Replicate unless the free
-    providers are unavailable/failed.
-    """
+def submit_relipsync(video_url: str, audio_url: str, prefer: str = None) -> dict:
+    """Submit a video→video re-lipsync to the first available provider (sync.so → fal →
+    Replicate). Returns {provider, job} WITHOUT waiting — the caller persists this + polls."""
     order, seen, errors = [], set(), []
     for p in ([prefer] if prefer else []) + ["sync", "fal", "latentsync", "wav2lip"]:
-        if not p or p in seen:
-            continue
-        seen.add(p)
-        order.append(p)
+        if p and p not in seen:
+            seen.add(p); order.append(p)
     for p in order:
         try:
             if p == "sync":
-                url = _sync_so_relipsync(video_url, audio_url)
+                job = _sync_so_submit(video_url, audio_url)
             elif p == "fal":
-                url = _fal_veed_relipsync(video_url, audio_url)
+                job = _fal_submit(video_url, audio_url)
             elif p in ("latentsync", "wav2lip"):
                 if not settings.replicate_api_token:
                     raise RuntimeError("no replicate token")
                 job = _start_replicate(video_url, audio_url, model=p)
-                url = None
-                for _ in range(120):
-                    time.sleep(4)
-                    st = _check_replicate(job)
-                    if st.get("local_path"):
-                        return {"provider": p, "local_path": st["local_path"]}
-                    if st.get("video_url"):
-                        url = st["video_url"]; break
-                    if st.get("status") in ("failed", "canceled"):
-                        raise RuntimeError(st.get("error") or f"{p} failed")
-                if not url:
-                    raise RuntimeError(f"{p} timed out")
             else:
                 continue
-            logger.info(f"relipsync via {p}")
-            return {"provider": p, "video_url": url}
+            logger.info(f"relipsync submitted via {p} (job {job})")
+            return {"provider": p, "job": str(job)}
         except Exception as e:
             errors.append(f"{p}: {e}")
-            logger.warning(f"relipsync {p} unavailable/failed: {e}")
-    raise RuntimeError("all video lip-sync providers failed → " + " | ".join(errors[-4:]))
+            logger.warning(f"relipsync submit {p} failed: {e}")
+    raise RuntimeError("all lip-sync providers rejected the submit → " + " | ".join(errors[-4:]))
+
+
+def poll_relipsync(provider: str, job: str):
+    """One status poll. Returns ('processing', None) | ('done', {video_url|local_path}). Raises on failure."""
+    if provider == "sync":
+        st, url = _sync_so_status(job); return (st, {"video_url": url} if url else None)
+    if provider == "fal":
+        st, url = _fal_status(job); return (st, {"video_url": url} if url else None)
+    if provider in ("latentsync", "wav2lip"):
+        r = _check_replicate(job)
+        if r.get("local_path"):
+            return ("done", {"local_path": r["local_path"]})
+        if r.get("video_url"):
+            return ("done", {"video_url": r["video_url"]})
+        if r.get("status") in ("failed", "canceled"):
+            raise RuntimeError(r.get("error") or f"{provider} failed")
+        return ("processing", None)
+    raise RuntimeError(f"unknown lip-sync provider {provider}")
+
+
+def relipsync_video(video_url: str, audio_url: str, prefer: str = None) -> dict:
+    """Blocking convenience wrapper (submit → poll to done). Returns {provider, video_url|local_path}."""
+    sub = submit_relipsync(video_url, audio_url, prefer)
+    for _ in range(150):   # ~10 min
+        time.sleep(4)
+        st, res = poll_relipsync(sub["provider"], sub["job"])
+        if st == "done":
+            return {"provider": sub["provider"], **res}
+    raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
 
 
 class LipSyncService:
