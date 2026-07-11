@@ -163,6 +163,45 @@ COST_MODEL = (
 )
 
 
+# ── US direct-response affiliate VERTICAL knowledge (audience · pain · angle · offer · compliance · hook) ──
+# The brain reads the matching brief so scripts speak the vertical's real language and stay compliant.
+VERTICALS = {
+    "home_insurance": "US homeowners (often 45-65, TX/FL/CO high-cost states). Pain: premiums rising yearly with no claims. Angle: compare/switch to cut the bill; 'you're overpaying'. Offer: free rate comparison by zip (lead gen, CPC/EPC). Hook: 'If you own a home in [state] and your insurance keeps going up…'. Compliance: no guaranteed-savings claims, no fake carrier logos, savings are 'may/could'.",
+    "auto_insurance": "US drivers (25-65). Pain: rates jump despite clean record. Angle: 2-min quote comparison, drivers switching save. Offer: free auto quote by zip/age. Hook: 'Drivers in [state] are switching and saving…'. Compliance: 'may save', no guaranteed rates, no impersonating GEICO/Progressive.",
+    "health_insurance": "US 18-64 uninsured/underinsured, ACA-eligible. Pain: can't afford coverage. Angle: subsidies/credits many qualify for; check eligibility. Offer: ACA subsidy/plan finder (lead). Hook: 'You may qualify for a $0 health plan…'. Compliance: NOT govt-affiliated, 'may qualify', no ACA/gov logos, licensed-agent disclaimers.",
+    "medicare": "US seniors 65+ (and turning 65). Pain: confusing Advantage/Supplement choices, missing benefits. Angle: extra benefits (dental/vision/OTC/flex card) they may be leaving on the table. Offer: free plan review by a licensed agent. Hook: 'Seniors on Medicare may qualify for extra benefits…'. Compliance: NOT Medicare/CMS, 'may be eligible', TPMO disclaimers, no scare tactics.",
+    "life_insurance": "US 45-75, final-expense/burial focus. Pain: leaving family with funeral costs. Angle: affordable coverage, no-exam, locks in rate. Offer: free quote (lead). Hook: 'Cover your final expenses for about a dollar a day…'. Compliance: 'rates vary', no guaranteed acceptance unless true, no fear-mongering.",
+    "refinance": "US homeowners with a mortgage. Pain: high rate/payment, want cash-out or lower payment. Angle: check today's rate, could lower payment. Offer: free refi quote by zip (lead). Hook: 'Homeowners are lowering their payment by…'. Compliance: 'may qualify', APR/NMLS where required, no guaranteed rates.",
+    "personal_loans": "US adults needing cash (debt, emergency). Pain: high-interest debt, need funds fast. Angle: check your rate, no impact to score. Offer: loan/rate marketplace (lead). Hook: 'See your personal loan rate in 60 seconds — won't hurt your credit'. Compliance: 'checking rate is a soft pull', representative APR, no guaranteed approval.",
+    "debt_relief": "US adults with $10k+ unsecured debt. Pain: drowning in credit-card debt. Angle: programs to reduce/consolidate what you owe. Offer: free debt assessment (lead). Hook: 'If you owe over $10,000 in credit cards…'. Compliance: not credit repair, results vary, no 'erase your debt' guarantees.",
+    "solar": "US homeowners (sunny/high-utility states). Pain: rising electric bills. Angle: incentives/programs may cover install; slash the bill. Offer: free solar savings estimate by zip (lead). Hook: 'Homeowners in [state] are getting solar for little to nothing…'. Compliance: incentives vary by eligibility, no guaranteed 'free', no fake govt-program claims.",
+    "bizop": "US 25-55 seeking income/work-from-home. Pain: paycheck-to-paycheck, want extra/replacement income. Angle: simple system, real people making money from home, low start. Offer: free training/webinar or app signup. Hook: 'This stay-at-home mom makes $___/week doing…'. Compliance: income disclaimers ('results not typical'), no get-rich-quick guarantees, no fake testimonials.",
+    "credit_repair": "US adults with poor credit. Pain: denied for loans/apartments. Angle: dispute errors, raise your score. Offer: free credit consultation (lead). Hook: 'Boost your credit score by removing errors…'. Compliance: results vary, cannot remove accurate items, CROA disclaimers.",
+    "auto_warranty": "US owners of older/out-of-warranty cars. Pain: costly repairs after factory warranty ends. Angle: protect against big repair bills. Offer: free vehicle protection quote. Hook: 'If your car is out of warranty, one repair could cost…'. Compliance: it's a service contract not insurance, not the manufacturer, coverage varies.",
+}
+
+
+def vertical_brief(vertical: str) -> str:
+    """The researched context line for a vertical (audience/angle/offer/compliance) — the brain uses
+    it so scripts speak the vertical's real DR language and stay compliant. Falls back gracefully."""
+    v = _slug_vertical(vertical)
+    ctx = VERTICALS.get(v)
+    if not ctx:
+        return (f"VERTICAL: {vertical or 'direct-response'} — write a benefit-led, first-person DR ad; "
+                "make claims soft ('may/could'), no guarantees, no impersonating brands/gov, add income/results disclaimers if relevant.")
+    return f"VERTICAL CONTEXT ({v}): {ctx}"
+
+
+def _slug_vertical(v: str) -> str:
+    s = (v or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {"homeowners_insurance": "home_insurance", "home_ins": "home_insurance",
+               "aca": "health_insurance", "obamacare": "health_insurance",
+               "final_expense": "life_insurance", "burial": "life_insurance",
+               "mortgage": "refinance", "refi": "refinance", "loans": "personal_loans",
+               "make_money_online": "bizop", "work_from_home": "bizop", "mmo": "bizop"}
+    return aliases.get(s, s)
+
+
 def _norm(request_type: str) -> str:
     rt = (request_type or "").strip().lower().replace(" ", "_").replace("/", "_").replace("-", "_")
     alias = {

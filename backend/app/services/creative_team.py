@@ -360,6 +360,8 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
     metrics = loser_metrics or {}
     prompt = f"""{pb.MISSION}
 
+{pb.vertical_brief(vertical)}
+
 {learn.lessons_for_prompt(vertical=vertical)}
 
 {_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
