@@ -2239,14 +2239,18 @@ def _set_lipsync_status(request_id, status, error=None):
         logger.warning(f"update lipsync status failed: {e}")
 
 
-async def _produce_lipsync_variant(request_id, out_name, result, script=""):
+async def _produce_lipsync_variant(request_id, out_name, result, script="", ass_path=None):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
     out_path = os.path.join(UPLOAD_DIR, out_name)
     out_url = f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}"
-    await asyncio.to_thread(_ffmpeg, ["-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
+    args = ["-i", src]
+    if ass_path and os.path.exists(ass_path):
+        args += ["-vf", f"ass={ass_path}"]   # burn word-timed captions
+    args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "192k", out_path]
+    await asyncio.to_thread(_ffmpeg, args, 300)
     _ae_persist(out_path, out_name)
     return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script}
 
@@ -2443,8 +2447,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
+    # 3b) CAPTIONS (optional) — align OUR script to the audio → burn clean word-timed captions
+    ass_path = None
+    if a.get("captions"):
+        try:
+            from ..services import captions as cap
+            words = await asyncio.to_thread(lambda: cap.forced_align(out_audio, script))
+            ass_path = cap.build_ass(words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.ass"))
+            if ass_path:
+                _track_cost(req.request_id, "captions", "elevenlabs-fa", cost_usd=0.002, note="forced-align + ffmpeg burn")
+        except Exception as e:
+            logger.warning(f"captions failed, shipping without: {e}")
+
     # 4) SAVE — normalize + persist to BOTH buckets
-    variant = await _produce_lipsync_variant(req.request_id, name, result, script)
+    variant = await _produce_lipsync_variant(req.request_id, name, result, script, ass_path=ass_path)
     _set_lipsync_status(req.request_id, "done")
     # auto-feedback statement for THIS generation (shown per video)
     fb = ("Reused real library footage · "
