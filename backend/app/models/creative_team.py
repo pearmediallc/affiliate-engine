@@ -69,3 +69,20 @@ class LipsyncJob(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class CreationCost(Base):
+    """Per-step provider spend for a single creation, so the UI can show exactly which AI
+    provider cost what for each video/image (per request + in the Variation Studio)."""
+    __tablename__ = "creation_costs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id = Column(String, index=True)
+    step = Column(String)            # script | voice | lipsync | captions | image | video
+    provider = Column(String)
+    model = Column(String, nullable=True)
+    units = Column(Float, nullable=True)
+    unit_type = Column(String, nullable=True)   # chars | sec | min | run | free
+    cost_usd = Column(Float, default=0.0)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

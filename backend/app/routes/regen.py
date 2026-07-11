@@ -822,6 +822,30 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.get("/costs")
+async def creation_costs(request_id: str = "", _auth: bool = Depends(require_service_key)):
+    """Per-creation spend breakdown: total + by provider + by step. Drives the credit UI."""
+    from ..database import SessionLocal
+    from ..models.creative_team import CreationCost
+    db = SessionLocal()
+    try:
+        q = db.query(CreationCost)
+        if request_id:
+            q = q.filter(CreationCost.request_id == request_id)
+        rows = q.order_by(CreationCost.created_at.asc()).limit(500).all()
+        items = [{"step": r.step, "provider": r.provider, "model": r.model, "units": r.units,
+                  "unit_type": r.unit_type, "cost_usd": round(r.cost_usd or 0, 5), "note": r.note,
+                  "request_id": r.request_id} for r in rows]
+        total = round(sum(r.cost_usd or 0 for r in rows), 4)
+        by_provider = {}
+        for r in rows:
+            by_provider[r.provider] = round(by_provider.get(r.provider, 0) + (r.cost_usd or 0), 5)
+        return {"success": True, "request_id": request_id or None, "total_usd": total,
+                "by_provider": by_provider, "items": items}
+    finally:
+        db.close()
+
+
 @router.get("/voices")
 async def list_voices(gender: str = "", age_band: str = "", _auth: bool = Depends(require_service_key)):
     """The full pickable voice catalog (Kokoro/OpenAI/Deepgram presets, casting-tagged),
@@ -908,6 +932,9 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
     provider = ("gemini" if ("imagen" in model or "gemini" in model)
                 else "openai" if ("dall" in model or "gpt" in model)
                 else "fal" if "flux" in model else (model or "image"))
+    rid = payload.get("request_id")
+    if rid:
+        _track_cost(rid, "image", provider, model=model, unit_type="run", cost_usd=data.get("cost_usd") or 0)
     return {"success": True, "url": url, "provider": provider, "model": model, "cost_usd": data.get("cost_usd")}
 
 
@@ -2158,6 +2185,23 @@ async def recipe_generate(req: RunRequest) -> list:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+# ── Per-creation cost ledger (which provider cost what for each video/image) ──
+def _track_cost(request_id, step, provider, *, model=None, units=None, unit_type=None, cost_usd=0.0, note=""):
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreationCost
+        db = SessionLocal()
+        try:
+            db.add(CreationCost(request_id=request_id, step=step, provider=provider, model=model,
+                                units=units, unit_type=unit_type, cost_usd=float(cost_usd or 0), note=note))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"track_cost failed ({step}/{provider}): {e}")
+    logger.info(f"[cost] {request_id} {step} · {provider} · ${float(cost_usd or 0):.4f}{' · ' + note if note else ''}")
+
+
 # ── Durable lip-sync resume (long renders survive an AE restart) ──────────────
 def _persist_lipsync(request_id, provider, job, audio_url, char_url, callback_url, out_name, script=""):
     try:
@@ -2323,6 +2367,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     if not script:
         raise RuntimeError("avatar-lipsync: no script and could not generate one")
     act.finish("scriptwriter", req.request_id, t0, detail=script[:160])
+    _track_cost(req.request_id, "script", "gemini", model="gemini-2.5-flash", cost_usd=0.001, note="strategist+critic")
 
     await _abort_if_cancelled(req, "avatar-lipsync voice")
 
@@ -2344,6 +2389,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
         script, voice_id=("chatterbox:character" if sample_url else voice_id),
         sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational"))
+    _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
+                units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
     # Fit the VO to the requested length (and under sync.so's 20s free cap): gently speed it up
     # (natural, atempo≤1.35) then hard-trim as a backstop.
     voice_cap = min(float(seconds) + 1.0, 19.5)
@@ -2392,11 +2439,21 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     if not result:
         raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
     act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
+    _lip_cost = {"fal": round(seconds / 60 * 0.10, 4), "latentsync": 0.088, "wav2lip": 0.03}.get(sub["provider"], 0.0)
+    _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
+                cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
     # 4) SAVE — normalize + persist to BOTH buckets
     variant = await _produce_lipsync_variant(req.request_id, name, result, script)
     _set_lipsync_status(req.request_id, "done")
-    variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url)})
+    # auto-feedback statement for THIS generation (shown per video)
+    fb = ("Reused real library footage · "
+          f"voice {voice_res.get('provider')}{' (fallback)' if voice_res.get('fallback') else ''}"
+          f" · lip-sync {sub['provider']} · ~{seconds}s"
+          + (f" · states offer {offer_value}" if offer_value else "")
+          + (" · voice cloned from character" if sample_url else ""))
+    variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url),
+                    "whats_changed": fb, "feedback": fb})
     return [variant]
 
 
