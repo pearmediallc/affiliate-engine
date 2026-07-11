@@ -2471,20 +2471,39 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
-    # 3b) CAPTIONS (optional) — align OUR script to the audio → burn clean word-timed captions
-    ass_path = None
+    # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
+    ass_path, _cap_words = None, []
+    _use_veed = bool(a.get("captions")) and (a.get("caption_style") or "clean").lower() == "veed" and bool(settings.fal_key)
     if a.get("captions"):
         try:
             from ..services import captions as cap
-            words = await asyncio.to_thread(lambda: cap.forced_align(out_audio, script))
-            ass_path = cap.build_ass(words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.ass"))
-            if ass_path:
-                _track_cost(req.request_id, "captions", "elevenlabs-fa", cost_usd=0.002, note="forced-align + ffmpeg burn")
+            _cap_words = await asyncio.to_thread(lambda: cap.forced_align(out_audio, script))
+            if not _use_veed:
+                ass_path = cap.build_ass(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.ass"))
+                if ass_path:
+                    _track_cost(req.request_id, "captions", "elevenlabs-fa+ffmpeg", cost_usd=0.002, note="forced-align + ffmpeg burn")
         except Exception as e:
             logger.warning(f"captions failed, shipping without: {e}")
 
     # 4) SAVE — normalize + persist to BOTH buckets
     variant = await _produce_lipsync_variant(req.request_id, name, result, script, ass_path=ass_path)
+
+    # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
+    if _use_veed:
+        try:
+            from ..services import captions as cap
+            srt_path = cap.build_srt(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.srt")) if _cap_words else None
+            srt_text = open(srt_path).read() if srt_path else None
+            veed_url = await asyncio.to_thread(lambda: cap.veed_subtitles(
+                variant["video_url"], preset=(a.get("caption_preset") or "glide"), srt_text=srt_text))
+            capped = await _download_to_temp(veed_url, ".mp4")
+            import shutil
+            shutil.move(capped, os.path.join(UPLOAD_DIR, name))
+            _ae_persist(os.path.join(UPLOAD_DIR, name), name)
+            _track_cost(req.request_id, "captions", "veed(fal)", units=seconds, unit_type="min",
+                        cost_usd=round(seconds / 60 * 0.10, 4), note="VEED styled")
+        except Exception as e:
+            logger.warning(f"VEED captions failed, keeping base video: {e}")
     _set_lipsync_status(req.request_id, "done")
     # auto-feedback statement for THIS generation (shown per video)
     fb = ("Reused real library footage · "

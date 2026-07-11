@@ -7,6 +7,7 @@ Accurate captions from OUR known script (no ASR guesswork → no fillers/gaps):
 """
 import logging
 import os
+import time
 import requests
 
 from ..config import settings
@@ -78,3 +79,58 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 4, play_w: int = 1
     with open(out_ass_path, "w") as f:
         f.write(header + "\n".join(lines) + "\n")
     return out_ass_path
+
+
+def _srt_ts(t: float) -> str:
+    t = max(0.0, float(t)); h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60); ms = int((t - int(t)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_srt(words: list, out_srt_path: str, per_line: int = 6) -> str | None:
+    """SRT from our forced-aligned words — fed to VEED so it keeps OUR accuracy (skips its ASR)."""
+    if not words:
+        return None
+    blocks, idx = [], 1
+    for i in range(0, len(words), per_line):
+        chunk = words[i:i + per_line]
+        start = chunk[0]["start"]; end = chunk[-1]["end"] or (start + 1.2)
+        if end <= start:
+            end = start + 1.2
+        text = " ".join(w["word"] for w in chunk).strip()
+        blocks.append(f"{idx}\n{_srt_ts(start)} --> {_srt_ts(end)}\n{text}\n")
+        idx += 1
+    with open(out_srt_path, "w") as f:
+        f.write("\n".join(blocks))
+    return out_srt_path
+
+
+def veed_subtitles(video_url: str, preset: str = "glide", srt_text: str | None = None) -> str:
+    """Burn styled captions via the VEED Subtitle API on fal.ai. Returns the output video URL.
+    Passes our SRT when possible (keeps forced-alignment accuracy); else VEED transcribes."""
+    key = settings.fal_key
+    if not key:
+        raise RuntimeError("no fal key (VEED captions run on fal.ai)")
+    base = "https://queue.fal.run/veed/subtitles"
+    inp = {"video_url": video_url}
+    if preset:
+        inp["preset"] = preset
+    if srt_text:
+        inp["subtitles"] = srt_text   # bypass VEED transcription → keep our exact words/timing
+    h = {"Authorization": f"Key {key}"}
+    r = requests.post(base, headers={**h, "Content-Type": "application/json"}, json=inp, timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"veed {r.status_code}: {r.text[:200]}")
+    rid = r.json().get("request_id")
+    for _ in range(150):
+        time.sleep(4)
+        s = requests.get(f"{base}/requests/{rid}/status", headers=h, timeout=30).json()
+        st = (s.get("status") or "").upper()
+        if st == "COMPLETED":
+            res = requests.get(f"{base}/requests/{rid}", headers=h, timeout=30).json()
+            out = (res.get("video") or {}).get("url") or res.get("video_url")
+            if out:
+                return out
+            raise RuntimeError(f"veed completed without url: {res}")
+        if st in ("FAILED", "ERROR"):
+            raise RuntimeError(f"veed {st}: {s}")
+    raise RuntimeError("veed captions timed out")
