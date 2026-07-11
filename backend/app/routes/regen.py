@@ -838,7 +838,8 @@ async def available_providers(_auth: bool = Depends(require_service_key)):
     if s.elevenlabs_api_key: voice.append({"id": "elevenlabs", "name": "ElevenLabs (premium)", "cost": "$"})
     if s.replicate_api_token: voice.append({"id": "kokoro", "name": "Kokoro (Replicate)", "cost": "¢"})
     video = []
-    if s.kie_api_key: video.append({"id": "kie-seedance", "name": "Kie · Seedance", "cost": "$$"})
+    if s.kie_api_key: video += [{"id": "kie-seedance", "name": "Kie · Seedance 2.0", "cost": "$$"},
+                                {"id": "kie-seedance-fast", "name": "Kie · Seedance 2.0 Fast", "cost": "$"}]
     if s.fal_key: video += [{"id": "fal-seedance", "name": "fal · Seedance (cheaper)", "cost": "$"},
                             {"id": "fal-kling", "name": "fal · Kling 2.0", "cost": "$"},
                             {"id": "fal-wan", "name": "fal · Wan 2.6 (budget)", "cost": "¢"}]
@@ -2650,11 +2651,43 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     return [variant]
 
 
+async def recipe_fal_video(req: RunRequest) -> list:
+    """New-from-scratch video via a fal model (fal-seedance / fal-kling / fal-wan) — the cheap lane.
+    Model is explicit + cost-tracked so the brain learns which model performs best."""
+    from ..services import fal_video as fv
+    a = req.assets or {}
+    prompt = (a.get("prompt") or req.expectation or "").strip()
+    if not prompt:
+        raise RuntimeError("fal video: prompt required")
+    model = (req.model or a.get("engine") or "fal-seedance")
+    image_url = (a.get("image_urls") or [None])[0]
+    seconds = int(a.get("seconds") or 5)
+    res = await asyncio.to_thread(lambda: fv.generate_video(
+        model, prompt, image_url=image_url, seconds=seconds,
+        aspect_ratio=a.get("aspect_ratio") or "9:16", resolution=a.get("resolution") or "480p"))
+    name, out_path, out_url = _out_url(req, "gen")
+    await asyncio.to_thread(_ffmpeg, ["-i", res["local_path"], "-c:v", "libx264", "-preset", "veryfast",
+                                      "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
+    _ae_persist(out_path, name)
+    _track_cost(req.request_id, "video", res["model"], model=res["model"], units=seconds, unit_type="sec",
+                cost_usd=res["cost_usd"], note=("image→video" if image_url else "text→video"))
+    fb = f"New video · {res['model']}{' (image→video)' if image_url else ''} · {seconds}s · {a.get('resolution') or '480p'}"
+    return [{"recipe": f"Generate — {res['model']}", "video_url": out_url, "whats_changed": fb, "feedback": fb, "confidence": 0.7}]
+
+
+async def recipe_generate_router(req: RunRequest) -> list:
+    """Route new-video by chosen model: fal-* → cheap fal lane; else Kie Seedance (recipe_generate)."""
+    m = (req.model or (req.assets or {}).get("engine") or "").lower()
+    if m.startswith("fal-"):
+        return await recipe_fal_video(req)
+    return await recipe_generate(req)
+
+
 _RECIPES = {
     "Full Ad": recipe_full_ad,
     "Avatar Lipsync": recipe_avatar_lipsync,
     "Create from Assets": recipe_from_assets,
-    "Generate Video": recipe_generate,
+    "Generate Video": recipe_generate_router,
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,
     "Hook Change Only": recipe_hook_change,
