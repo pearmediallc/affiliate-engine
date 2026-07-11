@@ -822,6 +822,36 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.get("/providers")
+async def available_providers(_auth: bool = Depends(require_service_key)):
+    """Which providers are ACTUALLY usable (detected from configured keys — never assumed), per
+    step, so the UI offers only real options and the router never picks an unconfigured lane."""
+    s = settings
+    lip = []
+    if s.sync_so_api_key: lip.append({"id": "sync", "name": "sync.so — video→video (premium)", "cost": "$$"})
+    if s.fal_key: lip.append({"id": "fal", "name": "fal · VEED lip-sync", "cost": "$"})
+    if s.replicate_api_token:
+        lip += [{"id": "latentsync", "name": "Replicate LatentSync (cheap, video→video)", "cost": "$"},
+                {"id": "wav2lip", "name": "Replicate Wav2Lip (cheapest)", "cost": "¢"}]
+    voice = [{"id": "openai", "name": "OpenAI TTS", "cost": "¢"}]
+    if s.deepgram_api_key: voice.append({"id": "deepgram", "name": "Deepgram Aura", "cost": "¢"})
+    if s.elevenlabs_api_key: voice.append({"id": "elevenlabs", "name": "ElevenLabs (premium)", "cost": "$"})
+    if s.replicate_api_token: voice.append({"id": "kokoro", "name": "Kokoro (Replicate)", "cost": "¢"})
+    video = []
+    if s.kie_api_key: video.append({"id": "kie-seedance", "name": "Kie · Seedance", "cost": "$$"})
+    if s.fal_key: video += [{"id": "fal-seedance", "name": "fal · Seedance (cheaper)", "cost": "$"},
+                            {"id": "fal-kling", "name": "fal · Kling 2.0", "cost": "$"},
+                            {"id": "fal-wan", "name": "fal · Wan 2.6 (budget)", "cost": "¢"}]
+    image = []
+    if s.gemini_api_key: image.append({"id": "gemini", "name": "Gemini Imagen 4", "cost": "¢"})
+    if s.openai_api_key: image.append({"id": "openai", "name": "OpenAI DALL·E 3", "cost": "¢"})
+    if s.ideogram_api_key: image.append({"id": "ideogram", "name": "Ideogram 3 (text-heavy)", "cost": "¢"})
+    captions = [{"id": "clean", "name": "ffmpeg — accurate, free", "cost": "free"}]
+    if s.fal_key: captions.append({"id": "veed", "name": "VEED styled (fal)", "cost": "$"})
+    return {"success": True, "lipsync": lip, "voice": voice, "video": video, "image": image, "captions": captions,
+            "default_quality": _ENGINE["default_quality"]}
+
+
 @router.get("/engine-config")
 async def get_engine_config(_auth: bool = Depends(require_service_key)):
     """Live engine dials: concurrency cap, monthly budget ceiling, default quality + spend-to-date."""
@@ -2290,6 +2320,15 @@ async def recipe_generate(req: RunRequest) -> list:
                 ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
+        # accurate Kie Seedance cost — OFFICIAL per-second rates by resolution; with-input is cheaper
+        _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
+        _with_input = bool(video_urls or image_urls)
+        _rr = _KIE_RATE.get(str(resolution).lower(), _KIE_RATE["720p"])
+        _persec = _rr[0] if _with_input else _rr[1]
+        _vid_sec = len(clip_paths) * per
+        _track_cost(req.request_id, "video", "kie-seedance", model=f"seedance-{resolution}",
+                    units=_vid_sec, unit_type="sec", cost_usd=round(_persec * _vid_sec, 4),
+                    note=("with-input" if _with_input else "text→video"))
         refs = []
         if image_urls: refs.append(f"{len(image_urls)} image(s)")
         if video_urls: refs.append(f"{len(video_urls)} video(s)")

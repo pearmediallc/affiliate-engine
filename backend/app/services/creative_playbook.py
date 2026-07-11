@@ -151,7 +151,9 @@ EDITOR_PLAYBOOK = (
 COST_MODEL = (
     "COST DISCIPLINE — pick the cheapest path that meets the quality bar:\n"
     "- REUSE our own tagged footage + regenerate script/voice/lip-sync BY DEFAULT (~$0.03–0.10 each). "
-    "Only generate net-new video when no suitable asset exists (~$1.50 Seedance, ~25% of volume).\n"
+    "Only generate net-new video when no suitable asset exists (~25% of volume). New-video costs "
+    "(Kie Seedance 480p official): ~$0.86/15s WITH an image/video input vs ~$1.43 text→video — so "
+    "prefer image→video (with-input) mode, and cheaper fal models (Wan ~$0.07/s, Kling) when quality allows.\n"
     "- Lip-sync routing: BULK → Replicate LatentSync (~$0.09) / Wav2Lip (~$0.03) — cheapest at volume; "
     "PREMIUM/hero only → sync.so (~$0.70). NEVER Veo for bulk ($6–11).\n"
     "- Voice: OpenAI/Deepgram (pennies) before ElevenLabs. Captions: ffmpeg ASS (free) before VEED.\n"
