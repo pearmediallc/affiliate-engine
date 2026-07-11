@@ -822,6 +822,37 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.get("/engine-config")
+async def get_engine_config(_auth: bool = Depends(require_service_key)):
+    """Live engine dials: concurrency cap, monthly budget ceiling, default quality + spend-to-date."""
+    spent = _month_spend()
+    cap = _ENGINE["monthly_budget_usd"]
+    return {"success": True, "concurrency_cap": _ENGINE["cap"], "active": _ENGINE["active"],
+            "default_quality": _ENGINE["default_quality"], "monthly_budget_usd": cap,
+            "month_spend_usd": round(spent, 2), "budget_remaining_usd": round(max(0, cap - spent), 2) if cap else None}
+
+
+@router.post("/engine-config")
+async def set_engine_config(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Admin dial: set concurrency cap (1–30), monthly budget ceiling, default quality (bulk|premium)."""
+    if "concurrency_cap" in payload:
+        _ENGINE["cap"] = max(1, min(30, int(payload["concurrency_cap"])))
+    if "monthly_budget_usd" in payload:
+        _ENGINE["monthly_budget_usd"] = max(0.0, float(payload["monthly_budget_usd"]))
+    if payload.get("default_quality") in ("bulk", "premium"):
+        _ENGINE["default_quality"] = payload["default_quality"]
+    # wake any queued jobs in case the cap was raised
+    try:
+        cond = _engine_cond()
+        async with cond:
+            cond.notify_all()
+    except Exception:
+        pass
+    logger.info(f"[regen] engine-config set → {_ENGINE}")
+    return {"success": True, "concurrency_cap": _ENGINE["cap"], "monthly_budget_usd": _ENGINE["monthly_budget_usd"],
+            "default_quality": _ENGINE["default_quality"]}
+
+
 @router.post("/parse-intent")
 async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)):
     """LLM-parse a plain-language creative command into structured intent (robust to odd phrasings
@@ -1082,13 +1113,72 @@ _EXPECTED_SEC = {
 }
 
 
+# ── Throughput gate + monthly budget guard ──────────────────────────────────
+# 10+ jobs run in parallel, but BOUNDED so a burst never crashes the engine; a hard $ ceiling
+# means it never burns money; default routing is cheapest-first. All admin-configurable.
+_ENGINE = {
+    "cap": int(os.getenv("GEN_CONCURRENCY", "10")),                       # max concurrent heavy jobs
+    "monthly_budget_usd": float(os.getenv("MONTHLY_BUDGET_USD", "0") or 0),  # 0 = unlimited
+    "default_quality": os.getenv("GEN_QUALITY", "bulk"),                  # bulk (cheapest) | premium
+    "active": 0,
+}
+_ENGINE_COND = None
+
+
+def _engine_cond():
+    global _ENGINE_COND
+    if _ENGINE_COND is None:
+        _ENGINE_COND = asyncio.Condition()
+    return _ENGINE_COND
+
+
+def _month_spend() -> float:
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreationCost
+        from sqlalchemy import func
+        from datetime import datetime
+        db = SessionLocal()
+        try:
+            start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            v = db.query(func.coalesce(func.sum(CreationCost.cost_usd), 0.0)).filter(CreationCost.created_at >= start).scalar()
+            return float(v or 0)
+        finally:
+            db.close()
+    except Exception:
+        return 0.0
+
+
+def _budget_blocked():
+    cap = _ENGINE["monthly_budget_usd"]
+    if not cap:
+        return (False, 0.0, 0.0)
+    spent = _month_spend()
+    return (spent >= cap, spent, cap)
+
+
 async def _execute(req: RunRequest):
     """Pick recipe by variation_type → produce variants → POST back to callback."""
     from ..services import creative_team_activity as act
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
     label = f"{vtype} · {(req.context.get('creative_filename') or req.assets.get('prompt') or req.request_id)[:60]}"
     act.begin_job(req.request_id, label=label, expected_sec=_EXPECTED_SEC.get(vtype, 180))
-    logger.info(f"[regen] JOB START id={req.request_id} type={vtype} model={req.model} label={label!r}")
+    # HARD money guard: never exceed the monthly budget ceiling
+    _blocked, _spent, _cap = _budget_blocked()
+    if _blocked:
+        msg = f"monthly budget reached (${_spent:.2f}/${_cap:.2f}) — generation paused to avoid overspend"
+        logger.warning(f"[regen] BUDGET BLOCK {req.request_id}: {msg}")
+        await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": msg, "variants": []})
+        act.end_job(req.request_id, ok=False, error=msg)
+        return
+    # THROUGHPUT GATE: cap concurrent heavy jobs; extras queue here and drain as lanes free
+    _cond = _engine_cond()
+    async with _cond:
+        while _ENGINE["active"] >= _ENGINE["cap"]:
+            act.tick(req.request_id, f"queued — {_ENGINE['active']}/{_ENGINE['cap']} lanes busy")
+            await _cond.wait()
+        _ENGINE["active"] += 1
+    logger.info(f"[regen] JOB START id={req.request_id} type={vtype} model={req.model} lane={_ENGINE['active']}/{_ENGINE['cap']} label={label!r}")
     ok = False; err_msg = ""
     try:
         await _abort_if_cancelled(req, "start")
@@ -1106,6 +1196,10 @@ async def _execute(req: RunRequest):
         logger.exception(f"regen run failed for {req.request_id}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "failed", "error": str(e), "variants": []})
     finally:
+        # release the throughput lane so a queued job can start
+        async with _cond:
+            _ENGINE["active"] = max(0, _ENGINE["active"] - 1)
+            _cond.notify(1)
         act.end_job(req.request_id, ok=ok, error=err_msg)
         if not ok and err_msg:   # SELF-LEARNING: record the failure + a corrective rule
             try:
@@ -2451,8 +2545,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     from ..services import lip_sync
     t2 = act.start("shots", req.request_id, "re-syncing the mouth on the real footage")
     prefer = a.get("lipsync_provider")   # optional override: sync | fal | latentsync | wav2lip
+    quality = a.get("quality") or _ENGINE["default_quality"]   # bulk (cheapest) | premium
     name, out_path, out_url = _out_url(req, "avatar_lipsync")
-    sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer))
+    sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
     _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
     result = None
     try:

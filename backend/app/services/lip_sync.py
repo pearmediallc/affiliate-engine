@@ -263,11 +263,16 @@ def _fal_status(rid: str):
     return ("processing", None)
 
 
-def submit_relipsync(video_url: str, audio_url: str, prefer: str = None) -> dict:
-    """Submit a video→video re-lipsync to the first available provider (sync.so → fal →
-    Replicate). Returns {provider, job} WITHOUT waiting — the caller persists this + polls."""
+def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality: str = "bulk") -> dict:
+    """Submit a video→video re-lipsync, routed by cost/quality. Returns {provider, job} WITHOUT
+    waiting — the caller persists this + polls. bulk = cheapest-first (Replicate per-render is
+    cheapest for volume); premium = best-quality-first (sync.so). `prefer` overrides."""
+    # bulk: LatentSync/Wav2Lip (Replicate, ~$0.03–0.09) → fal → sync.so (pricey at volume)
+    # premium: sync.so (best) → fal → Replicate
+    chain = (["sync", "fal", "latentsync", "wav2lip"] if quality == "premium"
+             else ["latentsync", "wav2lip", "fal", "sync"])
     order, seen, errors = [], set(), []
-    for p in ([prefer] if prefer else []) + ["sync", "fal", "latentsync", "wav2lip"]:
+    for p in ([prefer] if prefer else []) + chain:
         if p and p not in seen:
             seen.add(p); order.append(p)
     for p in order:

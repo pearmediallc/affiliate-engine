@@ -147,6 +147,20 @@ EDITOR_PLAYBOOK = (
 )
 
 
+# ── Cost discipline the brain must obey (so we out-produce humans WITHOUT burning money) ──
+COST_MODEL = (
+    "COST DISCIPLINE — pick the cheapest path that meets the quality bar:\n"
+    "- REUSE our own tagged footage + regenerate script/voice/lip-sync BY DEFAULT (~$0.03–0.10 each). "
+    "Only generate net-new video when no suitable asset exists (~$1.50 Seedance, ~25% of volume).\n"
+    "- Lip-sync routing: BULK → Replicate LatentSync (~$0.09) / Wav2Lip (~$0.03) — cheapest at volume; "
+    "PREMIUM/hero only → sync.so (~$0.70). NEVER Veo for bulk ($6–11).\n"
+    "- Voice: OpenAI/Deepgram (pennies) before ElevenLabs. Captions: ffmpeg ASS (free) before VEED.\n"
+    "- 480p default; single clip unless a longer duration is explicitly required; retry a clip ONLY on a "
+    "real Critic-flagged defect (never speculative re-renders).\n"
+    "- Respect the engine's concurrency cap + monthly budget ceiling; ~$0.50/creative all-in is the target."
+)
+
+
 def _norm(request_type: str) -> str:
     rt = (request_type or "").strip().lower().replace(" ", "_").replace("/", "_").replace("-", "_")
     alias = {
@@ -216,7 +230,7 @@ def summary_for_prompt() -> str:
         f"- Resources: tagged asset library (avatars by age/gender/face, maps by state, brolls by "
         "vertical, voices), script_database, winner_library.\n"
         f"- POLICY: {POLICY['casting']} {POLICY['cost']} {POLICY['quality']}\n\n"
-        + EDITOR_PLAYBOOK
+        + EDITOR_PLAYBOOK + "\n\n" + COST_MODEL
     )
 
 
