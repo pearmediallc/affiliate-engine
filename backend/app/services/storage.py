@@ -117,6 +117,17 @@ class StorageService:
             return False
 
     @staticmethod
+    def object_exists(s3_key: str) -> bool:
+        client = StorageService._client()
+        if not client or not s3_key:
+            return False
+        try:
+            client.head_object(Bucket=settings.aws_s3_bucket, Key=s3_key)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def presign_url(s3_key: str, expires: int = 3600) -> str | None:
         """Presigned GET URL so an EXTERNAL service (sync.so / fal / Replicate) can fetch a
         private-bucket object. Accepts a key or a full S3 URL."""

@@ -822,6 +822,37 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.get("/thumb")
+async def thumb(url: str = "", key: str = "", _auth: bool = Depends(require_service_key)):
+    """Stable JPG poster for a video (ffmpeg frame → cached in S3 at a deterministic key). Fixes the
+    black 9:16 cards: same source → same poster URL, generated once, served forever. Never black."""
+    import hashlib
+    from ..services.storage import StorageService
+    src = (key or url or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="key or url required")
+    h = hashlib.sha1(src.encode()).hexdigest()[:20]
+    tkey = f"thumbnails/{h}.jpg"
+    if StorageService.object_exists(tkey):
+        return {"success": True, "url": StorageService.presign_url(tkey, expires=604800), "cached": True}
+    fetch = url or StorageService.presign_url(key)
+    if not fetch:
+        raise HTTPException(status_code=400, detail="cannot resolve source video")
+    out = os.path.join(UPLOAD_DIR, f"thumb_{h}.jpg")
+    try:
+        await asyncio.to_thread(_ffmpeg, ["-ss", "0.6", "-i", fetch, "-frames:v", "1",
+                                          "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
+    except Exception:
+        await asyncio.to_thread(_ffmpeg, ["-i", fetch, "-ss", "0.3", "-frames:v", "1",
+                                          "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
+    StorageService.upload_file(out, tkey)
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    return {"success": True, "url": StorageService.presign_url(tkey, expires=604800) or "", "cached": False}
+
+
 @router.get("/providers")
 async def available_providers(_auth: bool = Depends(require_service_key)):
     """Which providers are ACTUALLY usable (detected from configured keys — never assumed), per
