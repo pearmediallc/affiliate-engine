@@ -839,18 +839,28 @@ async def thumb(url: str = "", key: str = "", _auth: bool = Depends(require_serv
     if not fetch:
         raise HTTPException(status_code=400, detail="cannot resolve source video")
     out = os.path.join(UPLOAD_DIR, f"thumb_{h}.jpg")
+    raw = None
     try:
-        await asyncio.to_thread(_ffmpeg, ["-ss", "0.6", "-i", fetch, "-frames:v", "1",
-                                          "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
-    except Exception:
-        await asyncio.to_thread(_ffmpeg, ["-i", fetch, "-ss", "0.3", "-frames:v", "1",
-                                          "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
-    StorageService.upload_file(out, tkey)
-    try:
-        os.remove(out)
-    except OSError:
-        pass
-    return {"success": True, "url": StorageService.presign_url(tkey, expires=604800) or "", "cached": False}
+        # download first (reliable for presigned/spaced keys), then extract a frame locally
+        raw = await _download_to_temp(fetch, ".mp4")
+        try:
+            await asyncio.to_thread(_ffmpeg, ["-ss", "0.6", "-i", raw, "-frames:v", "1",
+                                              "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
+        except Exception:
+            await asyncio.to_thread(_ffmpeg, ["-i", raw, "-frames:v", "1",
+                                              "-vf", "scale=360:-2", "-q:v", "5", "-y", out], 60)
+        StorageService.upload_file(out, tkey)
+        return {"success": True, "url": StorageService.presign_url(tkey, expires=604800) or "", "cached": False}
+    except Exception as e:
+        logger.warning(f"thumb generation failed for {src}: {e}")
+        return {"success": False, "url": "", "error": str(e)[:160]}
+    finally:
+        for p in (raw, out):
+            try:
+                if p:
+                    os.remove(p)
+            except OSError:
+                pass
 
 
 @router.get("/providers")
