@@ -822,6 +822,30 @@ async def creative_team_lessons(scope: str = "", style: str = "", vertical: str 
     return {"success": True, "lessons": learn.get_lessons(scope=scope, style=style, vertical=vertical, limit=100)}
 
 
+@router.post("/parse-intent")
+async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)):
+    """LLM-parse a plain-language creative command into structured intent (robust to odd phrasings
+    like 'grandma', 'guy in his 60s', multi-clause briefs). Falls back to {} if the LLM is down."""
+    cmd = (payload.get("command") or "").strip()
+    if not cmd:
+        return {"success": True, "intent": {}}
+    prompt = (
+        "Extract structured intent from this creative-ad request. Map age words to bands: "
+        "under35, 35-44, 45-55, 55plus (grandma/elderly/60s/70s→55plus; middle-aged/40s/50→45-55). "
+        "Return STRICT JSON only: {\"gender\":\"female|male\",\"age_band\":\"under35|35-44|45-55|55plus|null\","
+        "\"vertical\":\"home_insurance|bizop|refinance|null\",\"offer_value\":\"e.g. $29 or null\","
+        "\"seconds\":number-or-null,\"script_ref\":\"S<number> or null\",\"scene\":\"short setting like "
+        "kitchen/living room/outdoor or null\",\"count\":number(default 1),\"wants_image\":true/false}. "
+        f"Request: \"{cmd[:800]}\""
+    )
+    try:
+        d = await _gemini_json(prompt)
+        return {"success": True, "intent": d or {}}
+    except Exception as e:
+        logger.warning(f"parse-intent failed: {e}")
+        return {"success": True, "intent": {}}
+
+
 @router.get("/costs")
 async def creation_costs(request_id: str = "", _auth: bool = Depends(require_service_key)):
     """Per-creation spend breakdown: total + by provider + by step. Drives the credit UI."""
