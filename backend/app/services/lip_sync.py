@@ -198,17 +198,23 @@ def _sync_so_submit(video_url: str, audio_url: str, model: str = "lipsync-2") ->
     key = settings.sync_so_api_key
     if not key:
         raise RuntimeError("no sync.so key")
-    r = requests.post("https://api.sync.so/v2/generate",
-                      headers={"x-api-key": key, "Content-Type": "application/json"},
-                      json={"model": model, "input": [
-                          {"type": "video", "url": video_url},
-                          {"type": "audio", "url": audio_url}]}, timeout=30)
-    if r.status_code not in (200, 201):
+    body = {"model": model, "input": [{"type": "video", "url": video_url}, {"type": "audio", "url": audio_url}]}
+    # free tier = 1 concurrent render → on a 429 concurrency limit, WAIT for the other to finish
+    # and retry instead of hard-failing (auto-queues near-parallel/repeat requests).
+    for attempt in range(8):
+        r = requests.post("https://api.sync.so/v2/generate",
+                          headers={"x-api-key": key, "Content-Type": "application/json"}, json=body, timeout=30)
+        if r.status_code in (200, 201):
+            gid = r.json().get("id")
+            if not gid:
+                raise RuntimeError(f"sync.so no id: {r.text[:160]}")
+            return gid
+        if r.status_code == 429 and "concurren" in r.text.lower():
+            logger.info(f"sync.so busy (1-render free limit) — waiting to queue (try {attempt + 1})")
+            time.sleep(25)
+            continue
         raise RuntimeError(f"sync.so {r.status_code}: {r.text[:200]}")
-    gid = r.json().get("id")
-    if not gid:
-        raise RuntimeError(f"sync.so no id: {r.text[:160]}")
-    return gid
+    raise RuntimeError("sync.so still busy after waiting (concurrency limit)")
 
 
 def _sync_so_status(gid: str):
