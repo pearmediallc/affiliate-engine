@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from typing import Optional
 
 
@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:8000"]
     cors_allow_all: bool = True  # In production, set CORS_ORIGINS env var and set this to False
+
+    @model_validator(mode="after")
+    def _fal_key_fallback(self):
+        # accept either FAL_KEY or FAL_API_KEY for the fal.ai lanes (lip-sync / video / VEED captions)
+        if not self.fal_key and self.fal_api_key:
+            self.fal_key = self.fal_api_key
+        elif not self.fal_api_key and self.fal_key:
+            self.fal_api_key = self.fal_key
+        return self
 
     class Config:
         env_file = ".env"
