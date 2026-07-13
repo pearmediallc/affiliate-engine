@@ -181,6 +181,48 @@ VERTICALS = {
 }
 
 
+# ── Camera-movement prompt reference (from aicameramovements.com) — the Shot Selector / Prompt
+# Writer pulls the exact phrasing for a shot when a movement suits the beat. Reference, not default. ──
+CAMERA_MOVES = {
+    "static": "locked-off static shot. hold one fixed camera position for the full clip.",
+    "pan right": "pan right. rotate the camera horizontally left→right from one fixed point.",
+    "pan left": "pan left. rotate the camera horizontally right→left from one fixed point.",
+    "whip pan": "whip pan. rotate rapidly from the current direction toward a new target.",
+    "tilt up": "tilt up. rotate the camera upward from one fixed point.",
+    "tilt down": "tilt down. rotate the camera downward from one fixed point.",
+    "slow zoom in": "slow zoom in. slowly increase focal length toward a tighter frame.",
+    "slow zoom out": "slow zoom out. slowly decrease focal length toward a wider frame.",
+    "crash zoom": "crash zoom. snap the lens rapidly toward the main visual target.",
+    "dolly in": "dolly in. move the camera physically forward toward the subject.",
+    "dolly out": "dolly out. move the camera physically backward away from the subject.",
+    "tracking": "tracking shot. move through the scene with the main subject.",
+    "follow (OTS)": "follow shot from behind. move behind the subject at shoulder height.",
+    "reverse tracking (walk-and-talk)": "reverse tracking shot. move backward in front of the walking subject.",
+    "side tracking": "side tracking shot. move parallel beside the subject.",
+    "truck": "truck left/right. move the camera physically sideways on a straight horizontal path.",
+    "pedestal": "pedestal up/down. move the whole camera vertically in a straight line.",
+    "arc": "arc left/right. move on a shallow curved path around the subject.",
+    "orbit": "orbit clockwise/counter-clockwise. circle the subject at a consistent radius.",
+    "handheld": "handheld shot. camera at operator height with natural body movement (UGC feel).",
+    "snorricam": "body-mounted Snorricam. camera fixed relative to the subject's face/torso.",
+    "crane": "crane up/down. travel smoothly through open space vertically.",
+    "drone push in": "drone push in. fly smoothly forward through open space toward the subject.",
+    "drone pull back": "drone pull back. fly smoothly backward away from the subject.",
+    "aerial": "helicopter-style aerial. move from high altitude along a broad gradual flight path.",
+    "FPV": "first-person view. move forward at eye height from the character's perspective.",
+    "push past": "push past. move forward past a visible foreground object/edge into the space beyond.",
+}
+
+
+def camera_reference() -> str:
+    """Camera-movement vocabulary the brain can apply when a shot calls for motion (else keep it
+    steady/handheld for UGC authenticity). Reference — use only when it fits the beat."""
+    picks = ["handheld", "slow zoom in", "dolly in", "tracking", "orbit", "arc", "crane", "drone push in", "FPV", "static"]
+    lines = "; ".join(f"{k} → {CAMERA_MOVES[k]}" for k in picks if k in CAMERA_MOVES)
+    return ("CAMERA-MOVEMENT REFERENCE (apply only when a move suits the beat; default to steady/handheld "
+            f"for UGC authenticity): {lines}")
+
+
 def vertical_brief(vertical: str) -> str:
     """The researched context line for a vertical (audience/angle/offer/compliance) — the brain uses
     it so scripts speak the vertical's real DR language and stay compliant. Falls back gracefully."""
@@ -271,10 +313,11 @@ def summary_for_prompt() -> str:
         f"- Resources: tagged asset library (avatars by age/gender/face, maps by state, brolls by "
         "vertical, voices), script_database, winner_library.\n"
         f"- POLICY: {POLICY['casting']} {POLICY['cost']} {POLICY['quality']}\n\n"
-        + EDITOR_PLAYBOOK + "\n\n" + COST_MODEL
+        + EDITOR_PLAYBOOK + "\n\n" + COST_MODEL + "\n\n" + camera_reference()
     )
 
 
 def describe() -> dict:
     """Full playbook (for the UI / an endpoint) so the office can show what the brain knows."""
-    return {"styles": VARIATION_STYLES, "engines": ENGINES, "resources": RESOURCES, "policy": POLICY}
+    return {"styles": VARIATION_STYLES, "engines": ENGINES, "resources": RESOURCES, "policy": POLICY,
+            "verticals": VERTICALS, "camera_moves": CAMERA_MOVES}
