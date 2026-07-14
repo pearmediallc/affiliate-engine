@@ -2481,6 +2481,59 @@ class _Verbatim(Exception):
     """The user supplied the script — skip the writer/critic entirely."""
 
 
+def _audio_seconds(path: str) -> float:
+    import subprocess
+    try:
+        p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path], capture_output=True, text=True, timeout=30)
+        return float((p.stdout or "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _trim_to_sentence(script: str, target_sec: float, wps: float = 2.6) -> str:
+    """Cut a script down to ~target_sec of speech, ALWAYS ending on a complete sentence.
+    A clip that stops mid-thought reads as broken; one that lands on a full stop reads as edited."""
+    budget = max(6, int(target_sec * wps))
+    sentences = re.split(r"(?<=[.!?])\s+", (script or "").strip())
+    out, used = [], 0
+    for s in sentences:
+        n = len(s.split())
+        if out and used + n > budget:
+            break
+        out.append(s); used += n
+    return " ".join(out).strip() or script
+
+
+async def _cover_audio_with_footage(char_url: str, need_sec: float, request_id: str) -> str:
+    """Guarantee the base clip is at least as long as the voice-over.
+
+    Lip-sync is video→video: if the footage runs out before the audio does, the render simply
+    STOPS — which is the abrupt, half-finished ending. We loop the character's own clip (and
+    trim to length) so the person is on screen for the whole read. Returns a URL the lip-sync
+    provider can fetch; on any failure we fall back to the original clip."""
+    from ..services.storage import StorageService
+    try:
+        src = await _download_to_temp(char_url, ".mp4")
+        have = await asyncio.to_thread(_audio_seconds, src)   # container duration
+        if have <= 0 or have >= need_sec - 0.2:
+            return char_url                                    # already long enough
+        loops = int(need_sec // have) + 1
+        ext = os.path.join(UPLOAD_DIR, f"base_{request_id[:8]}.mp4")
+        # -stream_loop repeats the clip; -t cuts it exactly at the voice's length
+        await asyncio.to_thread(_ffmpeg, ["-stream_loop", str(loops), "-i", src, "-t", f"{need_sec:.2f}",
+                                          "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                                          "-pix_fmt", "yuv420p", ext], 300)
+        up = StorageService.upload_file(ext, f"base/{os.path.basename(ext)}")
+        url = StorageService.presign_url(up) or up if up else None
+        if url:
+            logger.info(f"[avatar-lipsync] footage {have:.1f}s < VO {need_sec:.1f}s → extended to cover the read")
+            return url
+    except Exception as e:
+        logger.warning(f"footage extend failed, using the clip as-is (may truncate): {e}")
+    return char_url
+
+
 def _clean_script(s: str) -> str:
     """Make a script SPEAKABLE. Un-filled placeholders ([Your State], {{city}}) and stage
     directions must never reach the voice — the VO literally read '[Your State]' out loud."""
@@ -2682,23 +2735,37 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         ref_text=(a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
-    # Fit the VO to the requested length (and under sync.so's 20s free cap): gently speed it up
-    # (natural, atempo≤1.35) then hard-trim as a backstop.
-    voice_cap = min(float(seconds) + 1.0, 19.5)
-    try:
-        import subprocess
-        pd = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                             "-of", "default=nw=1:nk=1", out_audio], capture_output=True, text=True, timeout=30)
-        dur = float((pd.stdout or "0").strip() or 0)
-        if dur > voice_cap:
-            factor = min(1.35, dur / max(1.0, voice_cap - 0.4))
+    # ── DURATION POLICY ───────────────────────────────────────────────────────────────────────
+    # NEVER cram the script into the asked-for seconds. The old code sped the VO up by as much as
+    # 1.35x to squeeze under sync.so's old 20s free cap — that is exactly what made the delivery
+    # sound rushed and the captions feel faster than the voice.
+    #
+    # Instead: let the read breathe at its natural pace and SPAN OUT the video to match it. Only
+    # nudge the tempo if we're over a genuine hard ceiling, and even then never past 1.12x
+    # (imperceptible). If we're still over, we cut on a SENTENCE boundary — never mid-word — so the
+    # clip ends like a clip, not like a half-generated fragment.
+    vo_sec = await asyncio.to_thread(_audio_seconds, out_audio)
+    hard_cap = float(a.get("max_seconds") or 90)      # a real ceiling, not sync.so's old free tier
+    fit_note = ""
+    if vo_sec > hard_cap:
+        factor = min(1.12, vo_sec / hard_cap)
+        trimmed = _trim_to_sentence(script, hard_cap * factor)     # cut on a full stop
+        if trimmed != script:
+            script = trimmed
+            out_audio = await asyncio.to_thread(lambda: vs.synthesize(
+                script, voice_id=("fal-clone:character" if sample_url else voice_id),
+                sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational",
+                fallback_voice_id=voice_id).get("path") or out_audio)
+            vo_sec = await asyncio.to_thread(_audio_seconds, out_audio)
+            fit_note = f"script trimmed to a full sentence to fit {hard_cap:.0f}s"
+        if vo_sec > hard_cap:
             fit = out_audio.rsplit(".", 1)[0] + "_fit.mp3"
-            await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}",
-                                              "-t", f"{voice_cap:.1f}", fit], 120)
-            out_audio = fit
-            logger.info(f"[avatar-lipsync] fit VO {dur:.1f}s → ≤{voice_cap:.1f}s (atempo {factor:.2f})")
-    except Exception as e:
-        logger.warning(f"audio duration-fit skipped: {e}")
+            await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}", fit], 120)
+            out_audio, vo_sec = fit, await asyncio.to_thread(_audio_seconds, fit)
+            fit_note = (fit_note + f"; tempo {factor:.2f}x").strip("; ")
+    # THIS is the real runtime — the video follows the voice, not the other way round.
+    seconds = max(1, int(round(vo_sec)))
+    logger.info(f"[avatar-lipsync] VO runs {vo_sec:.1f}s at natural pace → video spans {seconds}s {fit_note}")
 
     audio_url = StorageService.upload_file(out_audio, f"voice/vo_{req.request_id[:8]}.mp3")
     if not audio_url:
@@ -2706,6 +2773,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # our bucket is private → presign so sync.so/fal/Replicate can actually fetch the audio
     audio_url = StorageService.presign_url(audio_url) or audio_url
     act.finish("character", req.request_id, t1, detail=f"voice={voice_res.get('provider')} (fallback={voice_res.get('fallback')})")
+
+    # ── THE FOOTAGE MUST COVER THE VOICE ──────────────────────────────────────────────────────
+    # If the character's clip is shorter than the VO, the lip-sync output gets cut off — that is
+    # the "half-generated" ending. Extend the footage to cover the full read before we sync.
+    char_url = await _cover_audio_with_footage(char_url, vo_sec, req.request_id)
 
     await _abort_if_cancelled(req, "avatar-lipsync render")
 

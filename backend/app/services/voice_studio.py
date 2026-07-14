@@ -38,7 +38,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # Default fallback order — keep it OFF Replicate (openai/deepgram/elevenlabs are plain HTTP);
 # Kokoro (Replicate) is last so the Replicate rate-limit/credit is reserved for lip-sync.
-FALLBACK_ORDER = ["openai", "deepgram", "elevenlabs", "kokoro"]
+FALLBACK_ORDER = ["openai", "gemini", "deepgram", "elevenlabs", "kokoro"]
 
 # ── Curated preset catalog (casting-tagged so the brain can pick the right voice) ──
 # age_band ∈ {under35,35-44,45-55,55plus}; gender ∈ {female,male}
@@ -65,6 +65,15 @@ VOICE_CATALOG = [
     {"id": "deepgram:aura-2-asteria-en", "name": "Asteria", "provider": "deepgram", "gender": "female", "age_band": "35-44", "style": "clear, upbeat"},
     {"id": "deepgram:aura-2-orion-en",   "name": "Orion",   "provider": "deepgram", "gender": "male",   "age_band": "45-55", "style": "warm, mature"},
     {"id": "deepgram:aura-2-arcas-en",   "name": "Arcas",   "provider": "deepgram", "gender": "male",   "age_band": "35-44", "style": "natural, conversational"},
+    # Gemini TTS — prebuilt voices, delivery steerable in plain English (no cloning)
+    {"id": "gemini:Kore",       "name": "Kore",       "provider": "gemini", "gender": "female", "age_band": "35-44", "style": "firm, confident"},
+    {"id": "gemini:Aoede",      "name": "Aoede",      "provider": "gemini", "gender": "female", "age_band": "under35", "style": "breezy, natural"},
+    {"id": "gemini:Leda",       "name": "Leda",       "provider": "gemini", "gender": "female", "age_band": "under35", "style": "youthful, bright"},
+    {"id": "gemini:Gacrux",     "name": "Gacrux",     "provider": "gemini", "gender": "female", "age_band": "45-55", "style": "mature, warm"},
+    {"id": "gemini:Vindemiatrix","name": "Vindemiatrix","provider": "gemini","gender": "female", "age_band": "45-55", "style": "gentle, reassuring"},
+    {"id": "gemini:Charon",     "name": "Charon",     "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "informative, steady"},
+    {"id": "gemini:Puck",       "name": "Puck",       "provider": "gemini", "gender": "male",   "age_band": "35-44", "style": "upbeat, engaging"},
+    {"id": "gemini:Orus",       "name": "Orus",       "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "firm, authoritative"},
     # ElevenLabs — our most natural UGC voices (public library ids)
     {"id": "elevenlabs:21m00Tcm4TlvDq8ikWAM", "name": "Rachel",  "provider": "elevenlabs", "gender": "female", "age_band": "35-44", "style": "calm, natural"},
     {"id": "elevenlabs:EXAVITQu4vr4xnSDxMaL", "name": "Sarah",   "provider": "elevenlabs", "gender": "female", "age_band": "under35", "style": "soft, conversational"},
@@ -84,6 +93,7 @@ def available_providers() -> set:
     to be funded (REPLICATE_ENABLED), or every call 402s and we silently swap the user's voice."""
     p = set()
     if settings.openai_api_key:     p.add("openai")
+    if settings.gemini_api_key:     p.add("gemini")
     if settings.deepgram_api_key:   p.add("deepgram")
     if settings.elevenlabs_api_key: p.add("elevenlabs")
     if settings.fal_key or settings.fal_api_key: p.add("fal-clone")   # F5-TTS zero-shot cloning
@@ -148,6 +158,45 @@ def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
         return scored[0][1]
     # nothing configured at all — fall back to the catalog default rather than crashing
     return _by_id("openai:nova") or {"id": "kokoro:af_sarah", "provider": "kokoro"}
+
+
+# ── Gemini TTS (prebuilt voices + natural-language style steering) ────────────
+# Gemini has NO voice cloning (Google's cloning is Chirp 3, sales-gated). What it does give us is
+# a cheap, very natural preset lane whose delivery we can steer in plain English — which pairs
+# with the tone the brain already infers from the script.
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+
+
+def _syn_gemini(text: str, voice: str, out_path: str, style: Optional[str] = None) -> dict:
+    key = settings.gemini_api_key
+    if not key:
+        raise RuntimeError("no gemini key")
+    # Gemini TTS takes the delivery direction inline, as prose.
+    prompt = f"Say this in a {style} tone, like a real person talking to camera: {text}" if style else text
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json={"contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"responseModalities": ["AUDIO"],
+                                   "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}},
+        timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"gemini tts {r.status_code}: {r.text[:200]}")
+    parts = (((r.json() or {}).get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    b64 = next((p["inlineData"]["data"] for p in parts if p.get("inlineData", {}).get("data")), None)
+    if not b64:
+        raise RuntimeError("gemini tts returned no audio")
+    # it hands back raw PCM (s16le, 24k, mono) — wrap it into the mp3 the pipeline expects
+    raw = out_path + ".pcm"
+    with open(raw, "wb") as f:
+        f.write(base64.b64decode(b64))
+    subprocess.run(["ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", raw, out_path],
+                   capture_output=True, timeout=120, check=True)
+    try:
+        os.remove(raw)
+    except OSError:
+        pass
+    return {"provider": "gemini", "voice": voice, "cost_usd": 0.002}
 
 
 # ── fal voice CLONE (F5-TTS) ──────────────────────────────────────────────────
@@ -378,6 +427,8 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
                 res = _syn_kokoro(text, _native_for("kokoro") or "af_sarah", out_path)
             elif prov == "openai":
                 res = _syn_openai(text, _native_for("openai") or "nova", out_path, style)
+            elif prov == "gemini":
+                res = _syn_gemini(text, _native_for("gemini") or "Kore", out_path, style)
             elif prov == "deepgram":
                 res = _syn_deepgram(text, _native_for("deepgram") or "aura-2-hera-en", out_path)
             elif prov == "elevenlabs":
