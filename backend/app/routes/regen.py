@@ -1051,13 +1051,19 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
     full = (f"{prompt}. "
             "Photorealistic, authentic UGC/editorial look — natural skin texture with real pores, "
             "realistic lighting and depth, believable everyday setting, correct anatomy and hands. "
-            f"{notext}no plastic AI skin, no over-smoothing, no distorted hands, no cartoon/3D-render look.")
+            f"{notext}no plastic AI skin, no over-smoothing, no distorted hands, no cartoon/3D-render look; "
+            # models love to draw a picture-of-the-subject INSIDE the subject's own flyer/screen
+            "do NOT put a picture of the same people inside any flyer, poster, card or screen in the "
+            "image; no picture-in-picture, no duplicated subjects, no gibberish/garbled lettering.")
+    # ad creatives are VERTICAL — 16:9 was hardcoded, which is why the image came back letterboxed
+    aspect = (payload.get("aspect") or payload.get("aspect_ratio") or "9:16").strip()
     svc = ImageGeneratorService()
     try:
-        data = await svc._generate_with_provider(full)
+        data = await svc._generate_with_provider(full, aspect)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"image generation failed: {e}")
     url, path = data.get("url"), data.get("path")
+    download_url = None
     if path:
         try:
             from ..services.storage import StorageService
@@ -1067,6 +1073,10 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
             # so hand back a presigned URL the user can actually open.
             if u:
                 url = StorageService.presign_url(key, expires=604800) or u
+                # a second presign that SAVES instead of opening a tab (the `download` attribute
+                # is ignored cross-origin, so the header has to do the work)
+                download_url = StorageService.presign_url(key, expires=604800,
+                                                          download_as=os.path.basename(path))
         except Exception as e:
             logger.warning(f"image s3 upload failed: {e}")
     model = data.get("model") or ""
@@ -1076,7 +1086,8 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
     rid = payload.get("request_id")
     if rid:
         _track_cost(rid, "image", provider, model=model, unit_type="run", cost_usd=data.get("cost_usd") or 0)
-    return {"success": True, "url": url, "provider": provider, "model": model, "cost_usd": data.get("cost_usd")}
+    return {"success": True, "url": url, "download_url": download_url or url, "aspect": aspect,
+            "provider": provider, "model": model, "cost_usd": data.get("cost_usd")}
 
 
 @router.post("/creative-team/enhance")
@@ -2452,12 +2463,54 @@ def _set_lipsync_status(request_id, status, error=None):
         logger.warning(f"update lipsync status failed: {e}")
 
 
-async def _produce_lipsync_variant(request_id, out_name, result, script="", ass_path=None):
+def _video_dims(path: str) -> tuple:
+    """(w, h) of a video — captions must be sized to the REAL frame, not an assumed 1080x1920."""
+    try:
+        import subprocess
+        p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+                           capture_output=True, text=True, timeout=30)
+        w, h = (p.stdout or "").strip().split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return 1080, 1920
+
+
+class _Verbatim(Exception):
+    """The user supplied the script — skip the writer/critic entirely."""
+
+
+def _clean_script(s: str) -> str:
+    """Make a script SPEAKABLE. Un-filled placeholders ([Your State], {{city}}) and stage
+    directions must never reach the voice — the VO literally read '[Your State]' out loud."""
+    if not s:
+        return ""
+    s = re.sub(r"\[[^\]\n]{0,40}\]", " ", s)        # [Your State], [pause]
+    s = re.sub(r"\{\{[^}\n]{0,40}\}\}", " ", s)     # {{city}}
+    s = re.sub(r"^\s*(SCENE|SHOT|VO|V\.O\.|CUT TO|B-ROLL)\s*[:.-].*$", " ", s, flags=re.I | re.M)
+    s = re.sub(r"\*+", " ", s)                       # markdown emphasis
+    s = re.sub(r"[ \t]+", " ", s)
+    return re.sub(r"\s*\n\s*", " ", s).strip()
+
+
+async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
     out_path = os.path.join(UPLOAD_DIR, out_name)
     out_url = f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}"
+    # Build the subtitle HERE — only now do we know the lip-synced video's real dimensions, and
+    # caption size/margins are derived from them (a 1080x1920 assumption made them look tiny).
+    ass_path = None
+    if cap_words:
+        try:
+            from ..services import captions as cap
+            w, h = await asyncio.to_thread(_video_dims, src)
+            ass_path = cap.build_ass(cap_words, os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass"),
+                                     play_w=w, play_h=h)
+            logger.info(f"[captions] burning {len(cap_words)} words onto {w}x{h}")
+        except Exception as e:
+            logger.error(f"[captions] build failed: {e}")
     args = ["-i", src]
     if ass_path and os.path.exists(ass_path):
         args += ["-vf", f"ass={ass_path}"]   # burn word-timed captions
@@ -2465,7 +2518,8 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", ass_
              "-c:a", "aac", "-b:a", "192k", out_path]
     await asyncio.to_thread(_ffmpeg, args, 300)
     _ae_persist(out_path, out_name)
-    return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script}
+    return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script,
+            "captions_burned": bool(ass_path)}
 
 
 async def _resume_one_lipsync(row):
@@ -2539,10 +2593,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     base = (a.get("script") or "").strip()
     brief = (a.get("brief") or req.expectation or "").strip()
 
-    # 1) SCRIPT — run the FULL creative team: Strategist diagnoses + Script Writer drafts
-    #    (MISSION + learned-lessons grounded), then the Critic hardens the hook. Same brain
-    #    the other recipes use — not a lone GPT call.
+    # 1) SCRIPT.
+    # If the user HANDED US a script, that IS the script — speak it. The writer silently replacing
+    # a supplied script is not a feature, it's a bug.
     t0 = act.start("scriptwriter", req.request_id, "strategizing + writing the script")
+    verbatim = bool(base) and (a.get("script_mode") or "").lower() == "verbatim"
     script = base or brief
     offer_desc = " ".join(x for x in [
         brief,
@@ -2552,6 +2607,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         f"speaks in about {seconds}s (hard ceiling {seconds}s).",
     ] if x).strip()
     try:
+        if verbatim:
+            raise _Verbatim()          # the user's words win — skip the writer AND the critic
         from ..services import creative_team as team
         _strategy, script = await team.strategize_and_write(
             offer_desc=offer_desc, vertical=(vertical or "home_insurance"), request_type="ugc")
@@ -2569,6 +2626,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 act.tick(req.request_id, "critic hardened the hook")
         except Exception as e:
             logger.warning(f"script critic pass skipped: {e}")
+    except _Verbatim:
+        script = base
+        logger.info(f"[avatar-lipsync] speaking the SUPPLIED script verbatim ({len(base.split())} words)")
     except Exception as e:
         logger.warning(f"team script failed, falling back to direct generation: {e}")
         try:
@@ -2581,10 +2641,15 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             script = (d.get("script") or script).strip()
         except Exception:
             pass
+    script = _clean_script(script)
     if not script:
         raise RuntimeError("avatar-lipsync: no script and could not generate one")
-    act.finish("scriptwriter", req.request_id, t0, detail=script[:160])
-    _track_cost(req.request_id, "script", "gemini", model="gemini-2.5-flash", cost_usd=0.001, note="strategist+critic")
+    act.finish("scriptwriter", req.request_id, t0,
+               detail=("used YOUR script verbatim · " if verbatim else "") + script[:160])
+    _track_cost(req.request_id, "script", ("none" if verbatim else "gemini"),
+                model=("user-supplied" if verbatim else "gemini-2.5-flash"),
+                cost_usd=(0.0 if verbatim else 0.001),
+                note=("user supplied the script — not rewritten" if verbatim else "strategist+critic"))
 
     await _abort_if_cancelled(req, "avatar-lipsync voice")
 
@@ -2665,28 +2730,28 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
     # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
-    ass_path, _cap_words, _cap_method, _cap_err = None, [], "", ""
+    _cap_words, _cap_method, _cap_err = [], "", ""
     _use_veed = bool(a.get("captions")) and (a.get("caption_style") or "clean").lower() == "veed" and bool(settings.fal_key)
     if a.get("captions"):
         try:
             from ..services import captions as cap
-            # align() NEVER comes back empty: forced-align (exact) → even-split from our known script.
+            # align() NEVER comes back empty: ElevenLabs FA → Whisper word-timestamps (real timings
+            # off the actual voice, so the pace is right) → Deepgram → even-split.
             _cap_words, _cap_method = await asyncio.to_thread(lambda: cap.align(out_audio, script))
-            if not _use_veed:
-                ass_path = cap.build_ass(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.ass"))
-                if ass_path:
-                    _track_cost(req.request_id, "captions", f"{_cap_method}+ffmpeg", cost_usd=0.002,
-                                note=f"{_cap_method} + ffmpeg burn (CTA styled)")
+            if _cap_words and not _use_veed:
+                _track_cost(req.request_id, "captions", f"{_cap_method}+ffmpeg", cost_usd=0.004,
+                            note=f"{_cap_method} word timings + ffmpeg burn (TikTok style, CTA button)")
         except Exception as e:
             _cap_err = str(e)[:160]
             logger.error(f"captions FAILED for {req.request_id}: {e}")
-    # captions were asked for but produced nothing → say so loudly instead of silently shipping bare
-    if a.get("captions") and not _use_veed and not ass_path:
-        _cap_err = _cap_err or "aligner + even-split both returned no words"
+    if a.get("captions") and not _cap_words:
+        _cap_err = _cap_err or "every aligner returned no words"
         logger.error(f"captions requested but NOT burned for {req.request_id}: {_cap_err}")
 
-    # 4) SAVE — normalize + persist to BOTH buckets
-    variant = await _produce_lipsync_variant(req.request_id, name, result, script, ass_path=ass_path)
+    # 4) SAVE — normalize + persist to BOTH buckets (subtitle is built in here, sized to the real frame)
+    variant = await _produce_lipsync_variant(req.request_id, name, result, script,
+                                             cap_words=(None if _use_veed else _cap_words))
+    ass_path = variant.get("captions_burned")
 
     # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
     if _use_veed:
@@ -2708,16 +2773,22 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # auto-feedback statement for THIS generation (shown per video). Report what ACTUALLY happened —
     # a clone that fell back to a preset must not still claim "cloned from character".
     _cloned = voice_res.get("provider") == "chatterbox"
+    _swapped = voice_res.get("fallback") and voice_res.get("requested")
     fb = ("Reused real library footage · "
           f"voice {voice_res.get('provider')}:{voice_res.get('voice')}"
           + (" (cloned from character)" if _cloned
              else " (clone unavailable → cast)" if sample_url else "")
+          # if we could not honour the voice the user PICKED, say so on the creative itself
+          + (f" · ⚠ you picked {voice_res.get('requested')} but it was unavailable "
+             f"({voice_res.get('fallback_reason')})" if _swapped else "")
           + f" · lip-sync {sub['provider']} · ~{seconds}s"
           + (f" · states offer {offer_value}" if offer_value else "")
+          + (" · script: yours, verbatim" if verbatim else "")
           + (f" · captions {_cap_method}" if (a.get("captions") and ass_path) else "")
           + (" · captions VEED" if _use_veed else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
     variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": _cloned,
+                    "voice_swapped": bool(_swapped), "voice_requested": voice_res.get("requested"),
                     "captions": bool(ass_path or _use_veed), "caption_method": _cap_method,
                     "whats_changed": fb, "feedback": fb})
     return [variant]

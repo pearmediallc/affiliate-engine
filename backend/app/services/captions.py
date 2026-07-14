@@ -58,50 +58,92 @@ def even_split(text: str, duration: float) -> list:
 
 def align(audio_path: str, text: str) -> tuple:
     """Word timings that are NEVER empty. Returns (words, method).
-    forced-align (exact) → even-split from the known script (approximate but always present)."""
-    words = forced_align(audio_path, text)
-    if words:
-        return words, "forced-align"
+    Real aligners first (their timings track the actual voice, so captions stay on the beat);
+    even-split only as a last resort — it is approximate and WILL feel off-pace."""
+    for name, fn in (("elevenlabs-fa", lambda: _elevenlabs_align(audio_path, text)),
+                     ("whisper", lambda: _whisper_align(audio_path)),
+                     ("deepgram", lambda: _deepgram_align(audio_path))):
+        out = fn()
+        if out:
+            logger.info(f"captions: aligned via {name} ({len(out)} words)")
+            return out, name
     dur = audio_duration(audio_path)
     words = even_split(text, dur)
     if words:
-        logger.warning(f"captions: aligners returned nothing → even-split fallback over {dur:.1f}s")
+        logger.warning(f"captions: ALL aligners failed → even-split over {dur:.1f}s (pace will be approximate)")
         return words, "even-split"
     return [], "none"
 
 
+def _elevenlabs_align(audio_path: str, text: str) -> list:
+    if not settings.elevenlabs_api_key:
+        return []
+    try:
+        with open(audio_path, "rb") as f:
+            r = requests.post("https://api.elevenlabs.io/v1/forced-alignment",
+                              headers={"xi-api-key": settings.elevenlabs_api_key},
+                              files={"file": f}, data={"text": text}, timeout=120)
+        if r.status_code == 200:
+            words = (r.json() or {}).get("words") or []
+            return [{"word": w.get("text", "").strip(), "start": w.get("start", 0), "end": w.get("end", 0)}
+                    for w in words if w.get("text", "").strip()]
+        logger.warning(f"elevenlabs FA {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"elevenlabs forced-align failed: {e}")
+    return []
+
+
+def _whisper_align(audio_path: str) -> list:
+    """OpenAI Whisper word-level timestamps. These are timings against the ACTUAL audio, so the
+    captions land on the beat the voice says them — this is what makes the pace correct."""
+    if not settings.openai_api_key:
+        return []
+    try:
+        with open(audio_path, "rb") as f:
+            r = requests.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                files={"file": (os.path.basename(audio_path), f, "audio/mpeg")},
+                data=[("model", "whisper-1"), ("response_format", "verbose_json"),
+                      ("timestamp_granularities[]", "word")],
+                timeout=180)
+        if r.status_code == 200:
+            words = (r.json() or {}).get("words") or []
+            return [{"word": str(w.get("word", "")).strip(), "start": w.get("start", 0), "end": w.get("end", 0)}
+                    for w in words if str(w.get("word", "")).strip()]
+        logger.warning(f"whisper align {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"whisper align failed: {e}")
+    return []
+
+
+def _deepgram_align(audio_path: str) -> list:
+    if not settings.deepgram_api_key:
+        return []
+    try:
+        with open(audio_path, "rb") as f:
+            r = requests.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
+                              headers={"Authorization": f"Token {settings.deepgram_api_key}",
+                                       "Content-Type": "audio/mpeg"}, data=f.read(), timeout=120)
+        if r.status_code == 200:
+            w = (((r.json().get("results") or {}).get("channels") or [{}])[0].get("alternatives") or [{}])[0].get("words") or []
+            return [{"word": x.get("word", ""), "start": x.get("start", 0), "end": x.get("end", 0)} for x in w if x.get("word")]
+    except Exception as e:
+        logger.warning(f"deepgram align fallback failed: {e}")
+    return []
+
+
 def forced_align(audio_path: str, text: str) -> list:
-    """Return [{word, start, end}] aligning `text` to `audio_path`. ElevenLabs → Deepgram."""
-    # ElevenLabs Forced Alignment (we already use ElevenLabs for voice)
-    if settings.elevenlabs_api_key:
-        try:
-            with open(audio_path, "rb") as f:
-                r = requests.post("https://api.elevenlabs.io/v1/forced-alignment",
-                                  headers={"xi-api-key": settings.elevenlabs_api_key},
-                                  files={"file": f}, data={"text": text}, timeout=120)
-            if r.status_code == 200:
-                d = r.json()
-                words = d.get("words") or []
-                out = [{"word": w.get("text", "").strip(), "start": w.get("start", 0), "end": w.get("end", 0)}
-                       for w in words if w.get("text", "").strip()]
-                if out:
-                    return out
-            else:
-                logger.warning(f"elevenlabs FA {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            logger.warning(f"elevenlabs forced-align failed: {e}")
-    # Deepgram fallback (word timestamps from ASR — less exact but has timings)
-    if settings.deepgram_api_key:
-        try:
-            with open(audio_path, "rb") as f:
-                r = requests.post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
-                                  headers={"Authorization": f"Token {settings.deepgram_api_key}",
-                                           "Content-Type": "audio/mpeg"}, data=f.read(), timeout=120)
-            if r.status_code == 200:
-                w = (((r.json().get("results") or {}).get("channels") or [{}])[0].get("alternatives") or [{}])[0].get("words") or []
-                return [{"word": x.get("word", ""), "start": x.get("start", 0), "end": x.get("end", 0)} for x in w if x.get("word")]
-        except Exception as e:
-            logger.warning(f"deepgram align fallback failed: {e}")
+    """Return [{word, start, end}] aligning `text` to `audio_path`.
+    ElevenLabs FA (exact, uses our script) → Whisper word timestamps (real timings from the
+    audio itself) → Deepgram. Whisper matters: it's what keeps the caption pace on the voice."""
+    for name, fn in (("elevenlabs-fa", lambda: _elevenlabs_align(audio_path, text)),
+                     ("whisper", lambda: _whisper_align(audio_path)),
+                     ("deepgram", lambda: _deepgram_align(audio_path))):
+        out = fn()
+        if out:
+            logger.info(f"captions: aligned via {name} ({len(out)} words)")
+            return out
     return []
 
 
@@ -133,20 +175,32 @@ def _cta_spans(words: list) -> list:
     return merged
 
 
-def build_ass(words: list, out_ass_path: str, per_line: int = 4, play_w: int = 1080, play_h: int = 1920) -> str | None:
-    """Group words into short phrase lines (word-timed) and write a clean ASS subtitle.
-    A spoken CTA ("click below", "get your quote"…) is emitted as a whole phrase in the CTA
-    style — an opaque blue button with white bold text — so the viewer sees a real call-to-action."""
+def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1080, play_h: int = 1920) -> str | None:
+    """TikTok/Reels-style burned captions — NOT movie subtitles.
+
+    Big bold uppercase, 2-3 words at a time, heavy black outline so it reads on any footage,
+    parked in the lower third (well clear of the player chrome). Sizes are derived from the
+    ACTUAL video height, so the text is never tiny on a 576p clip or huge on a 4K one.
+    A spoken CTA ("click below", "get your quote"…) becomes an opaque blue BUTTON instead."""
     if not words:
         return None
+    # scale everything off the real frame height (1920 is our reference design)
+    k = max(0.35, play_h / 1920.0)
+    fs      = int(96 * k)    # caption size — big, like a TikTok
+    cta_fs  = int(76 * k)
+    outline = max(2, int(8 * k))     # thick black stroke = readable on any background
+    shadow  = max(1, int(3 * k))
+    marginv = int(430 * k)           # lower third, clear of the play/scrub controls
+    side    = int(90 * k)
     header = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 2\n\n"
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
-        "Style: Def,Arial,64,&H00FFFFFF,&H00000000,&H96000000,-1,0,1,3,1,2,60,60,220\n"
-        # BorderStyle=3 = opaque box; Outline=14 = the button's padding; box colour is BGR blue.
-        "Style: Cta,Arial,66,&H00FFFFFF,&H00E07A1F,&H00000000,-1,0,3,14,0,2,80,80,260\n\n"
+        # white text, fat black outline, bottom-centre — the TikTok look
+        f"Style: Def,Arial,{fs},&H00FFFFFF,&H00000000,&H00000000,-1,0,1,{outline},{shadow},2,{side},{side},{marginv}\n"
+        # BorderStyle=3 = opaque box → renders as a button; Outline value is the button padding.
+        f"Style: Cta,Arial,{cta_fs},&H00FFFFFF,&H00E07A1F,&H00000000,-1,0,3,{max(10, int(16 * k))},0,2,{side},{side},{marginv}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         % (play_w, play_h)
     )
@@ -154,32 +208,46 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 4, play_w: int = 1
     cta_start = {s: e for s, e in ctas}
     inside = {i for s, e in ctas for i in range(s, e)}
 
-    def _line(chunk, style):
-        start = chunk[0]["start"]; end = chunk[-1]["end"]
+    def _chunk(c, style):
+        start = float(c[0]["start"]); end = float(c[-1]["end"])
         if end <= start:
-            end = start + 1.2
-        if style == "Cta":
-            end += 0.6   # let the button linger a beat so it's readable/clickable-feeling
-        text = " ".join(w["word"] for w in chunk).replace("\n", " ").strip().upper()
-        return f"Dialogue: 0,{_fmt(start)},{_fmt(end)},{style},,0,0,0,,{text}"
+            end = start + 0.5
+        text = " ".join(str(w["word"]) for w in c).replace("\n", " ").strip().upper()
+        text = re.sub(r"\s+", " ", text)
+        return {"start": start, "end": end, "style": style, "text": text}
 
-    lines, i, buf = [], 0, []
+    chunks, i, buf = [], 0, []
     while i < len(words):
         if i in cta_start:                       # flush the pending text, then emit the button
             if buf:
-                lines.append(_line(buf, "Def")); buf = []
+                chunks.append(_chunk(buf, "Def")); buf = []
             e = cta_start[i]
-            lines.append(_line(words[i:e], "Cta"))
+            chunks.append(_chunk(words[i:e], "Cta"))
             i = e
             continue
-        if i in inside:                          # covered by a span we already emitted
+        if i in inside:                          # already covered by a CTA span
             i += 1
             continue
         buf.append(words[i]); i += 1
         if len(buf) >= per_line:
-            lines.append(_line(buf, "Def")); buf = []
+            chunks.append(_chunk(buf, "Def")); buf = []
     if buf:
-        lines.append(_line(buf, "Def"))
+        chunks.append(_chunk(buf, "Def"))
+
+    # TikTok captions are CONTINUOUS — each line holds until the next one starts, so there's no
+    # flicker/gap between phrases. Also enforce a readable minimum on-screen time.
+    lines = []
+    for n, c in enumerate(chunks):
+        nxt = chunks[n + 1]["start"] if n + 1 < len(chunks) else None
+        end = c["end"]
+        if nxt is not None:
+            end = max(end, min(nxt, c["start"] + 2.5))   # hold to the next line (cap the hold)
+            end = min(end, nxt)                          # never overlap the next line
+        else:
+            end = max(end, c["start"] + 0.9)
+        if end - c["start"] < 0.35:                      # too quick to read → give it a beat
+            end = c["start"] + 0.35
+        lines.append(f"Dialogue: 0,{_fmt(c['start'])},{_fmt(end)},{c['style']},,0,0,0,,{c['text']}")
     with open(out_ass_path, "w") as f:
         f.write(header + "\n".join(lines) + "\n")
     return out_ass_path

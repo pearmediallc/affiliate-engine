@@ -128,9 +128,11 @@ class StorageService:
             return False
 
     @staticmethod
-    def presign_url(s3_key: str, expires: int = 3600) -> str | None:
+    def presign_url(s3_key: str, expires: int = 3600, download_as: str | None = None) -> str | None:
         """Presigned GET URL so an EXTERNAL service (sync.so / fal / Replicate) can fetch a
-        private-bucket object. Accepts a key or a full S3 URL."""
+        private-bucket object. Accepts a key or a full S3 URL.
+        download_as=<filename> makes the browser SAVE the file instead of opening a tab — the
+        HTML `download` attribute is ignored cross-origin, so it has to come from S3's headers."""
         if not s3_key:
             return None
         if s3_key.startswith("http"):
@@ -139,8 +141,10 @@ class StorageService:
         if not client:
             return None
         try:
-            return client.generate_presigned_url(
-                "get_object", Params={"Bucket": settings.aws_s3_bucket, "Key": s3_key}, ExpiresIn=expires)
+            params = {"Bucket": settings.aws_s3_bucket, "Key": s3_key}
+            if download_as:
+                params["ResponseContentDisposition"] = f'attachment; filename="{download_as}"'
+            return client.generate_presigned_url("get_object", Params=params, ExpiresIn=expires)
         except Exception as e:
             logger.warning(f"S3 presign failed for {s3_key}: {e}")
             return None

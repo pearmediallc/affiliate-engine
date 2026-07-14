@@ -32,6 +32,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Ad creatives are VERTICAL by default — 16:9 was hardcoded, which is why images came back
+# letterboxed in a 9:16 card. Callers may still ask for another ratio explicitly.
+_IMAGEN_AR = {"9:16", "16:9", "1:1", "3:4", "4:3"}
+_IDEOGRAM_AR = {"9:16": "ASPECT_9_16", "16:9": "ASPECT_16_9", "1:1": "ASPECT_1_1",
+                "3:4": "ASPECT_3_4", "4:3": "ASPECT_4_3"}
+_OPENAI_SIZE = {"9:16": "1024x1792", "16:9": "1792x1024", "1:1": "1024x1024"}
+
 
 def _persist_image(filepath: str, filename: str) -> str:
     """Upload to S3 if configured, otherwise return local serve URL."""
@@ -125,7 +132,7 @@ class ImageGeneratorService:
             logger.error(f"Error generating image: {str(e)}")
             raise
 
-    async def _generate_with_provider(self, prompt: str) -> dict:
+    async def _generate_with_provider(self, prompt: str, aspect: str = "9:16") -> dict:
         """
         Generate image with provider chain: Gemini (PRIMARY) → OpenAI (SECONDARY) → FAL (TERTIARY)
 
@@ -147,7 +154,7 @@ class ImageGeneratorService:
         if route == "ideogram":
             try:
                 logger.info("Smart route: Using Ideogram (text-heavy content detected)")
-                return await self._generate_with_ideogram(prompt)
+                return await self._generate_with_ideogram(prompt, aspect)
             except Exception as e:
                 logger.warning(f"Ideogram smart route failed: {e}, falling back to default chain")
 
@@ -155,7 +162,7 @@ class ImageGeneratorService:
         if GOOGLE_GENAI_AVAILABLE and settings.gemini_api_key:
             try:
                 logger.info("Step 1: Attempting Gemini 2.0 Flash (PRIMARY)")
-                return await self._generate_with_gemini_image(prompt)
+                return await self._generate_with_gemini_image(prompt, aspect)
             except Exception as gemini_e:
                 logger.warning(f"Step 1 FAILED: Gemini error: {str(gemini_e)}")
                 logger.info("Falling back to OpenAI...")
@@ -166,7 +173,7 @@ class ImageGeneratorService:
         if settings.openai_api_key:
             try:
                 logger.info("Step 2: Attempting OpenAI DALL-E 3 (SECONDARY)")
-                return await self._generate_with_openai(prompt)
+                return await self._generate_with_openai(prompt, aspect)
             except Exception as openai_e:
                 logger.warning(f"Step 2 FAILED: OpenAI error: {str(openai_e)}")
                 logger.info("Falling back to FAL...")
@@ -176,7 +183,7 @@ class ImageGeneratorService:
         # STEP 3: Use FAL (TERTIARY) - final fallback
         try:
             logger.info("Step 3: Attempting FAL.ai (TERTIARY)")
-            return await self._generate_with_fal(prompt)
+            return await self._generate_with_fal(prompt, aspect)
         except Exception as fal_e:
             logger.error(f"Step 3 FAILED: FAL error: {str(fal_e)}")
             raise Exception("All image generation providers failed")
@@ -193,7 +200,7 @@ class ImageGeneratorService:
         # Default chain
         return "default"
 
-    async def _generate_with_ideogram(self, prompt: str) -> dict:
+    async def _generate_with_ideogram(self, prompt: str, aspect: str = "9:16") -> dict:
         """Generate image using Ideogram 3.0 - best for text-heavy images"""
         if not settings.ideogram_api_key:
             raise ValueError("IDEOGRAM_API_KEY not set")
@@ -208,7 +215,7 @@ class ImageGeneratorService:
                 "image_request": {
                     "prompt": prompt,
                     "model": "V_3",
-                    "aspect_ratio": "ASPECT_16_9",
+                    "aspect_ratio": _IDEOGRAM_AR.get(aspect, "ASPECT_9_16"),
                     "magic_prompt_option": "AUTO",
                 }
             }
@@ -252,7 +259,7 @@ class ImageGeneratorService:
             logger.error(f"Ideogram generation failed: {str(e)}")
             raise
 
-    async def _generate_with_openai(self, prompt: str) -> dict:
+    async def _generate_with_openai(self, prompt: str, aspect: str = "9:16") -> dict:
         """
         Generate image using OpenAI DALL-E 3
 
@@ -273,7 +280,7 @@ class ImageGeneratorService:
                 "Content-Type": "application/json",
             }
 
-            dalle_size = "1024x1024"
+            dalle_size = _OPENAI_SIZE.get(aspect, "1024x1792")
             dalle_quality = "standard"
             payload = {
                 "model": "dall-e-3",
@@ -327,7 +334,7 @@ class ImageGeneratorService:
             logger.error(f"OpenAI image generation failed: {str(e)}")
             raise
 
-    async def _generate_with_gemini_image(self, prompt: str) -> dict:
+    async def _generate_with_gemini_image(self, prompt: str, aspect: str = "9:16") -> dict:
         """
         Generate image using Google Gemini via google.genai Client
 
@@ -359,7 +366,7 @@ class ImageGeneratorService:
                 prompt=prompt,
                 config=types.GenerateImagesConfig(
                     number_of_images=1,
-                    aspect_ratio="16:9",
+                    aspect_ratio=(aspect if aspect in _IMAGEN_AR else "9:16"),
                 ),
             )
 
@@ -431,7 +438,7 @@ class ImageGeneratorService:
                 logger.error(f"Both Imagen 4 and gemini-2.5-flash-image failed: {str(fallback_e)}")
                 raise
 
-    async def _generate_with_fal(self, prompt: str) -> dict:
+    async def _generate_with_fal(self, prompt: str, aspect: str = "9:16") -> dict:
         """Generate image using FLUX via Kie.ai (replaces deprecated FAL.ai path)."""
         try:
             if not settings.kie_api_key:

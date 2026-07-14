@@ -304,15 +304,25 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
         logger.warning("voice_studio: cloning unavailable (no Chatterbox/Replicate) → casting a preset voice")
         provider, native, sample_url = None, None, None
 
-    # the gender/age-correct voice the brain cast — used whenever we leave the chosen provider
+    # What voice did the caller actually want? If we have to leave their provider (e.g. Kokoro
+    # needs Replicate and Replicate has no payment method), we must land on the CLOSEST voice —
+    # same gender, same age band — not that provider's arbitrary default.
     fb = _by_id(fallback_voice_id) if fallback_voice_id else None
+    want = v or fb or {}
+    want_gender = want.get("gender") or "female"
+    want_age = want.get("age_band")
 
     def _native_for(prov: str) -> Optional[str]:
         if provider == prov and native:
             return native
-        if fb and fb.get("provider") == prov:
-            return fb["id"].split(":", 1)[1]
-        return None
+        best, best_s = None, -1
+        for c in VOICE_CATALOG:
+            if c.get("provider") != prov or c.get("auto_cast") is False:
+                continue
+            s = (5 if c.get("gender") == want_gender else 0) + (3 if c.get("age_band") == want_age else 0)
+            if s > best_s:
+                best, best_s = c, s
+        return best["id"].split(":", 1)[1] if best else None
 
     # build the attempt order: chosen provider → the cast voice's provider → the cheap chain,
     # and skip any provider whose key isn't configured.
@@ -337,8 +347,13 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
                 continue
             res["path"] = out_path
             res["fallback"] = (prov != provider) if provider else False
+            res["requested"] = voice_id
             if res["fallback"]:
-                logger.warning(f"voice_studio: fell back to {prov} (chosen={provider})")
+                # Say EXACTLY what happened — a silent swap is how "I picked Sarah and got Nova"
+                # goes unnoticed. errors[0] is why the chosen provider refused.
+                res["fallback_reason"] = (errors[0] if errors else f"{provider} unavailable")[:160]
+                logger.warning(f"voice_studio: requested {voice_id} ({provider}) → USED {prov}:{res.get('voice')} "
+                               f"— reason: {res['fallback_reason']}")
             return res
         except Exception as e:
             errors.append(f"{prov}: {e}")
