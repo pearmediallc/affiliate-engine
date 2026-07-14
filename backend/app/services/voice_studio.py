@@ -54,7 +54,8 @@ VOICE_CATALOG = [
     # OpenAI — steerable
     {"id": "openai:nova",    "name": "Nova",    "provider": "openai", "gender": "female", "age_band": "35-44", "style": "confident, bold"},
     {"id": "openai:shimmer", "name": "Shimmer", "provider": "openai", "gender": "female", "age_band": "under35", "style": "bright, cheerful"},
-    {"id": "openai:alloy",   "name": "Alloy",   "provider": "openai", "gender": "female", "age_band": "45-55", "style": "calm, neutral"},
+    # Alloy reads androgynous — selectable by hand, but NEVER auto-cast (it lands as "male" on a woman)
+    {"id": "openai:alloy",   "name": "Alloy",   "provider": "openai", "gender": "female", "age_band": "45-55", "style": "calm, neutral", "auto_cast": False},
     {"id": "openai:fable",   "name": "Fable",   "provider": "openai", "gender": "female", "age_band": "35-44", "style": "expressive, storytelling"},
     {"id": "openai:onyx",    "name": "Onyx",    "provider": "openai", "gender": "male",   "age_band": "45-55", "style": "deep, authoritative"},
     {"id": "openai:echo",    "name": "Echo",    "provider": "openai", "gender": "male",   "age_band": "35-44", "style": "clear, informative"},
@@ -64,10 +65,33 @@ VOICE_CATALOG = [
     {"id": "deepgram:aura-2-asteria-en", "name": "Asteria", "provider": "deepgram", "gender": "female", "age_band": "35-44", "style": "clear, upbeat"},
     {"id": "deepgram:aura-2-orion-en",   "name": "Orion",   "provider": "deepgram", "gender": "male",   "age_band": "45-55", "style": "warm, mature"},
     {"id": "deepgram:aura-2-arcas-en",   "name": "Arcas",   "provider": "deepgram", "gender": "male",   "age_band": "35-44", "style": "natural, conversational"},
+    # ElevenLabs — our most natural UGC voices (public library ids)
+    {"id": "elevenlabs:21m00Tcm4TlvDq8ikWAM", "name": "Rachel",  "provider": "elevenlabs", "gender": "female", "age_band": "35-44", "style": "calm, natural"},
+    {"id": "elevenlabs:EXAVITQu4vr4xnSDxMaL", "name": "Sarah",   "provider": "elevenlabs", "gender": "female", "age_band": "under35", "style": "soft, conversational"},
+    {"id": "elevenlabs:XrExE9yKIg1WjnnlVkGX", "name": "Matilda", "provider": "elevenlabs", "gender": "female", "age_band": "35-44", "style": "warm, friendly"},
+    {"id": "elevenlabs:oWAxZDx7w5VEj9dCyTzz", "name": "Grace",   "provider": "elevenlabs", "gender": "female", "age_band": "45-55", "style": "gentle, southern"},
+    {"id": "elevenlabs:pNInz6obpgDQGcFmaJgB", "name": "Adam",    "provider": "elevenlabs", "gender": "male",   "age_band": "35-44", "style": "deep, natural"},
+    {"id": "elevenlabs:TxGEqnHWrfWFTfGW9XjX", "name": "Josh",    "provider": "elevenlabs", "gender": "male",   "age_band": "under35", "style": "casual, young"},
 ]
 
 # ElevenLabs default public voice ids (used only when 11labs is the chosen/last provider)
 _ELEVEN_DEFAULTS = {"female": "21m00Tcm4TlvDq8ikWAM", "male": "TxGEqnHWrfWFTfGW9XjX"}
+
+
+def available_providers() -> set:
+    """Voice providers whose keys are actually configured — so we never offer (or auto-cast)
+    a voice we cannot synthesize. Cloning needs Chatterbox (or Replicate as its host)."""
+    p = set()
+    if settings.openai_api_key:     p.add("openai")
+    if settings.deepgram_api_key:   p.add("deepgram")
+    if settings.elevenlabs_api_key: p.add("elevenlabs")
+    if settings.replicate_api_token: p.add("kokoro")
+    if settings.chatterbox_api_url or settings.replicate_api_token: p.add("chatterbox")
+    return p
+
+
+def clone_available() -> bool:
+    return bool(settings.chatterbox_api_url or settings.replicate_api_token)
 
 
 def _by_id(voice_id: str) -> Optional[dict]:
@@ -77,9 +101,13 @@ def _by_id(voice_id: str) -> Optional[dict]:
     return None
 
 
-def list_voices(cloned: Optional[list] = None) -> list:
-    """Full pickable catalog: presets + any cloned voices passed in (from DB)."""
-    out = [{**v, "cloned": False} for v in VOICE_CATALOG]
+def list_voices(cloned: Optional[list] = None, only_available: bool = False) -> list:
+    """Full pickable catalog: presets + any cloned voices passed in (from DB).
+    only_available=True hides voices whose provider key isn't configured (so the picker
+    never offers a voice that would silently fall back to a different one)."""
+    avail = available_providers() if only_available else None
+    out = [{**v, "cloned": False} for v in VOICE_CATALOG
+           if not avail or v.get("provider") in avail]
     for c in (cloned or []):
         out.append({"id": c.get("id") or f"chatterbox:{c.get('voice_id')}", "name": c.get("name", "Cloned"),
                     "provider": c.get("provider", "chatterbox"), "gender": c.get("gender"),
@@ -89,22 +117,32 @@ def list_voices(cloned: Optional[list] = None) -> list:
 
 
 def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
-               style: Optional[str] = None, cloned: Optional[list] = None) -> dict:
-    """Brain casting: best catalog match. Default bias = 45-55 woman (house rule)."""
+               style: Optional[str] = None, cloned: Optional[list] = None,
+               tone: Optional[str] = None) -> dict:
+    """Brain casting: best catalog match among voices we can ACTUALLY synthesize.
+    Default bias = 45-55 woman (house rule). `tone` is the script's register
+    (e.g. "serious, informational" / "upbeat") so the voice matches the writing."""
     gender = gender or "female"
     age_band = age_band or "45-55"
-    pool = list_voices(cloned)
+    # only voices whose provider key is live, and never auto-cast an androgynous voice
+    pool = [v for v in list_voices(cloned, only_available=True) if v.get("auto_cast") is not False]
+    want = " ".join(x for x in [style, tone] if x).lower()
     scored = []
     for v in pool:
         s = 0
-        if v.get("gender") == gender: s += 3
+        if v.get("gender") == gender: s += 5          # gender is non-negotiable
         if v.get("age_band") == age_band: s += 3
-        if style and style.lower() in (v.get("style") or "").lower(): s += 2
-        if v.get("provider") in ("openai", "deepgram", "elevenlabs"): s += 1   # avoid Replicate for auto-cast
-        if v.get("cloned"): s += 1                  # prefer our own cloned voices when present
+        vstyle = (v.get("style") or "").lower()
+        if want and vstyle:                            # tone/style overlap on any word
+            s += 2 * sum(1 for w in set(want.replace(",", " ").split()) if len(w) > 3 and w in vstyle)
+        if v.get("provider") in ("elevenlabs", "openai", "deepgram"): s += 1   # avoid Replicate for auto-cast
+        if v.get("cloned"): s += 2                     # prefer our own cloned voices when present
         scored.append((s, v))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1] if scored else {"id": "kokoro:af_sarah", "provider": "kokoro"}
+    if scored:
+        return scored[0][1]
+    # nothing configured at all — fall back to the catalog default rather than crashing
+    return _by_id("openai:nova") or {"id": "kokoro:af_sarah", "provider": "kokoro"}
 
 
 # ── Replicate helper (synchronous via Prefer: wait) ───────────────────────────
@@ -227,7 +265,7 @@ def _syn_elevenlabs(text: str, voice_id: str, out_path: str) -> dict:
 
 def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[str] = None,
                style: Optional[str] = None, sample_url: Optional[str] = None,
-               cloned: Optional[list] = None) -> dict:
+               cloned: Optional[list] = None, fallback_voice_id: Optional[str] = None) -> dict:
     """
     Synthesize `text` in the chosen voice, cheapest-first with automatic fallback.
     - voice_id like 'kokoro:af_sarah' / 'openai:nova' / 'deepgram:aura-2-hera-en'
@@ -260,22 +298,41 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
             provider = pref
     native = (voice_id.split(":", 1)[1] if voice_id and ":" in voice_id else None)
 
-    # build the attempt order: chosen provider first, then the cheap→premium chain
-    order = ([provider] if provider else []) + [p for p in FALLBACK_ORDER if p != provider]
+    # If the clone can't run (no Chatterbox/Replicate), don't even try — go straight to the
+    # cast voice so a female character never lands on a blind default voice.
+    if provider == "chatterbox" and not clone_available():
+        logger.warning("voice_studio: cloning unavailable (no Chatterbox/Replicate) → casting a preset voice")
+        provider, native, sample_url = None, None, None
+
+    # the gender/age-correct voice the brain cast — used whenever we leave the chosen provider
+    fb = _by_id(fallback_voice_id) if fallback_voice_id else None
+
+    def _native_for(prov: str) -> Optional[str]:
+        if provider == prov and native:
+            return native
+        if fb and fb.get("provider") == prov:
+            return fb["id"].split(":", 1)[1]
+        return None
+
+    # build the attempt order: chosen provider → the cast voice's provider → the cheap chain,
+    # and skip any provider whose key isn't configured.
+    avail = available_providers()
+    order = ([provider] if provider else []) + ([fb["provider"]] if fb else []) + FALLBACK_ORDER
+    order = [p for i, p in enumerate(order) if p in avail and p not in order[:i]]
     errors = []
     for prov in order:
         try:
             if prov == "chatterbox":
-                voice_name = native if provider == "chatterbox" and native else None
-                res = _syn_chatterbox(text, out_path, voice_name=voice_name, sample_url=sample_url, style=style)
+                res = _syn_chatterbox(text, out_path, voice_name=_native_for("chatterbox"),
+                                      sample_url=sample_url, style=style)
             elif prov == "kokoro":
-                res = _syn_kokoro(text, native if provider == "kokoro" and native else "af_sarah", out_path)
+                res = _syn_kokoro(text, _native_for("kokoro") or "af_sarah", out_path)
             elif prov == "openai":
-                res = _syn_openai(text, native if provider == "openai" and native else "nova", out_path, style)
+                res = _syn_openai(text, _native_for("openai") or "nova", out_path, style)
             elif prov == "deepgram":
-                res = _syn_deepgram(text, native if provider == "deepgram" and native else "aura-2-hera-en", out_path)
+                res = _syn_deepgram(text, _native_for("deepgram") or "aura-2-hera-en", out_path)
             elif prov == "elevenlabs":
-                res = _syn_elevenlabs(text, native if provider == "elevenlabs" and native else _ELEVEN_DEFAULTS["female"], out_path)
+                res = _syn_elevenlabs(text, _native_for("elevenlabs") or _ELEVEN_DEFAULTS["female"], out_path)
             else:
                 continue
             res["path"] = out_path

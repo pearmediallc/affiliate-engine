@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\('app/services/auto_editor.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(npx --yes tsc --noEmit)",
+      "Bash(python3 -m py_compile /Users/mac/Desktop/affiliate-engine/backend/app/services/campaign_service.py /Users/mac/Desktop/affiliate-engine/backend/app/services/auto_editor.py /Users/mac/Desktop/affiliate-engine/backend/app/services/variation_engine.py /Users/mac/Desktop/affiliate-engine/backend/app/models/campaign.py /Users/mac/Desktop/affiliate-engine/backend/app/routes/campaigns.py)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(git commit -m ' *)",
+      "Bash(python3 -m py_compile /Users/mac/Desktop/affiliate-engine/backend/app/services/storage.py /Users/mac/Desktop/affiliate-engine/backend/app/services/image_generator.py /Users/mac/Desktop/affiliate-engine/backend/app/services/video_creator.py /Users/mac/Desktop/affiliate-engine/backend/app/services/multi_provider_video.py /Users/mac/Desktop/affiliate-engine/backend/app/config.py)",
+      "Bash(git -C /Users/mac/Desktop/affiliate-engine add frontend/components/CampaignStudio.tsx frontend/components/Dashboard.tsx)",
+      "Bash(git -C /Users/mac/Desktop/affiliate-engine status --short)",
+      "Bash(python3 -m py_compile /Users/mac/Desktop/affiliate-engine/backend/app/routes/video_edit.py)",
+      "Bash(npx --prefix frontend tsc --noEmit)",
+      "Bash(python -c ' *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/Users/mac/Desktop/affiliate-engine/backend/app/routes/video_edit.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git commit -m 'fix\\(video\\): replace stale _HIGGSFIELD_MODELS ref with _HIGGSFIELD_T2V/_HIGGSFIELD_I2V *)",
+      "Bash(git commit -m 'fix\\(routing\\): require key+secret for Higgsfield availability check *)",
+      "Bash(git commit -m 'fix\\(routing\\): routing table is authoritative, ignore stale preferred_model from DB *)",
+      "Bash(git commit -m 'fix\\(kieai\\): handle nested data envelope in Kie.ai responses *)",
+      "Bash(git commit -m 'fix\\(kieai\\): snap duration to valid Runway values, add required quality field *)",
+      "Bash(git commit *)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:docs.kie.ai)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backend/app/services/multi_provider_video.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/app/services/kieai_service.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/app/services/multi_provider_video.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/app/services/kieai_service.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(xargs basename *)",
+      "Bash(grep -rn \"NotImplementedError\\\\|TODO\\\\|FIXME\\\\|pass\\\\s*$\" /Users/mac/Desktop/affiliate-engine/backend/app/services/ --include=\"*.py\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/app/routes/marketing.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/app/routes/characters.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/app/routes/scene_settings.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

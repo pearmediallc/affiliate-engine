@@ -932,13 +932,21 @@ async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)
     cmd = (payload.get("command") or "").strip()
     if not cmd:
         return {"success": True, "intent": {}}
+    from ..services import creative_playbook as pb
+    verticals = "|".join(sorted(pb.VERTICALS.keys()))
     prompt = (
         "Extract structured intent from this creative-ad request. Map age words to bands: "
-        "under35, 35-44, 45-55, 55plus (grandma/elderly/60s/70s→55plus; middle-aged/40s/50→45-55). "
+        "under35, 35-44, 45-55, 55plus (grandma/elderly/60s/70s→55plus; middle-aged/40s/50→45-55; "
+        "20s/25-35/young→under35). "
         "Return STRICT JSON only: {\"gender\":\"female|male\",\"age_band\":\"under35|35-44|45-55|55plus|null\","
-        "\"vertical\":\"home_insurance|bizop|refinance|null\",\"offer_value\":\"e.g. $29 or null\","
+        f"\"vertical\":\"{verticals}|null\",\"offer_value\":\"e.g. $29 or null\","
         "\"seconds\":number-or-null,\"script_ref\":\"S<number> or null\",\"scene\":\"short setting like "
-        "kitchen/living room/outdoor or null\",\"count\":number(default 1),\"wants_image\":true/false}. "
+        "kitchen/living room/outdoor or null\","
+        # tone + energy drive CASTING: a serious, informational script needs a calm, static
+        # talking-head — not a high-energy, camera-moving clip. The avatar must fit the words.
+        "\"tone\":\"serious|warm|urgent|upbeat|conversational|null\","
+        "\"energy\":\"static|moderate|dynamic|null\","
+        "\"count\":number(default 1),\"wants_image\":true/false}. "
         f"Request: \"{cmd[:800]}\""
     )
     try:
@@ -978,10 +986,13 @@ async def list_voices(gender: str = "", age_band: str = "", _auth: bool = Depend
     """The full pickable voice catalog (Kokoro/OpenAI/Deepgram presets, casting-tagged),
     plus the brain's recommended voice for the given casting. More options than 11Labs, cheapest-first."""
     from ..services import voice_studio as vs
-    voices = vs.list_voices()
+    # only voices we can ACTUALLY synthesize — never offer one whose key isn't configured,
+    # or the user picks it and silently gets a different voice.
+    voices = vs.list_voices(only_available=True)
     if gender: voices = [v for v in voices if v.get("gender") == gender]
     if age_band: voices = [v for v in voices if v.get("age_band") == age_band]
     return {"success": True, "count": len(voices), "voices": voices,
+            "clone_available": vs.clone_available(),
             "recommended": vs.pick_voice(gender=gender or None, age_band=age_band or None)}
 
 
@@ -1050,9 +1061,12 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
     if path:
         try:
             from ..services.storage import StorageService
-            u = StorageService.upload_file(path, f"regen/image_{os.path.basename(path)}")
+            key = f"regen/image_{os.path.basename(path)}"
+            u = StorageService.upload_file(path, key)
+            # our bucket is PRIVATE — the raw object URL 403s (AccessDenied) in the browser,
+            # so hand back a presigned URL the user can actually open.
             if u:
-                url = u
+                url = StorageService.presign_url(key, expires=604800) or u
         except Exception as e:
             logger.warning(f"image s3 upload failed: {e}")
     model = data.get("model") or ""
@@ -2585,13 +2599,16 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
         except Exception as e:
             logger.warning(f"voice-clone sample extract failed, using preset: {e}")
-    voice_id = a.get("voice_id")
-    if not voice_id and not sample_url:
-        voice_id = vs.pick_voice(gender=a.get("gender"), age_band=a.get("age_band")).get("id")
+    # ALWAYS cast a gender/age/tone-correct preset. It's the voice we speak with directly, AND the
+    # fallback if the clone can't run — so a female character can never land on a male/androgynous
+    # voice just because Chatterbox/Replicate was unavailable.
+    voice_id = a.get("voice_id") or vs.pick_voice(
+        gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone")).get("id")
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
         script, voice_id=("chatterbox:character" if sample_url else voice_id),
-        sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational"))
+        sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational",
+        fallback_voice_id=voice_id))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
     # Fit the VO to the requested length (and under sync.so's 20s free cap): gently speed it up
@@ -2648,18 +2665,25 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
     # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
-    ass_path, _cap_words = None, []
+    ass_path, _cap_words, _cap_method, _cap_err = None, [], "", ""
     _use_veed = bool(a.get("captions")) and (a.get("caption_style") or "clean").lower() == "veed" and bool(settings.fal_key)
     if a.get("captions"):
         try:
             from ..services import captions as cap
-            _cap_words = await asyncio.to_thread(lambda: cap.forced_align(out_audio, script))
+            # align() NEVER comes back empty: forced-align (exact) → even-split from our known script.
+            _cap_words, _cap_method = await asyncio.to_thread(lambda: cap.align(out_audio, script))
             if not _use_veed:
                 ass_path = cap.build_ass(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.ass"))
                 if ass_path:
-                    _track_cost(req.request_id, "captions", "elevenlabs-fa+ffmpeg", cost_usd=0.002, note="forced-align + ffmpeg burn")
+                    _track_cost(req.request_id, "captions", f"{_cap_method}+ffmpeg", cost_usd=0.002,
+                                note=f"{_cap_method} + ffmpeg burn (CTA styled)")
         except Exception as e:
-            logger.warning(f"captions failed, shipping without: {e}")
+            _cap_err = str(e)[:160]
+            logger.error(f"captions FAILED for {req.request_id}: {e}")
+    # captions were asked for but produced nothing → say so loudly instead of silently shipping bare
+    if a.get("captions") and not _use_veed and not ass_path:
+        _cap_err = _cap_err or "aligner + even-split both returned no words"
+        logger.error(f"captions requested but NOT burned for {req.request_id}: {_cap_err}")
 
     # 4) SAVE — normalize + persist to BOTH buckets
     variant = await _produce_lipsync_variant(req.request_id, name, result, script, ass_path=ass_path)
@@ -2681,13 +2705,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"VEED captions failed, keeping base video: {e}")
     _set_lipsync_status(req.request_id, "done")
-    # auto-feedback statement for THIS generation (shown per video)
+    # auto-feedback statement for THIS generation (shown per video). Report what ACTUALLY happened —
+    # a clone that fell back to a preset must not still claim "cloned from character".
+    _cloned = voice_res.get("provider") == "chatterbox"
     fb = ("Reused real library footage · "
-          f"voice {voice_res.get('provider')}{' (fallback)' if voice_res.get('fallback') else ''}"
-          f" · lip-sync {sub['provider']} · ~{seconds}s"
+          f"voice {voice_res.get('provider')}:{voice_res.get('voice')}"
+          + (" (cloned from character)" if _cloned
+             else " (clone unavailable → cast)" if sample_url else "")
+          + f" · lip-sync {sub['provider']} · ~{seconds}s"
           + (f" · states offer {offer_value}" if offer_value else "")
-          + (" · voice cloned from character" if sample_url else ""))
-    variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": bool(sample_url),
+          + (f" · captions {_cap_method}" if (a.get("captions") and ass_path) else "")
+          + (" · captions VEED" if _use_veed else "")
+          + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
+    variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": _cloned,
+                    "captions": bool(ass_path or _use_veed), "caption_method": _cap_method,
                     "whats_changed": fb, "feedback": fb})
     return [variant]
 
