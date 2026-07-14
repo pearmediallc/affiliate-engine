@@ -79,19 +79,20 @@ _ELEVEN_DEFAULTS = {"female": "21m00Tcm4TlvDq8ikWAM", "male": "TxGEqnHWrfWFTfGW9
 
 
 def available_providers() -> set:
-    """Voice providers whose keys are actually configured — so we never offer (or auto-cast)
-    a voice we cannot synthesize. Cloning needs Chatterbox (or Replicate as its host)."""
+    """Voice providers we can ACTUALLY synthesize with — so we never offer (or auto-cast) a voice
+    that will fail. Kokoro/Chatterbox run on Replicate: a token alone isn't enough, the account has
+    to be funded (REPLICATE_ENABLED), or every call 402s and we silently swap the user's voice."""
     p = set()
     if settings.openai_api_key:     p.add("openai")
     if settings.deepgram_api_key:   p.add("deepgram")
     if settings.elevenlabs_api_key: p.add("elevenlabs")
-    if settings.replicate_api_token: p.add("kokoro")
-    if settings.chatterbox_api_url or settings.replicate_api_token: p.add("chatterbox")
+    if settings.replicate_usable:   p.add("kokoro")
+    if settings.chatterbox_api_url or settings.replicate_usable: p.add("chatterbox")
     return p
 
 
 def clone_available() -> bool:
-    return bool(settings.chatterbox_api_url or settings.replicate_api_token)
+    return bool(settings.chatterbox_api_url or settings.replicate_usable)
 
 
 def _by_id(voice_id: str) -> Optional[dict]:
@@ -367,7 +368,7 @@ def clone_voice(sample_url: str, name: str) -> dict:
     (no pre-registration needed), so we just validate + return a catalog-style ref.
     Falls back to ElevenLabs instant-clone if Chatterbox/Replicate is unavailable.
     """
-    if settings.chatterbox_api_url or settings.replicate_api_token:
+    if settings.chatterbox_api_url or settings.replicate_usable:
         return {"voice_id": f"chatterbox:{name}", "provider": "chatterbox", "sample_url": sample_url, "name": name}
     # last resort — ElevenLabs instant clone (counts against 11labs quota)
     from .elevenlabs_service import ElevenLabsService

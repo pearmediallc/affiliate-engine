@@ -869,15 +869,16 @@ async def available_providers(_auth: bool = Depends(require_service_key)):
     step, so the UI offers only real options and the router never picks an unconfigured lane."""
     s = settings
     lip = []
+    if s.fal_key: lip.append({"id": "fal", "name": "fal · lip-sync (cheapest)", "cost": "$"})
     if s.sync_so_api_key: lip.append({"id": "sync", "name": "sync.so — video→video (premium)", "cost": "$$"})
-    if s.fal_key: lip.append({"id": "fal", "name": "fal · VEED lip-sync", "cost": "$"})
-    if s.replicate_api_token:
+    # Replicate lanes only when the account is FUNDED — an unfunded token 402s on every call
+    if s.replicate_usable:
         lip += [{"id": "latentsync", "name": "Replicate LatentSync (cheap, video→video)", "cost": "$"},
                 {"id": "wav2lip", "name": "Replicate Wav2Lip (cheapest)", "cost": "¢"}]
     voice = [{"id": "openai", "name": "OpenAI TTS", "cost": "¢"}]
     if s.deepgram_api_key: voice.append({"id": "deepgram", "name": "Deepgram Aura", "cost": "¢"})
     if s.elevenlabs_api_key: voice.append({"id": "elevenlabs", "name": "ElevenLabs (premium)", "cost": "$"})
-    if s.replicate_api_token: voice.append({"id": "kokoro", "name": "Kokoro (Replicate)", "cost": "¢"})
+    if s.replicate_usable: voice.append({"id": "kokoro", "name": "Kokoro (Replicate)", "cost": "¢"})
     video = []
     if s.kie_api_key: video += [{"id": "kie-seedance", "name": "Kie · Seedance 2.0", "cost": "$$"},
                                 {"id": "kie-seedance-fast", "name": "Kie · Seedance 2.0 Fast", "cost": "$"}]

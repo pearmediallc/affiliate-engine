@@ -269,8 +269,12 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     cheapest for volume); premium = best-quality-first (sync.so). `prefer` overrides."""
     # bulk: LatentSync/Wav2Lip (Replicate, ~$0.03–0.09) → fal → sync.so (pricey at volume)
     # premium: sync.so (best) → fal → Replicate
+    # Replicate lanes are dropped entirely unless the account is funded (REPLICATE_ENABLED) —
+    # an unfunded token 402s on every render, which just burns time and falls through anyway.
     chain = (["sync", "fal", "latentsync", "wav2lip"] if quality == "premium"
              else ["latentsync", "wav2lip", "fal", "sync"])
+    if not settings.replicate_usable:
+        chain = [p for p in chain if p not in ("latentsync", "wav2lip")]
     order, seen, errors = [], set(), []
     for p in ([prefer] if prefer else []) + chain:
         if p and p not in seen:
@@ -282,8 +286,8 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
             elif p == "fal":
                 job = _fal_submit(video_url, audio_url)
             elif p in ("latentsync", "wav2lip"):
-                if not settings.replicate_api_token:
-                    raise RuntimeError("no replicate token")
+                if not settings.replicate_usable:
+                    raise RuntimeError("Replicate not enabled (unfunded account) — using fal/sync.so instead")
                 job = _start_replicate(video_url, audio_url, model=p)
             else:
                 continue

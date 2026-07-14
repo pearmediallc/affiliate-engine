@@ -137,6 +137,16 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:8000"]
     cors_allow_all: bool = True  # In production, set CORS_ORIGINS env var and set this to False
 
+    # Replicate is OFF by default. A token can be present but the account unfunded, in which case
+    # every Replicate call 402s/throttles — and the UI would still offer those lanes (Kokoro voices,
+    # LatentSync/Wav2Lip). Kie + fal + sync.so cover the whole pipeline without it. Set
+    # REPLICATE_ENABLED=true only once the account actually has a payment method.
+    replicate_enabled: bool = False
+
+    @property
+    def replicate_usable(self) -> bool:
+        return bool(self.replicate_api_token and self.replicate_enabled)
+
     @model_validator(mode="after")
     def _fal_key_fallback(self):
         # accept either FAL_KEY or FAL_API_KEY for the fal.ai lanes (lip-sync / video / VEED captions)
