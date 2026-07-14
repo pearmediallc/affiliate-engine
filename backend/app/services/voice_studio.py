@@ -21,6 +21,7 @@ Public API:
 """
 import logging
 import os
+import subprocess
 import uuid
 import base64
 import time
@@ -74,6 +75,13 @@ VOICE_CATALOG = [
     {"id": "gemini:Charon",     "name": "Charon",     "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "informative, steady"},
     {"id": "gemini:Puck",       "name": "Puck",       "provider": "gemini", "gender": "male",   "age_band": "35-44", "style": "upbeat, engaging"},
     {"id": "gemini:Orus",       "name": "Orus",       "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "firm, authoritative"},
+    # 55plus — there were NO elderly voices at all, so an "OLD LADY" clip could never be cast and
+    # fell through to a bright 35-44 voice. Gemini takes the delivery direction in plain English,
+    # so an elder read is steered at synth time (see _age_style).
+    {"id": "gemini:Sulafat",    "name": "Sulafat",    "provider": "gemini", "gender": "female", "age_band": "55plus", "style": "elderly, gentle, unhurried"},
+    {"id": "gemini:Achernar",   "name": "Achernar",   "provider": "gemini", "gender": "female", "age_band": "55plus", "style": "elderly, soft, grandmotherly"},
+    {"id": "gemini:Iapetus",    "name": "Iapetus",    "provider": "gemini", "gender": "male",   "age_band": "55plus", "style": "elderly, weathered, calm"},
+    {"id": "gemini:Rasalgethi", "name": "Rasalgethi", "provider": "gemini", "gender": "male",   "age_band": "55plus", "style": "elderly, measured, warm"},
     # ElevenLabs voices are NOT hardcoded — see _eleven_voices(). Hardcoding public Voice-Library
     # ids is what caused the 402s: "Free users cannot use library voices via the API". We now ask
     # the account which voices it can actually use.
@@ -170,6 +178,23 @@ def list_voices(cloned: Optional[list] = None, only_available: bool = False) -> 
                     "age_band": c.get("age_band"), "style": c.get("style", "cloned voice"),
                     "cloned": True, "sample_url": c.get("sample_url")})
     return out
+
+
+def age_style(age_band: str | None, gender: str | None = None) -> str:
+    """Delivery direction for the age we're casting. A voice model can only sound 70 if we ASK
+    it to — Gemini/OpenAI steer delivery from plain English, so we always tell them who's talking."""
+    who = "woman" if (gender or "female") == "female" else "man"
+    return {
+        "55plus":  f"an elderly {who} in her seventies, warm and unhurried, softer and a little frail"
+                   if who == "woman" else
+                   f"an elderly man in his seventies, warm and unhurried, weathered",
+        "45-55":   f"a mature {who} in her fifties, grounded and trustworthy"
+                   if who == "woman" else f"a mature man in his fifties, grounded and trustworthy",
+        "35-44":   f"a {who} in her late thirties, natural and conversational"
+                   if who == "woman" else f"a man in his late thirties, natural and conversational",
+        "under35": f"a young {who} in her late twenties, casual and upbeat"
+                   if who == "woman" else f"a young man in his late twenties, casual and upbeat",
+    }.get(age_band or "", f"a {who} speaking naturally to camera")
 
 
 def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,

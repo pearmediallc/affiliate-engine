@@ -2553,27 +2553,50 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
         src = await _download_to_temp(result["video_url"], ".mp4")
     out_path = os.path.join(UPLOAD_DIR, out_name)
     out_url = f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}"
+    w, h = await asyncio.to_thread(_video_dims, src)
+
+    # ── SCRUB THE ORIGINAL'S BURNED-IN CAPTIONS ───────────────────────────────────────────────
+    # We re-use REAL editor creatives, and editors burn captions in CapCut. Lip-sync only changes
+    # the mouth — those old captions survive, and they say the OLD script. Burning ours on top is
+    # what produced two sets of captions, the bottom one contradicting the voice. Detect and blur
+    # them first, then lay ours over the clean frame.
+    delogo = ""
+    if cap_words:
+        try:
+            work = os.path.join(UPLOAD_DIR, f"capscan_{request_id[:8]}")
+            os.makedirs(work, exist_ok=True)
+            dur = await asyncio.to_thread(_audio_seconds, src)
+            frames = await asyncio.to_thread(
+                _extract_frames, src, [max(0.3, (dur or 4) * f) for f in (0.15, 0.45, 0.75)], work)
+            boxes = await _detect_caption_boxes(frames)
+            delogo = _delogo_chain(boxes, w, h)
+            if delogo:
+                logger.info(f"[captions] source has {len(boxes)} burned-in caption region(s) → scrubbing before ours")
+        except Exception as e:
+            logger.warning(f"[captions] burned-in caption scan failed (may double up): {e}")
+
     # Build the subtitle HERE — only now do we know the lip-synced video's real dimensions, and
     # caption size/margins are derived from them (a 1080x1920 assumption made them look tiny).
     ass_path = None
     if cap_words:
         try:
             from ..services import captions as cap
-            w, h = await asyncio.to_thread(_video_dims, src)
             ass_path = cap.build_ass(cap_words, os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass"),
                                      play_w=w, play_h=h)
             logger.info(f"[captions] burning {len(cap_words)} words onto {w}x{h}")
         except Exception as e:
             logger.error(f"[captions] build failed: {e}")
+
     args = ["-i", src]
-    if ass_path and os.path.exists(ass_path):
-        args += ["-vf", f"ass={ass_path}"]   # burn word-timed captions
+    vf = delogo + (f"ass={ass_path}" if (ass_path and os.path.exists(ass_path)) else "")
+    if vf:
+        args += ["-vf", vf.rstrip(",")]     # scrub the old captions, then burn ours — one pass
     args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "192k", out_path]
     await asyncio.to_thread(_ffmpeg, args, 300)
     _ae_persist(out_path, out_name)
     return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script,
-            "captions_burned": bool(ass_path)}
+            "captions_burned": bool(ass_path), "scrubbed_original_captions": bool(delogo)}
 
 
 async def _resume_one_lipsync(row):
@@ -2727,9 +2750,17 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     voice_id = a.get("voice_id") or vs.pick_voice(
         gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone")).get("id")
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
+    # TELL the model who is speaking. Casting a "55plus" voice is not enough on its own — the
+    # delivery has to be directed too, or a 70-year-old woman on screen is read by a bright
+    # 30-something. Gemini/OpenAI both steer delivery from plain English.
+    _style = ", ".join(x for x in [
+        vs.age_style(a.get("age_band"), a.get("gender")),
+        (a.get("tone") or "warm"),
+        "conversational, talking to camera",
+    ] if x)
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
         script, voice_id=("fal-clone:character" if sample_url else voice_id),
-        sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational",
+        sample_url=sample_url, out_path=out_audio, style=_style,
         fallback_voice_id=voice_id,
         # what the character actually SAYS in the reference clip — improves clone fidelity
         ref_text=(a.get("character_transcript") or None)))

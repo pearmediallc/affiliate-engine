@@ -192,8 +192,14 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
     shadow  = max(1, int(3 * k))
     marginv = int(430 * k)           # lower third, clear of the play/scrub controls
     side    = int(90 * k)
+    # How many CHARACTERS actually fit on one line? Text overflowed the frame because the font was
+    # sized off the HEIGHT while the line runs off the WIDTH. Arial bold averages ~0.55em/char.
+    usable = max(120, play_w - 2 * side)
+    max_chars = max(8, int(usable / (0.55 * fs)))
     header = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n"
+        # WrapStyle 0 = smart wrapping. It was 2 — "no wrapping at all" — so any line too wide for
+        # the frame simply ran off the edges instead of breaking. That was the overflow.
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
@@ -228,9 +234,12 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
         if i in inside:                          # already covered by a CTA span
             i += 1
             continue
-        buf.append(words[i]); i += 1
-        if len(buf) >= per_line:
+        # break on WORD COUNT *or* on how wide the line would actually render — whichever comes
+        # first. Word count alone let "PROTECTION WITHOUT BREAKING" run off a 1080-wide frame.
+        nxt_len = len(" ".join(str(w["word"]) for w in buf + [words[i]]))
+        if buf and (len(buf) >= per_line or nxt_len > max_chars):
             chunks.append(_chunk(buf, "Def")); buf = []
+        buf.append(words[i]); i += 1
     if buf:
         chunks.append(_chunk(buf, "Def"))
 
