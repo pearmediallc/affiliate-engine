@@ -74,14 +74,54 @@ VOICE_CATALOG = [
     {"id": "gemini:Charon",     "name": "Charon",     "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "informative, steady"},
     {"id": "gemini:Puck",       "name": "Puck",       "provider": "gemini", "gender": "male",   "age_band": "35-44", "style": "upbeat, engaging"},
     {"id": "gemini:Orus",       "name": "Orus",       "provider": "gemini", "gender": "male",   "age_band": "45-55", "style": "firm, authoritative"},
-    # ElevenLabs — our most natural UGC voices (public library ids)
-    {"id": "elevenlabs:21m00Tcm4TlvDq8ikWAM", "name": "Rachel",  "provider": "elevenlabs", "gender": "female", "age_band": "35-44", "style": "calm, natural"},
-    {"id": "elevenlabs:EXAVITQu4vr4xnSDxMaL", "name": "Sarah",   "provider": "elevenlabs", "gender": "female", "age_band": "under35", "style": "soft, conversational"},
-    {"id": "elevenlabs:XrExE9yKIg1WjnnlVkGX", "name": "Matilda", "provider": "elevenlabs", "gender": "female", "age_band": "35-44", "style": "warm, friendly"},
-    {"id": "elevenlabs:oWAxZDx7w5VEj9dCyTzz", "name": "Grace",   "provider": "elevenlabs", "gender": "female", "age_band": "45-55", "style": "gentle, southern"},
-    {"id": "elevenlabs:pNInz6obpgDQGcFmaJgB", "name": "Adam",    "provider": "elevenlabs", "gender": "male",   "age_band": "35-44", "style": "deep, natural"},
-    {"id": "elevenlabs:TxGEqnHWrfWFTfGW9XjX", "name": "Josh",    "provider": "elevenlabs", "gender": "male",   "age_band": "under35", "style": "casual, young"},
+    # ElevenLabs voices are NOT hardcoded — see _eleven_voices(). Hardcoding public Voice-Library
+    # ids is what caused the 402s: "Free users cannot use library voices via the API". We now ask
+    # the account which voices it can actually use.
 ]
+
+
+# ── ElevenLabs: ask the ACCOUNT what it can actually use (never assume) ───────────────
+_ELEVEN_CACHE: dict = {"at": 0.0, "voices": []}
+_ELEVEN_TTL = 600.0
+
+
+def _eleven_voices() -> list:
+    """The voices THIS ElevenLabs account can actually synthesize with.
+
+    Free tier cannot call public Voice-Library voices via the API (402 Payment Required) — so a
+    hardcoded id list is worse than useless, it silently swaps the user's voice. GET /v1/voices
+    returns exactly what the key is entitled to; we offer only those."""
+    if not settings.elevenlabs_api_key:
+        return []
+    now = time.time()
+    if _ELEVEN_CACHE["voices"] and now - _ELEVEN_CACHE["at"] < _ELEVEN_TTL:
+        return _ELEVEN_CACHE["voices"]
+    out = []
+    try:
+        r = requests.get("https://api.elevenlabs.io/v1/voices",
+                         headers={"xi-api-key": settings.elevenlabs_api_key}, timeout=30)
+        if r.status_code == 200:
+            for v in (r.json() or {}).get("voices", []):
+                vid, name = v.get("voice_id"), v.get("name")
+                if not vid or not name:
+                    continue
+                labels = v.get("labels") or {}
+                g = (labels.get("gender") or "").lower()
+                age = (labels.get("age") or "").lower()
+                band = ("under35" if "young" in age else
+                        "55plus" if "old" in age else
+                        "45-55" if "middle" in age else "35-44")
+                out.append({"id": f"elevenlabs:{vid}", "name": name, "provider": "elevenlabs",
+                            "gender": "male" if g.startswith("m") else "female",
+                            "age_band": band,
+                            "style": (labels.get("description") or labels.get("use_case") or "natural")})
+            logger.info(f"elevenlabs: {len(out)} voices available to this account")
+        else:
+            logger.warning(f"elevenlabs /voices {r.status_code}: {r.text[:160]} — disabling ElevenLabs voices")
+    except Exception as e:
+        logger.warning(f"elevenlabs voice list failed: {e}")
+    _ELEVEN_CACHE.update({"at": now, "voices": out})
+    return out
 
 # ElevenLabs default public voice ids (used only when 11labs is the chosen/last provider)
 _ELEVEN_DEFAULTS = {"female": "21m00Tcm4TlvDq8ikWAM", "male": "TxGEqnHWrfWFTfGW9XjX"}
@@ -95,7 +135,7 @@ def available_providers() -> set:
     if settings.openai_api_key:     p.add("openai")
     if settings.gemini_api_key:     p.add("gemini")
     if settings.deepgram_api_key:   p.add("deepgram")
-    if settings.elevenlabs_api_key: p.add("elevenlabs")
+    if settings.elevenlabs_api_key and _eleven_voices(): p.add("elevenlabs")
     if settings.fal_key or settings.fal_api_key: p.add("fal-clone")   # F5-TTS zero-shot cloning
     if settings.replicate_usable:   p.add("kokoro")
     if settings.chatterbox_api_url or settings.replicate_usable: p.add("chatterbox")
@@ -110,7 +150,7 @@ def clone_available() -> bool:
 
 
 def _by_id(voice_id: str) -> Optional[dict]:
-    for v in VOICE_CATALOG:
+    for v in VOICE_CATALOG + _eleven_voices():
         if v["id"] == voice_id:
             return v
     return None
@@ -121,7 +161,8 @@ def list_voices(cloned: Optional[list] = None, only_available: bool = False) -> 
     only_available=True hides voices whose provider key isn't configured (so the picker
     never offers a voice that would silently fall back to a different one)."""
     avail = available_providers() if only_available else None
-    out = [{**v, "cloned": False} for v in VOICE_CATALOG
+    pool = VOICE_CATALOG + _eleven_voices()     # ElevenLabs comes from the account, not a hardcoded list
+    out = [{**v, "cloned": False} for v in pool
            if not avail or v.get("provider") in avail]
     for c in (cloned or []):
         out.append({"id": c.get("id") or f"chatterbox:{c.get('voice_id')}", "name": c.get("name", "Cloned"),
@@ -402,7 +443,7 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
         if provider == prov and native:
             return native
         best, best_s = None, -1
-        for c in VOICE_CATALOG:
+        for c in VOICE_CATALOG + _eleven_voices():
             if c.get("provider") != prov or c.get("auto_cast") is False:
                 continue
             s = (5 if c.get("gender") == want_gender else 0) + (3 if c.get("age_band") == want_age else 0)
@@ -432,7 +473,10 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
             elif prov == "deepgram":
                 res = _syn_deepgram(text, _native_for("deepgram") or "aura-2-hera-en", out_path)
             elif prov == "elevenlabs":
-                res = _syn_elevenlabs(text, _native_for("elevenlabs") or _ELEVEN_DEFAULTS["female"], out_path)
+                ev = _native_for("elevenlabs") or ((_eleven_voices() or [{}])[0].get("id", ":").split(":", 1)[-1])
+                if not ev:
+                    raise RuntimeError("no ElevenLabs voice available to this account")
+                res = _syn_elevenlabs(text, ev, out_path)
             else:
                 continue
             res["path"] = out_path
