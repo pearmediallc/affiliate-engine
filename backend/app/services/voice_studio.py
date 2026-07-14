@@ -86,13 +86,17 @@ def available_providers() -> set:
     if settings.openai_api_key:     p.add("openai")
     if settings.deepgram_api_key:   p.add("deepgram")
     if settings.elevenlabs_api_key: p.add("elevenlabs")
+    if settings.fal_key or settings.fal_api_key: p.add("fal-clone")   # F5-TTS zero-shot cloning
     if settings.replicate_usable:   p.add("kokoro")
     if settings.chatterbox_api_url or settings.replicate_usable: p.add("chatterbox")
     return p
 
 
 def clone_available() -> bool:
-    return bool(settings.chatterbox_api_url or settings.replicate_usable)
+    """Can we actually clone the character's voice? fal (F5-TTS) does this on the key we already
+    have — so cloning does NOT require Replicate. sync.so can't clone at all; it's lip-sync only."""
+    return bool(settings.fal_key or settings.fal_api_key
+                or settings.chatterbox_api_url or settings.replicate_usable)
 
 
 def _by_id(voice_id: str) -> Optional[dict]:
@@ -144,6 +148,35 @@ def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
         return scored[0][1]
     # nothing configured at all — fall back to the catalog default rather than crashing
     return _by_id("openai:nova") or {"id": "kokoro:af_sarah", "provider": "kokoro"}
+
+
+# ── fal voice CLONE (F5-TTS) ──────────────────────────────────────────────────
+# Zero-shot voice cloning from the character's OWN footage: give it a reference clip + our
+# script, it speaks the script in that person's voice. Runs on the FAL key we already pay for —
+# no Replicate, no Chatterbox host. sync.so cannot do this (it is lip-sync only).
+FAL_CLONE_MODEL = os.getenv("FAL_CLONE_MODEL", "fal-ai/f5-tts")
+
+
+def _syn_fal_clone(text: str, out_path: str, sample_url: str, ref_text: Optional[str] = None) -> dict:
+    key = settings.fal_key or settings.fal_api_key
+    if not key:
+        raise RuntimeError("no fal key")
+    if not sample_url:
+        raise RuntimeError("fal clone needs a reference audio sample")
+    payload = {"gen_text": text[:5000], "ref_audio_url": sample_url,
+               "model_type": "F5-TTS", "remove_silence": True}
+    if ref_text:
+        payload["ref_text"] = ref_text[:2000]   # else fal ASRs the reference itself
+    r = requests.post(f"https://fal.run/{FAL_CLONE_MODEL}",
+                      headers={"Authorization": f"Key {key}", "Content-Type": "application/json"},
+                      json=payload, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"fal clone {r.status_code}: {r.text[:200]}")
+    url = ((r.json() or {}).get("audio_url") or {}).get("url")
+    if not url:
+        raise RuntimeError("fal clone returned no audio")
+    _dl(url, out_path)
+    return {"provider": "fal-clone", "voice": "cloned from character", "cost_usd": 0.02}
 
 
 # ── Replicate helper (synchronous via Prefer: wait) ───────────────────────────
@@ -266,7 +299,8 @@ def _syn_elevenlabs(text: str, voice_id: str, out_path: str) -> dict:
 
 def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[str] = None,
                style: Optional[str] = None, sample_url: Optional[str] = None,
-               cloned: Optional[list] = None, fallback_voice_id: Optional[str] = None) -> dict:
+               cloned: Optional[list] = None, fallback_voice_id: Optional[str] = None,
+               ref_text: Optional[str] = None) -> dict:
     """
     Synthesize `text` in the chosen voice, cheapest-first with automatic fallback.
     - voice_id like 'kokoro:af_sarah' / 'openai:nova' / 'deepgram:aura-2-hera-en'
@@ -287,11 +321,13 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
                 break
 
     provider = (v or {}).get("provider")
-    # explicit clone request: voice_id 'chatterbox:*' or a raw sample → route to chatterbox
-    if not provider and voice_id and voice_id.startswith("chatterbox"):
-        provider = "chatterbox"
+    # A clone request = "speak MY script in THIS person's voice", i.e. a reference sample.
+    # Prefer fal (F5-TTS) — it clones on the key we already pay for. Chatterbox/Replicate only
+    # if fal isn't configured.
+    if not provider and voice_id and voice_id.startswith(("chatterbox", "fal-clone")):
+        provider = "fal-clone" if (settings.fal_key or settings.fal_api_key) else "chatterbox"
     if not provider and sample_url:
-        provider = "chatterbox"
+        provider = "fal-clone" if (settings.fal_key or settings.fal_api_key) else "chatterbox"
     # a voice_id like 'elevenlabs:<id>' / 'deepgram:<model>' explicitly names the provider
     if not provider and voice_id and ":" in voice_id:
         pref = voice_id.split(":", 1)[0]
@@ -333,7 +369,9 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
     errors = []
     for prov in order:
         try:
-            if prov == "chatterbox":
+            if prov == "fal-clone":
+                res = _syn_fal_clone(text, out_path, sample_url=sample_url, ref_text=ref_text)
+            elif prov == "chatterbox":
                 res = _syn_chatterbox(text, out_path, voice_name=_native_for("chatterbox"),
                                       sample_url=sample_url, style=style)
             elif prov == "kokoro":

@@ -2661,8 +2661,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         try:
             raw = await _download_to_temp(char_url, ".mp4")
             wav = raw.rsplit(".", 1)[0] + ".wav"
+            # F5-TTS wants a clean ~10-15s reference of the person actually speaking
             await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
             sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
+            # the clone model fetches this itself — our bucket is private, so presign it
+            sample_url = StorageService.presign_url(sample_url) or sample_url
         except Exception as e:
             logger.warning(f"voice-clone sample extract failed, using preset: {e}")
     # ALWAYS cast a gender/age/tone-correct preset. It's the voice we speak with directly, AND the
@@ -2672,9 +2675,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone")).get("id")
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
-        script, voice_id=("chatterbox:character" if sample_url else voice_id),
+        script, voice_id=("fal-clone:character" if sample_url else voice_id),
         sample_url=sample_url, out_path=out_audio, style="casual, warm, conversational",
-        fallback_voice_id=voice_id))
+        fallback_voice_id=voice_id,
+        # what the character actually SAYS in the reference clip — improves clone fidelity
+        ref_text=(a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
     # Fit the VO to the requested length (and under sync.so's 20s free cap): gently speed it up
@@ -2773,7 +2778,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     _set_lipsync_status(req.request_id, "done")
     # auto-feedback statement for THIS generation (shown per video). Report what ACTUALLY happened —
     # a clone that fell back to a preset must not still claim "cloned from character".
-    _cloned = voice_res.get("provider") == "chatterbox"
+    _cloned = voice_res.get("provider") in ("fal-clone", "chatterbox")
     _swapped = voice_res.get("fallback") and voice_res.get("requested")
     fb = ("Reused real library footage · "
           f"voice {voice_res.get('provider')}:{voice_res.get('voice')}"
