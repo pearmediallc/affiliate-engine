@@ -958,6 +958,35 @@ async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)
         return {"success": True, "intent": {}}
 
 
+@router.post("/learn/roi")
+async def learn_roi(payload: dict, _auth: bool = Depends(require_service_key)):
+    """Close the loop: stitch platform ROI onto the decisions for a delivered creative.
+    body: {creative_ref, roi}  (or {items:[{creative_ref, roi}]}). This is the objective metric
+    the loop optimizes — set from the ad platform, never by a model."""
+    from ..database import SessionLocal
+    from ..services import learning_loop as learn
+    items = payload.get("items") or ([payload] if payload.get("creative_ref") else [])
+    db = SessionLocal()
+    try:
+        n = sum(learn.attach_roi(db, it["creative_ref"], float(it.get("roi") or 0))
+                for it in items if it.get("creative_ref"))
+        return {"success": True, "updated_rows": n}
+    finally:
+        db.close()
+
+
+@router.get("/learn/summary")
+async def learn_summary(vertical: str = "", _auth: bool = Depends(require_service_key)):
+    """What the brain has learned — voice/character/model win-rates by ROI. Proof it's learning."""
+    from ..database import SessionLocal
+    from ..services import learning_loop as learn
+    db = SessionLocal()
+    try:
+        return {"success": True, "vertical": vertical or "all", "summary": learn.summary(db, vertical or None)}
+    finally:
+        db.close()
+
+
 @router.get("/costs")
 async def creation_costs(request_id: str = "", _auth: bool = Depends(require_service_key)):
     """Per-creation spend breakdown: total + by provider + by step. Drives the credit UI."""
@@ -2747,8 +2776,22 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # ALWAYS cast a gender/age/tone-correct preset. It's the voice we speak with directly, AND the
     # fallback if the clone can't run — so a female character can never land on a male/androgynous
     # voice just because Chatterbox/Replicate was unavailable.
+    # LEARNING: bias the pick toward voices that have actually earned ROI in this vertical. Empty
+    # until data exists (cold start = today's behavior unchanged).
+    _vscores = {}
+    try:
+        from ..services import learning_loop as learn
+        from ..database import SessionLocal
+        _ldb = SessionLocal()
+        try:
+            _vscores = learn.voice_scores(_ldb, vertical or None)
+        finally:
+            _ldb.close()
+    except Exception:
+        _vscores = {}
     voice_id = a.get("voice_id") or vs.pick_voice(
-        gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone")).get("id")
+        gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone"),
+        roi_scores=_vscores).get("id")
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
     # TELL the model who is speaking. Casting a "55plus" voice is not enough on its own — the
     # delivery has to be directed too, or a 70-year-old woman on screen is read by a bright
@@ -2804,6 +2847,22 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # our bucket is private → presign so sync.so/fal/Replicate can actually fetch the audio
     audio_url = StorageService.presign_url(audio_url) or audio_url
     act.finish("character", req.request_id, t1, detail=f"voice={voice_res.get('provider')} (fallback={voice_res.get('fallback')})")
+
+    # ── VERIFIER GATE (deterministic, no LLM) — the money is spent at lip-sync, so a slow/mismatched
+    # voice must be caught HERE, not shipped. This is the loop's gate; it never edits itself.
+    _vmeta = next((v for v in vs.list_voices() if v.get("id") == voice_id), {})
+    from ..services import creative_qc as qc
+    _qc = qc.verify_pre_lipsync(
+        script=script, vo_seconds=vo_sec,
+        voice_gender=_vmeta.get("gender"), voice_age=_vmeta.get("age_band"),
+        char_gender=a.get("gender"), char_age=a.get("age_band"),
+        offer_value=offer_value or None)
+    if not _qc["ok"]:
+        logger.error(f"[qc] BLOCKED before lip-sync ({req.request_id}): {_qc['reasons']}")
+        _set_lipsync_status(req.request_id, "failed", "QC: " + "; ".join(_qc["reasons"])[:250])
+        raise RuntimeError("creative QC failed before render: " + "; ".join(_qc["reasons"]))
+    if _qc["reasons"]:
+        logger.warning(f"[qc] warnings ({req.request_id}): {_qc['reasons']}")
 
     # ── THE FOOTAGE MUST COVER THE VOICE ──────────────────────────────────────────────────────
     # If the character's clip is shorter than the VO, the lip-sync output gets cut off — that is
@@ -2900,6 +2959,26 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                     "voice_swapped": bool(_swapped), "voice_requested": voice_res.get("requested"),
                     "captions": bool(ass_path or _use_veed), "caption_method": _cap_method,
                     "whats_changed": fb, "feedback": fb})
+
+    # ── STATE: log every choice so the loop can learn from ROI later ──
+    try:
+        from ..services import learning_loop as learn
+        from ..database import SessionLocal
+        _db = SessionLocal()
+        try:
+            learn.log_decision(
+                _db, request_id=req.request_id, vertical=(vertical or None),
+                creative_ref=name,   # delivered filename → the key ROI joins back on
+                character_key=(a.get("character_asset_id") or a.get("source_filename") or char_url),
+                character_gender=a.get("gender"), character_age=a.get("age_band"),
+                voice_id=voice_id, voice_provider=voice_res.get("provider"),
+                voice_cloned=_cloned, lipsync_provider=sub["provider"],
+                script_ref=(a.get("script_ref") or None), captions=bool(ass_path or _use_veed),
+                qc_passed=True, cost_usd=float(_lip_cost or 0))
+        finally:
+            _db.close()
+    except Exception as e:
+        logger.warning(f"[learn] decision log skipped: {e}")
     return [variant]
 
 

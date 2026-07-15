@@ -86,3 +86,33 @@ class CreationCost(Base):
     cost_usd = Column(Float, default=0.0)
     note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CreativeDecision(Base):
+    """The learning STATE — one row per creative recording every CHOICE the engine made
+    (character, voice, model, script, whether QC passed). ROI is stitched in later from the ad
+    platform, keyed by creative_ref. The brain ranks future picks by the ROI these rows accrue —
+    so it stops repeating what loses. Append-only; the brain reads AGGREGATES, never raw history,
+    so it never bloats a prompt."""
+    __tablename__ = "creative_decisions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id = Column(String, index=True)
+    creative_ref = Column(String, index=True, nullable=True)   # delivered filename → join to ROI
+    vertical = Column(String, index=True, nullable=True)
+    character_key = Column(String, index=True, nullable=True)  # source clip / asset id (not the name token)
+    character_gender = Column(String, nullable=True)
+    character_age = Column(String, nullable=True)
+    voice_id = Column(String, index=True, nullable=True)
+    voice_provider = Column(String, nullable=True)
+    voice_cloned = Column(Boolean, default=False)
+    lipsync_provider = Column(String, nullable=True)
+    video_model = Column(String, nullable=True)
+    script_ref = Column(String, nullable=True)
+    captions = Column(Boolean, default=False)
+    qc_passed = Column(Boolean, default=True)
+    qc_reasons = Column(Text, nullable=True)
+    cost_usd = Column(Float, default=0.0)
+    roi = Column(Float, nullable=True)          # filled in later from the platform
+    roi_updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

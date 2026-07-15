@@ -9,7 +9,7 @@ from .job import Job
 from .audit_log import AuditLog
 from .campaign import Character, SceneSetting, Campaign, Shot, Variation
 from .harness import GenerationEvent, UserPromptProfile
-from .creative_team import CreativeTeamEvent
+from .creative_team import CreativeTeamEvent, CreativeDecision
 
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",

@@ -199,7 +199,7 @@ def age_style(age_band: str | None, gender: str | None = None) -> str:
 
 def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
                style: Optional[str] = None, cloned: Optional[list] = None,
-               tone: Optional[str] = None) -> dict:
+               tone: Optional[str] = None, roi_scores: Optional[dict] = None) -> dict:
     """Brain casting: best catalog match among voices we can ACTUALLY synthesize.
     Default bias = 45-55 woman (house rule). `tone` is the script's register
     (e.g. "serious, informational" / "upbeat") so the voice matches the writing."""
@@ -218,6 +218,9 @@ def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
             s += 2 * sum(1 for w in set(want.replace(",", " ").split()) if len(w) > 3 and w in vstyle)
         if v.get("provider") in ("elevenlabs", "openai", "deepgram"): s += 1   # avoid Replicate for auto-cast
         if v.get("cloned"): s += 2                     # prefer our own cloned voices when present
+        # LEARNED bias: a voice that has earned ROI gets up to +2. Bounded so it TIE-BREAKS among
+        # gender/age-correct voices — it can never override a gender match (+5). Zero at cold start.
+        s += 2 * float((roi_scores or {}).get(v.get("id"), 0) or 0)
         scored.append((s, v))
     scored.sort(key=lambda x: x[0], reverse=True)
     if scored:
