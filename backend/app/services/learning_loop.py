@@ -136,3 +136,34 @@ def summary(db, vertical: Optional[str] = None) -> dict:
         "characters": _rank(db, "character_key", vertical),
         "models": _rank(db, "video_model", vertical),
     }
+
+
+def decisions_for_job(db, request_id: str) -> list:
+    """What the Learner recorded for ONE job (request_id) — the per-job learning signal:
+    the QC gate result, the ROI once the platform reports it, and the human's verdict, plus
+    the casting/voice/model choices those outcomes attach to. Read-only; never raises."""
+    try:
+        from ..models.creative_team import CreativeDecision
+        rows = (db.query(CreativeDecision)
+                  .filter(CreativeDecision.request_id == request_id)
+                  .order_by(CreativeDecision.created_at.asc()).all())
+        out = []
+        for r in rows:
+            label = _label(r)   # 1 = win, 0 = loss, None = no outcome yet
+            out.append({
+                "creative_ref": r.creative_ref, "vertical": r.vertical,
+                "qc_passed": r.qc_passed, "qc_reasons": r.qc_reasons,
+                "roi": r.roi, "roi_updated_at": r.roi_updated_at.isoformat() if r.roi_updated_at else None,
+                "human_verdict": r.human_verdict, "human_reason": r.human_reason,
+                "verdict_at": r.verdict_at.isoformat() if r.verdict_at else None,
+                "outcome": ("win" if label == 1 else "loss" if label == 0 else "pending"),
+                "voice_id": r.voice_id, "voice_provider": r.voice_provider, "voice_cloned": r.voice_cloned,
+                "character_key": r.character_key, "character_gender": r.character_gender,
+                "character_age": r.character_age, "video_model": r.video_model,
+                "cost_usd": r.cost_usd,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return out
+    except Exception as e:
+        logger.warning(f"[learn] decisions_for_job failed: {e}")
+        return []

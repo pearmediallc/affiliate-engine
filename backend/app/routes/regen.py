@@ -1192,6 +1192,21 @@ async def creative_team_audit(job_id: str = "", persona: str = "", limit: int = 
     return {"success": True, **act.audit(job_id or None, persona or None, limit)}
 
 
+@router.get("/creative-team/decision")
+async def creative_team_decision(job_id: str = "", _auth: bool = Depends(require_service_key)):
+    """What the LEARNER recorded for one job (job_id = request_id): the per-job learning signal —
+    QC gate result, ROI (once the platform reports it), the human verdict, and the casting/voice/model
+    choices those outcomes attach to. Read-only surface over CreativeDecision (no new computation)."""
+    from ..services import learning_loop as learn
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        rows = learn.decisions_for_job(db, job_id) if job_id else []
+    finally:
+        db.close()
+    return {"success": True, "job_id": job_id or None, "count": len(rows), "decisions": rows}
+
+
 @router.post("/creative-team/grade")
 async def creative_team_grade(payload: dict, _auth: bool = Depends(require_service_key)):
     """Grade a LIVE creative's real metrics against the team model (ROI, $500 gate, offer-CR,
@@ -1810,9 +1825,24 @@ async def recipe_script_rewrite(req: RunRequest) -> list:
         # clone the spokesperson's voice from a sample of the original audio
         sample = os.path.join(work, "sample.mp3")
         await asyncio.to_thread(_ffmpeg, ["-i", orig, "-t", "45", "-vn", "-ac", "1", "-ar", "22050", "-b:a", "96k", sample])
-        voice_id = await asyncio.to_thread(ElevenLabsService.clone_voice, sample, f"regen-{req.request_id[:8]}")
         vo = os.path.join(work, "vo.mp3")
-        await asyncio.to_thread(ElevenLabsService.tts, voice_id, new_script, vo)
+        cloned_ok = False
+        try:
+            voice_id = await asyncio.to_thread(ElevenLabsService.clone_voice, sample, f"regen-{req.request_id[:8]}")
+            await asyncio.to_thread(ElevenLabsService.tts, voice_id, new_script, vo)
+            cloned_ok = True
+        except Exception as ce:
+            # Cloning must NEVER kill the generation (401 Unauthorized / 402 quota / network /
+            # any error). Fall back to a gender/age-matched preset voice — the same brain-casting
+            # used everywhere else — and keep the job going. Log a warning for visibility.
+            logger.warning(f"voice clone failed ({ce}) — falling back to a matched preset voice")
+            from ..services import voice_studio as _vs
+            ctx = req.context or {}
+            char = ctx.get("character") or {}
+            picked = _vs.pick_voice(gender=ctx.get("gender") or char.get("gender"),
+                                    age_band=ctx.get("age_band") or char.get("age_band"),
+                                    tone=(req.context.get("diagnosis", {}) or {}).get("directive_hint"))
+            await asyncio.to_thread(_vs.synthesize, new_script, voice_id=picked.get("id"), out_path=vo)
 
         name, out_path, url = _out_url(req, "script")
         # lay the new VO over the original visuals; length = the new VO
@@ -1820,8 +1850,11 @@ async def recipe_script_rewrite(req: RunRequest) -> list:
             ["-i", orig, "-i", vo, "-map", "0:v:0", "-map", "1:a:0", "-shortest",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-pix_fmt", "yuv420p",
              "-threads", "2", "-c:a", "aac", "-b:a", "192k", out_path], timeout=900)
-        return [{"recipe": "Script (rewrite, cloned voice)", "video_url": url, "confidence": 0.65,
-                 "whats_changed": "Rewrote the script + re-voiced it in the spokesperson's cloned voice over the original visuals."}]
+        return [{"recipe": "Script (rewrite, cloned voice)" if cloned_ok else "Script (rewrite, matched voice)",
+                 "video_url": url, "confidence": 0.65 if cloned_ok else 0.6,
+                 "whats_changed": ("Rewrote the script + re-voiced it in the spokesperson's cloned voice over the original visuals."
+                                   if cloned_ok else
+                                   "Rewrote the script + re-voiced it in a gender/age-matched voice (clone unavailable) over the original visuals.")}]
     finally:
         try:
             from ..services.elevenlabs_service import ElevenLabsService as _E
