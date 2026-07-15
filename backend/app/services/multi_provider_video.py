@@ -438,10 +438,39 @@ class MultiProviderVideoService:
         duration: int = 6,
         s3_prefix: Optional[str] = None,
     ) -> dict:
-        model_id = _pick_model(shot_type, preferred_model)
-        provider = _model_provider(model_id)
-        logger.info(f"Generating shot type={shot_type} model={model_id} provider={provider} duration={duration}s prefix={s3_prefix}")
+        # Ordered failover: the chosen model first, then the other configured candidates
+        # for this shot type. A single provider erroring (401/402/429/5xx/timeout) must not
+        # sink the shot — we step to the next provider and only raise if every one fails.
+        primary = _pick_model(shot_type, preferred_model)
+        available = _available_keys()
+        seen, ordered = set(), []
+        for m in [primary] + [c for c in _ROUTING.get(shot_type, _ROUTING["b_roll"]) if _model_provider(c) in available]:
+            if m not in seen:
+                seen.add(m); ordered.append(m)
 
+        last_err: Optional[Exception] = None
+        for i, model_id in enumerate(ordered):
+            provider = _model_provider(model_id)
+            try:
+                logger.info(f"Generating shot type={shot_type} model={model_id} provider={provider} duration={duration}s prefix={s3_prefix}"
+                            + (f" (fallback #{i})" if i else ""))
+                return MultiProviderVideoService._generate_one(
+                    model_id, provider, prompt, image_path, image_url,
+                    reference_video_urls, reference_image_urls, duration, s3_prefix)
+            except Exception as e:
+                last_err = e
+                more = i + 1 < len(ordered)
+                logger.warning(f"video gen via {model_id}/{provider} failed ({e})"
+                               + (" — trying next provider" if more else " — no providers left"))
+        raise last_err or RuntimeError("No video generation provider available")
+
+    @staticmethod
+    def _generate_one(
+        model_id: str, provider: str, prompt: str,
+        image_path: Optional[str], image_url: Optional[str],
+        reference_video_urls: Optional[list], reference_image_urls: Optional[list],
+        duration: int, s3_prefix: Optional[str],
+    ) -> dict:
         if provider == "google":
             fast = "fast" in model_id
             return _generate_veo(prompt, image_path, duration, fast=fast)

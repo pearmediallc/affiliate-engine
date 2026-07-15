@@ -56,10 +56,25 @@ class TranscriptionService:
         Returns:
             Dictionary with transcription, language, and metadata
         """
-        if provider == "deepgram":
-            return await self._transcribe_deepgram(audio_file_path, language)
-        else:
-            return await self._transcribe_openai(audio_file_path, language)
+        # Try the requested provider, then fall back to the other one if it's configured.
+        # A single provider erroring (bad key / quota / 5xx / timeout) must never kill a
+        # transcription that another provider can complete.
+        order = ["deepgram", "openai"] if provider == "deepgram" else ["openai", "deepgram"]
+        keyed = {"openai": bool(self.openai_key), "deepgram": bool(self.deepgram_key)}
+        tried = [p for p in order if keyed.get(p)]
+        last_err: Optional[Exception] = None
+        for p in tried:
+            try:
+                if p == "deepgram":
+                    return await self._transcribe_deepgram(audio_file_path, language)
+                return await self._transcribe_openai(audio_file_path, language)
+            except Exception as e:
+                last_err = e
+                logger.warning(f"transcription via {p} failed ({e}); trying next provider")
+        # No provider configured, or all configured providers failed.
+        if last_err:
+            raise last_err
+        raise ValueError("No transcription provider configured (set OPENAI_API_KEY or DEEPGRAM_API_KEY)")
 
     async def _transcribe_openai(
         self,
