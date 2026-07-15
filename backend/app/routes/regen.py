@@ -1224,6 +1224,72 @@ async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_ser
         return {"success": True, "text": prompt, "mode": mode, "fallback": True}
 
 
+@router.post("/studio/route")
+async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)):
+    """ChatGPT-style Studio router. Given the recent thread history + the new message, classify into
+    ONE strict-JSON action AND (for write actions) produce the content inline, so Node needs a single
+    round-trip. Always degrades to a plain reply on any failure."""
+    history = payload.get("history") or []
+    message = (payload.get("message") or "").strip()
+    vertical = payload.get("vertical") or ""
+    if not message:
+        return {"action": "reply", "text": "What would you like to make?"}
+    lines = []
+    for h in history[-20:]:
+        role = h.get("role") or "user"
+        kind = h.get("kind") or "text"
+        txt = (h.get("text") or "").replace("\n", " ")[:300]
+        tag = f"[{kind}]" if kind and kind != "text" else ""
+        lines.append(f"{role}{tag}: {txt}")
+    hist_text = "\n".join(lines) or "(empty)"
+    ask = (
+        "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
+        "then output ONE strict-JSON action. Prefer acting over asking — only ask when genuinely ambiguous.\n\n"
+        f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
+        f"DEFAULT VERTICAL: {vertical or 'general'}\n\n"
+        "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
+        "1) write_script — user wants script(s)/variations/hooks for a video ad:\n"
+        '   {"action":"write_script","vertical":"<vertical>","count":N,"scripts":[{"title":"...","text":"..."}]}\n'
+        "   Each script.text = a complete spoken UGC ad script (the spoken lines only, no scene labels). Cap N at 5.\n"
+        "2) write_ad_copy — user wants ad copy / primary text / captions:\n"
+        '   {"action":"write_ad_copy","count":N,"ad_copies":[{"title":"...","text":"..."}]}  Cap N at 5.\n'
+        "3) make_video — user wants to make/generate a video/creative/clip:\n"
+        '   {"action":"make_video","source":"last_script|last_ad_copy|none","prompt":"...","seconds":15}\n'
+        "   If the user references a prior script (e.g. \"make a video from that script\"), set source=\"last_script\" "
+        "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
+        "4) make_image — user wants a still image/poster/photo:\n"
+        '   {"action":"make_image","prompt":"..."}\n'
+        "5) reply — conversational, a question, or ambiguous:\n"
+        '   {"action":"reply","text":"..."}\n'
+    )
+    try:
+        out = await _gemini_json(ask)
+        action = str(out.get("action") or "reply").lower()
+        if action == "write_script":
+            scripts = [s for s in (out.get("scripts") or []) if (s.get("text") or "").strip()][:5]
+            if not scripts:
+                return {"action": "reply", "text": "I couldn't draft that — name the product or vertical and I'll write the scripts."}
+            return {"action": "write_script", "vertical": out.get("vertical") or vertical,
+                    "count": len(scripts), "scripts": scripts}
+        if action == "write_ad_copy":
+            copies = [c for c in (out.get("ad_copies") or []) if (c.get("text") or "").strip()][:5]
+            if not copies:
+                return {"action": "reply", "text": "I couldn't draft that — tell me the product and I'll write the ad copy."}
+            return {"action": "write_ad_copy", "count": len(copies), "ad_copies": copies}
+        if action == "make_video":
+            src = str(out.get("source") or "none").lower()
+            if src not in ("last_script", "last_ad_copy", "none"):
+                src = "none"
+            return {"action": "make_video", "source": src,
+                    "prompt": (out.get("prompt") or message).strip(), "seconds": int(out.get("seconds") or 15)}
+        if action == "make_image":
+            return {"action": "make_image", "prompt": (out.get("prompt") or message).strip()}
+        return {"action": "reply", "text": (out.get("text") or "Tell me what you'd like to make.").strip()}
+    except Exception as e:
+        logger.warning(f"studio route failed: {e}")
+        return {"action": "reply", "text": "I hit a snag routing that — could you rephrase?"}
+
+
 @router.get("/creative-team/reports")
 async def creative_team_reports(_auth: bool = Depends(require_service_key)):
     """Per-persona performance ledger (durable, aggregated from Postgres): runs, accuracy,
