@@ -1460,6 +1460,7 @@ async def _execute(req: RunRequest):
         recipe = _RECIPES.get(vtype, recipe_special)
         variants = await recipe(req)
         ok = True
+        _ensure_cost_logged(req.request_id, vtype, len(variants or []))
         logger.info(f"[regen] JOB DONE id={req.request_id} type={vtype} variants={len(variants)}")
         await _callback(req.callback_url, {"request_id": req.request_id, "status": "ready", "variants": variants})
     except Cancelled as c:
@@ -2636,6 +2637,40 @@ async def recipe_generate(req: RunRequest) -> list:
 
 
 # ── Per-creation cost ledger (which provider cost what for each video/image) ──
+# Rough per-variant estimate when a recipe produced media but never itemized its spend — so NO
+# generation is invisible in the Team Room. Real per-provider rows (when logged) always win; this
+# only fills the gap. Video ~cheapest-lane seconds; ffmpeg-only recipes are near-free.
+_EST_COST = {
+    "Avatar/UGC": 0.10, "Avatar Lipsync": 0.10, "Create from Assets": 0.12, "Full Ad": 0.20,
+    "map + ugc": 0.10, "Broll": 0.06, "Stock Video": 0.02, "Generate Video": 0.10,
+    "Special Request": 0.10, "Generate Image": 0.04, "Image": 0.04, "Image + Voiceover": 0.06,
+    "Hook Change Only": 0.02, "Caption Change Only": 0.005, "Reclean/Minor Mod": 0.005, "Script": 0.001,
+}
+
+
+def _ensure_cost_logged(request_id, vtype, n_variants):
+    """Safety-net: if a completed job wrote NO cost rows, log an estimate so spend is never invisible."""
+    if not n_variants:
+        return
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreationCost
+        db = SessionLocal()
+        try:
+            has = db.query(CreationCost.id).filter(CreationCost.request_id == request_id).first()
+            if has:
+                return
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"cost safety-net check failed: {e}")
+        return
+    per = _EST_COST.get(vtype, 0.08)
+    _track_cost(request_id, "generation", "estimated", model=vtype,
+                units=n_variants, unit_type="variant", cost_usd=per * n_variants,
+                note="estimated — recipe did not itemize provider spend")
+
+
 def _track_cost(request_id, step, provider, *, model=None, units=None, unit_type=None, cost_usd=0.0, note=""):
     try:
         from ..database import SessionLocal
