@@ -36,6 +36,34 @@ def log_decision(db, **kw) -> None:
             pass
 
 
+def record_verdict(db, creative_ref: str, verdict: str, reason: str = "") -> int:
+    """The human's decision as a label (used wherever ROI is absent).
+    verdict='accepted' → win, 'regenerated'/'rejected' → loss."""
+    try:
+        from ..models.creative_team import CreativeDecision
+        from datetime import datetime
+        rows = db.query(CreativeDecision).filter(CreativeDecision.creative_ref == creative_ref).all()
+        for r in rows:
+            r.human_verdict = verdict
+            r.human_reason = (reason or "")[:500]
+            r.verdict_at = datetime.utcnow()
+        db.commit()
+        return len(rows)
+    except Exception as e:
+        logger.warning(f"[learn] record_verdict failed: {e}")
+        return 0
+
+
+def _label(r) -> Optional[int]:
+    """The training label for one decision, best-signal-first:
+       real ROI if we have it, else the human verdict. None = no signal yet (ignored)."""
+    if r.roi is not None:
+        return 1 if r.roi >= _WIN_ROI else 0
+    if r.human_verdict:
+        return 1 if r.human_verdict == "accepted" else 0
+    return None
+
+
 def attach_roi(db, creative_ref: str, roi: float) -> int:
     """Stitch platform ROI back onto the decision(s) for a delivered creative."""
     try:
@@ -63,21 +91,28 @@ def _wilson(wins: int, n: int) -> float:
 
 
 def _rank(db, column, vertical: Optional[str]) -> dict:
-    """{value: {n, wins, score}} for a decision column, over creatives that HAVE an ROI yet."""
+    """{value: {n, wins, score, signal}} for a decision column, over creatives that carry ANY
+    label — real ROI where we have it, the human verdict where we don't."""
     from ..models.creative_team import CreativeDecision
-    q = db.query(CreativeDecision).filter(CreativeDecision.roi.isnot(None))
+    from sqlalchemy import or_
+    q = db.query(CreativeDecision).filter(
+        or_(CreativeDecision.roi.isnot(None), CreativeDecision.human_verdict.isnot(None)))
     if vertical:
         q = q.filter(CreativeDecision.vertical == vertical)
     agg: dict = {}
     for r in q.all():
         v = getattr(r, column)
-        if not v:
+        lab = _label(r)
+        if not v or lab is None:
             continue
-        a = agg.setdefault(v, {"n": 0, "wins": 0})
+        a = agg.setdefault(v, {"n": 0, "wins": 0, "roi_n": 0})
         a["n"] += 1
-        a["wins"] += 1 if (r.roi or 0) >= _WIN_ROI else 0
+        a["wins"] += lab
+        if r.roi is not None:
+            a["roi_n"] += 1
     for v, a in agg.items():
         a["score"] = round(_wilson(a["wins"], a["n"]), 4)
+        a["signal"] = "roi" if a["roi_n"] == a["n"] else ("mixed" if a["roi_n"] else "human")
     return agg
 
 

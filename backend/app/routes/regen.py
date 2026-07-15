@@ -975,6 +975,23 @@ async def learn_roi(payload: dict, _auth: bool = Depends(require_service_key)):
         db.close()
 
 
+@router.post("/learn/verdict")
+async def learn_verdict(payload: dict, _auth: bool = Depends(require_service_key)):
+    """The human's judgment as a label, used wherever ROI is absent.
+    body: {creative_ref, verdict: accepted|regenerated, reason?}"""
+    from ..database import SessionLocal
+    from ..services import learning_loop as learn
+    ref = payload.get("creative_ref"); verdict = payload.get("verdict")
+    if not ref or verdict not in ("accepted", "regenerated", "rejected"):
+        raise HTTPException(status_code=400, detail="creative_ref + verdict(accepted|regenerated) required")
+    db = SessionLocal()
+    try:
+        n = learn.record_verdict(db, ref, verdict, payload.get("reason") or "")
+        return {"success": True, "updated_rows": n}
+    finally:
+        db.close()
+
+
 @router.get("/learn/summary")
 async def learn_summary(vertical: str = "", _auth: bool = Depends(require_service_key)):
     """What the brain has learned — voice/character/model win-rates by ROI. Proof it's learning."""

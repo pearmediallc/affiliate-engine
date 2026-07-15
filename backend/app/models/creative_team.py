@@ -113,6 +113,11 @@ class CreativeDecision(Base):
     qc_passed = Column(Boolean, default=True)
     qc_reasons = Column(Text, nullable=True)
     cost_usd = Column(Float, default=0.0)
-    roi = Column(Float, nullable=True)          # filled in later from the platform
+    roi = Column(Float, nullable=True)          # filled in later from the platform (best signal)
     roi_updated_at = Column(DateTime, nullable=True)
+    # When no ROI is available, the human's decision IS the label: a media buyer accepting a
+    # creative as-is is a win; sending it back is a loss. verdict ∈ accepted | regenerated.
+    human_verdict = Column(String, nullable=True)
+    human_reason = Column(Text, nullable=True)
+    verdict_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
