@@ -211,19 +211,94 @@ def _eta(j: dict) -> Optional[int]:
     return int(max(0, j["expected_sec"] - (_now() - j["started"])))
 
 
+# ── DURABLE reconstruction (Postgres) ──────────────────────────────────────────
+# The room used to show ONLY in-memory jobs, so every past/completed generation's
+# team work log vanished after a restart. These read the durable creative_team_events
+# so the switcher lists past jobs and their desks/feed can be reconstructed on click.
+def _durable_events(limit_rows: int = 600) -> list:
+    """Recent events, newest first, as plain dicts (persona, event, detail, ms, job_id, at, ts)."""
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import CreativeTeamEvent as E
+        db = SessionLocal()
+        try:
+            rows = (db.query(E).filter(E.job_id.isnot(None))
+                      .order_by(E.created_at.desc()).limit(limit_rows).all())
+            return [{"persona": e.persona, "role": e.role, "event": e.event, "task": e.task,
+                     "detail": e.detail, "ms": e.ms, "job_id": e.job_id,
+                     "at": e.created_at.isoformat() if e.created_at else None,
+                     "ts": e.created_at.timestamp() if e.created_at else 0.0} for e in rows]
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"durable events read failed: {e}")
+        return []
+
+
+def _durable_jobs(limit_jobs: int = 20) -> list:
+    """Reconstruct a jobs-list from the durable timeline (finished jobs only — live ones
+    live in memory and take precedence in jobs_list)."""
+    evs = _durable_events()
+    by_job: dict = {}
+    for e in evs:   # newest-first
+        jid = e["job_id"]
+        g = by_job.setdefault(jid, {"job_id": jid, "label": jid, "status": "done",
+                                    "updated": e["ts"], "error": ""})
+        if e["event"] == "job_start" and e.get("detail"):
+            g["label"] = e["detail"]
+        elif e["event"] == "job_fail":
+            g["status"] = "failed"; g["error"] = (e.get("detail") or "")[:400]
+        # first (newest) occurrence sets updated; keep the max
+        g["updated"] = max(g["updated"], e["ts"])
+    out = [{**g, "progress": 100, "eta_sec": 0, "elapsed_sec": 0, "working": [], "durable": True}
+           for g in by_job.values()]
+    out.sort(key=lambda x: -x["updated"])
+    return out[:limit_jobs]
+
+
+def _durable_room(job_id: str) -> Optional[dict]:
+    """Rebuild ONE past job's desks + feed + status from the durable timeline, so clicking a
+    finished job in the switcher shows exactly what every persona did."""
+    evs = [e for e in _durable_events(1000) if e["job_id"] == job_id]
+    if not evs:
+        return None
+    evs_old_first = list(reversed(evs))
+    label, status, error = job_id, "done", ""
+    last_by_persona: dict = {}
+    for e in evs_old_first:
+        if e["event"] == "job_start" and e.get("detail"):
+            label = e["detail"]
+        elif e["event"] == "job_fail":
+            status = "failed"; error = (e.get("detail") or "")[:400]
+        if e["persona"] in _ROSTER_BY_ID and e["event"] in ("done", "fail", "revise"):
+            last_by_persona[e["persona"]] = (e.get("detail") or e.get("task") or "")[:200]
+    feed = [{"t": e["ts"], "persona": e["persona"], "event": e["event"],
+             "detail": (e.get("detail") or e.get("task") or "")[:200], "ms": e.get("ms")}
+            for e in evs][:60]
+    return {"label": label, "status": status, "error": error,
+            "last_by_persona": last_by_persona, "feed": feed}
+
+
 def jobs_list() -> list:
     with _LOCK:
         out = []
+        seen = set()
         for jid in list(_JOB_ORDER):
             j = _JOBS.get(jid)
             if not j:
                 continue
+            seen.add(jid)
             out.append({"job_id": jid, "label": j["label"], "status": j["status"],
                         "progress": _progress(j), "eta_sec": _eta(j), "error": j.get("error", ""),
                         "elapsed_sec": int(_now() - j["started"]), "updated": j["updated"],
                         "working": [p for p, st in j["personas"].items() if st["status"] == "working"]})
-        out.sort(key=lambda x: (x["status"] != "running", -x["updated"]))
-        return out
+    # merge in past jobs the memory no longer holds (survives restarts/deploys)
+    for dj in _durable_jobs():
+        if dj["job_id"] not in seen:
+            out.append(dj)
+            seen.add(dj["job_id"])
+    out.sort(key=lambda x: (x["status"] != "running", -x["updated"]))
+    return out
 
 
 def snapshot(job_id: Optional[str] = None) -> dict:
@@ -234,21 +309,35 @@ def snapshot(job_id: Optional[str] = None) -> dict:
             running = [x["job_id"] for x in jl if x["status"] == "running"]
             job_id = running[0] if running else (jl[0]["job_id"] if jl else None)
         j = _JOBS.get(job_id) if job_id else None
-        desks = []
-        for r in ROSTER:
-            st = (j["personas"][r["id"]] if j else {"status": "idle", "task": None, "since": None, "last": None})
-            desks.append({**r, "status": st["status"],
-                          "job_id": job_id if st["status"] == "working" else None,
-                          "task": st["task"],
-                          "busy_ms": int((_now() - st["since"]) * 1000) if st["since"] else 0,
-                          "queued": 0, "last": st["last"]})
-        return {"job_id": job_id, "label": (j["label"] if j else None),
-                "status": (j["status"] if j else "idle"), "error": (j.get("error", "") if j else ""),
-                "progress": (_progress(j) if j else 0), "eta_sec": (_eta(j) if j else None),
-                "elapsed_sec": (int(_now() - j["started"]) if j else 0),
-                "desks": desks, "feed": (list(j["feed"])[:60] if j else []),
-                "active_jobs": [x["job_id"] for x in jl if x["status"] == "running"],
-                "jobs": jl, "ts": _now()}
+        if j:
+            desks = []
+            for r in ROSTER:
+                st = j["personas"][r["id"]]
+                desks.append({**r, "status": st["status"],
+                              "job_id": job_id if st["status"] == "working" else None,
+                              "task": st["task"],
+                              "busy_ms": int((_now() - st["since"]) * 1000) if st["since"] else 0,
+                              "queued": 0, "last": st["last"]})
+            return {"job_id": job_id, "label": j["label"],
+                    "status": j["status"], "error": j.get("error", ""),
+                    "progress": _progress(j), "eta_sec": _eta(j),
+                    "elapsed_sec": int(_now() - j["started"]),
+                    "desks": desks, "feed": list(j["feed"])[:60],
+                    "active_jobs": [x["job_id"] for x in jl if x["status"] == "running"],
+                    "jobs": jl, "ts": _now()}
+    # not in memory → reconstruct from the durable timeline (a past/completed job)
+    room = _durable_room(job_id) if job_id else None
+    desks = []
+    for r in ROSTER:
+        last = (room["last_by_persona"].get(r["id"]) if room else None)
+        desks.append({**r, "status": "idle", "job_id": None, "task": None,
+                      "busy_ms": 0, "queued": 0, "last": last})
+    return {"job_id": job_id, "label": (room["label"] if room else None),
+            "status": (room["status"] if room else "idle"), "error": (room["error"] if room else ""),
+            "progress": (100 if room else 0), "eta_sec": 0, "elapsed_sec": 0,
+            "desks": desks, "feed": (room["feed"] if room else []),
+            "active_jobs": [x["job_id"] for x in jl if x["status"] == "running"],
+            "jobs": jl, "ts": _now()}
 
 
 # ── DURABLE audit (Postgres) ───────────────────────────────────────────────────
