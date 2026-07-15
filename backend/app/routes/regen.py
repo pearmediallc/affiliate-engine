@@ -604,20 +604,48 @@ Return ONLY JSON:
 }}"""
 
 
+async def _openai_json(prompt: str) -> dict:
+    """OpenAI strict-JSON fallback for _gemini_json (same JSON contract)."""
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    def _call() -> str:
+        from openai import OpenAI
+        oai = OpenAI(api_key=settings.openai_api_key)
+        resp = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content or "{}"
+    return json.loads(await asyncio.to_thread(_call))
+
+
 async def _gemini_json(prompt: str) -> dict:
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY not configured")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={settings.gemini_api_key}"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
-    }
-    async with httpx.AsyncClient(timeout=90) as c:
-        r = await c.post(url, json=body)
-        r.raise_for_status()
-        data = r.json()
-    txt = data["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(txt)
+    """Gemini → strict JSON, with an OpenAI fallback so a Gemini outage / quota /
+    401 / 429 / 5xx doesn't sink the recipe that calls it. Raises only if BOTH fail."""
+    try:
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY not configured")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={settings.gemini_api_key}"
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+        }
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+        txt = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(txt)
+    except Exception as ge:
+        try:
+            result = await _openai_json(prompt)
+            logger.warning(f"_gemini_json: Gemini failed ({ge}) — used OpenAI fallback")
+            return result
+        except Exception as oe:
+            logger.error(f"_gemini_json: Gemini ({ge}) and OpenAI fallback ({oe}) both failed")
+            raise ge
 
 
 @router.post("/seedance-test")
@@ -752,8 +780,30 @@ async def winners(vertical: str = "", limit: int = 12, _auth: bool = Depends(req
     """List competitor winners (scraper library) for a vertical — playable video_url + hook +
     score. Powers the Creative Library 'Scraper Winners' section."""
     from ..services import winner_library
-    return {"success": True, "vertical": vertical,
-            "winners": winner_library.fetch_winners(vertical, limit=limit)}
+    if vertical and vertical != "unknown":
+        wins = winner_library.fetch_winners(vertical, limit=limit)
+    else:
+        # "All verticals": the Creative Library default sends vertical="". fetch_winners is
+        # vertical-keyed and returns [] for an empty vertical, so without this the default view
+        # always showed 0 winners even when the library IS seeded. Fan out concurrently across the
+        # known verticals, then merge + rank by score. Still [] if the library is genuinely
+        # unseeded/unconfigured — this never fabricates winners.
+        vsets = ["home_insurance", "auto_insurance", "medicare", "final_expense",
+                 "bizop", "refinance", "life_insurance", "debt_relief"]
+        results = await asyncio.gather(
+            *[asyncio.to_thread(winner_library.fetch_winners, v, limit) for v in vsets],
+            return_exceptions=True)
+        seen, merged = set(), []
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            for w in res:
+                u = w.get("url")
+                if u and u not in seen:
+                    seen.add(u); merged.append(w)
+        merged.sort(key=lambda w: w.get("score") or 0, reverse=True)
+        wins = merged[:limit]
+    return {"success": True, "vertical": vertical, "winners": wins}
 
 
 @router.get("/winner-db-test")
@@ -1421,28 +1471,45 @@ async def recipe_avatar(req: RunRequest) -> list:
     else:
         raise RuntimeError("could not transcribe the original and no script directive given — refusing to generate unrelated content")
 
-    # avatar persona from the directive (de-hardcoded); sensible default for this vertical
-    avatar_id = await _pick_avatar(
-        age=(req.directive.get("avatar_age") or "elderly"),
-        gender=(req.directive.get("avatar_gender") or "female"),
-        region=(req.directive.get("avatar_region") or "namer"))
-    if not avatar_id:
-        raise RuntimeError("no matching avatar found")
-
-    # last credit-safety gate before the paid TikTok render
+    # last credit-safety gate before the paid TikTok render (kept OUTSIDE the fallback guard
+    # below so a real cancellation is never swallowed into a fallback).
     await _abort_if_cancelled(req, "avatar generation")
 
-    # one avatar render per request (deterministic for a given script)
-    loop = asyncio.get_event_loop()
-    created = await loop.run_in_executor(None, lambda: TikTokSymphonyService.create_avatar_video(
-        avatar_id=avatar_id, script=script, video_name=f"regen_{req.request_id[:8]}"
-    ))
-    task_id = (created.get("data", {}).get("list", [{}]) or [{}])[0].get("task_id")
-    if not task_id:
-        raise RuntimeError(f"avatar create returned no task_id: {created}")
-    url = await _poll_avatar(task_id)
-    if not url:
-        raise RuntimeError("avatar render timed out/failed")
+    # TikTok Symphony is the only synthetic-avatar provider. Wrap the whole render so a
+    # Symphony outage / quota / API error degrades to our real-footage lip-sync lane
+    # (when a character clip is available) instead of failing the entire job.
+    try:
+        # avatar persona from the directive (de-hardcoded); sensible default for this vertical
+        avatar_id = await _pick_avatar(
+            age=(req.directive.get("avatar_age") or "elderly"),
+            gender=(req.directive.get("avatar_gender") or "female"),
+            region=(req.directive.get("avatar_region") or "namer"))
+        if not avatar_id:
+            raise RuntimeError("no matching avatar found")
+
+        # one avatar render per request (deterministic for a given script)
+        loop = asyncio.get_event_loop()
+        created = await loop.run_in_executor(None, lambda: TikTokSymphonyService.create_avatar_video(
+            avatar_id=avatar_id, script=script, video_name=f"regen_{req.request_id[:8]}"
+        ))
+        task_id = (created.get("data", {}).get("list", [{}]) or [{}])[0].get("task_id")
+        if not task_id:
+            raise RuntimeError(f"avatar create returned no task_id: {created}")
+        url = await _poll_avatar(task_id)
+        if not url:
+            raise RuntimeError("avatar render timed out/failed")
+    except Exception as e:
+        char_url = (req.assets or {}).get("character_video_url") or getattr(req, "active_url", None)
+        if char_url:
+            logger.warning(f"TikTok Symphony avatar failed ({e}) — degrading to real-footage lip-sync lane")
+            try:
+                return await recipe_avatar_lipsync(req)
+            except Exception as e2:
+                logger.error(f"avatar lip-sync fallback also failed: {e2}")
+        raise RuntimeError(
+            f"Avatar render failed via TikTok Symphony ({e}) and no fallback path was available. "
+            f"Check TIKTOK_ACCESS_TOKEN / advertiser credits, or attach a character clip so the "
+            f"real-footage lip-sync lane can be used instead.")
 
     # Remove the TikTok "AI-generated" watermark (bottom strip) + add ONE clean lower-third CTA
     # caption (the avatar speaks the exact script, so a CTA is coherent + never garbled).
@@ -1872,8 +1939,13 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
     try:
         W, H = await asyncio.to_thread(_ffprobe_dims, orig)
         transcript = await _transcribe_file(orig)
-        d = await _gemini_json(f'From this transcript give 3 stock search terms + one 5-word caption. '
-                               f'Transcript:"{transcript[:900]}". Return JSON {{"queries":[".."],"caption":".."}}')
+        try:
+            d = await _gemini_json(f'From this transcript give 3 stock search terms + one 5-word caption. '
+                                   f'Transcript:"{transcript[:900]}". Return JSON {{"queries":[".."],"caption":".."}}')
+        except Exception as e:
+            # Both LLMs down → don't sink the clip; fall back to transcript-derived terms/caption.
+            logger.warning(f"broll query/caption LLM failed ({e}) — using transcript-derived terms")
+            d = {}
         queries = (d.get("queries") or []) + ["lifestyle", "city"]
         caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
         offer_desc = (caption + " — " + transcript[:220]).strip()
@@ -2346,6 +2418,9 @@ async def recipe_generate(req: RunRequest) -> list:
         prompt = (prompt + HOOK + NO_TEXT)[:1900]
 
         if engine in ("veo-extend", "veo", "veo3-google"):
+          # Veo (Google) can 401/402/429/5xx or time out. On any non-cancellation failure,
+          # fall through to the Seedance (Kie) lane below so the job still produces a video.
+          try:
             from ..services.video_creator import VideoCreatorService as VC
             from ..services import creative_team_activity as act
             # MULTI-SCENE: one scene per line → base is scene 0, each extension advances to the next
@@ -2385,6 +2460,11 @@ async def recipe_generate(req: RunRequest) -> list:
             return [{"recipe": "Generate — Veo 3.1 extend", "video_url": url, "confidence": 0.7,
                      "whats_changed": (f"Veo 3.1 {'image-to-video + ' if image_urls else ''}native extend — "
                         f"{len(paths)} segment(s) (~{approx}s) from your prompt.")}]
+          except Cancelled:
+            raise
+          except Exception as e:
+            logger.warning(f"Veo generate/extend failed ({e}) — falling back to Seedance (Kie)")
+            # fall through to the Seedance lane below
 
         # ── Seedance 2.0 (Kie) — native single clip up to 15s, full reference set ──
         from ..services.kieai_service import KieAIService
@@ -3043,9 +3123,15 @@ async def recipe_fal_video(req: RunRequest) -> list:
     model = (req.model or a.get("engine") or "fal-seedance")
     image_url = (a.get("image_urls") or [None])[0]
     seconds = int(a.get("seconds") or 5)
-    res = await asyncio.to_thread(lambda: fv.generate_video(
-        model, prompt, image_url=image_url, seconds=seconds,
-        aspect_ratio=a.get("aspect_ratio") or "9:16", resolution=a.get("resolution") or "480p"))
+    try:
+        res = await asyncio.to_thread(lambda: fv.generate_video(
+            model, prompt, image_url=image_url, seconds=seconds,
+            aspect_ratio=a.get("aspect_ratio") or "9:16", resolution=a.get("resolution") or "480p"))
+    except Exception as e:
+        # fal down / no credits / bad key → don't fail the job; fall back to the Kie
+        # Seedance lane (recipe_generate), which produces an equivalent new-from-scratch video.
+        logger.warning(f"fal video ({model}) failed ({e}) — falling back to Kie Seedance (recipe_generate)")
+        return await recipe_generate(req)
     name, out_path, out_url = _out_url(req, "gen")
     await asyncio.to_thread(_ffmpeg, ["-i", res["local_path"], "-c:v", "libx264", "-preset", "veryfast",
                                       "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], 300)
