@@ -828,6 +828,9 @@ async def vmake_test(url: str = "", _auth: bool = Depends(require_service_key)):
     auth_ok = vm._ok(config_env)
     out = {"success": auth_ok, "configured": True, "auth_ok": auth_ok,
            "config_response": config_env}
+    if not auth_ok:
+        # keys set but rejected — run the signing matrix so we can see if ANY variant authenticates
+        out["diagnostic"] = await asyncio.to_thread(vm.diag, "videoscreenclear")
     if url:
         out["consume_raw"] = await asyncio.to_thread(vm.consume, url, "videoscreenclear", "",
                                                      {"rsp_media_type": "url"})

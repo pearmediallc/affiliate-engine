@@ -90,6 +90,60 @@ def get_config(task: str = "videoscreenclear") -> dict:
     return _post("/skill/config.json", {"task": task})
 
 
+# ─── signing diagnostic ──────────────────────────────────────────────────────────────────────
+# Both real keys and dummy keys return the same 10021, so a rejection can't tell us whether the
+# KEYS are wrong or the SIGNING is wrong. This tries a matrix of signing variants server-side
+# (where the real keys live) and reports which — if any — Vmake accepts. Never exposes the keys.
+
+def _sign_variant(method: str, path: str, body: bytes, *, trail_slash: bool,
+                  sign_ct: bool, hash_empty: bool) -> dict:
+    ak, sk = settings.vmake_ak, settings.vmake_sk
+    t = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    headers = {"Host": _HOST, "X-Sdk-Date": t}
+    if sign_ct:
+        headers["Content-Type"] = "application/json"
+    signed_names = sorted(k.lower() for k in headers)
+    canon_headers = "".join(
+        f"{n}:{[headers[k] for k in headers if k.lower() == n][0].strip()}\n" for n in signed_names)
+    signed_headers = ";".join(signed_names)
+    canon_uri = (path + "/") if (trail_slash and not path.endswith("/")) else path
+    payload_hash = _sha256_hex(b"" if hash_empty else body)
+    canonical_request = "\n".join([method, canon_uri, "", canon_headers, signed_headers, payload_hash])
+    string_to_sign = "\n".join(["SDK-HMAC-SHA256", t, _sha256_hex(canonical_request.encode())])
+    sig = hmac.new(sk.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
+    out = {**headers, "Content-Type": "application/json",
+           "Authorization": f"SDK-HMAC-SHA256 Access={ak}, SignedHeaders={signed_headers}, Signature={sig}"}
+    return out
+
+
+def diag(task: str = "videoscreenclear") -> dict:
+    """Try a matrix of signing variants against /skill/config.json. Returns each variant's result
+    code so we can see which signing Vmake accepts (code 0) — or that ALL fail (keys are wrong)."""
+    body = json.dumps({"task": task}).encode()
+    results = []
+    for trail in (True, False):
+        for sign_ct in (True, False):
+            for hash_empty in (False, True):
+                label = f"slash={int(trail)},ct={int(sign_ct)},emptyhash={int(hash_empty)}"
+                try:
+                    h = _sign_variant("POST", "/skill/config.json", body,
+                                      trail_slash=trail, sign_ct=sign_ct, hash_empty=hash_empty)
+                    r = requests.post(BASE_URL + "/skill/config.json", data=body, headers=h, timeout=30)
+                    meta = {}
+                    try:
+                        meta = r.json().get("meta", {})
+                    except Exception:
+                        meta = {"raw": r.text[:120]}
+                    results.append({"variant": label, "code": meta.get("code"), "msg": meta.get("msg")})
+                    if meta.get("code") == 0:
+                        return {"winner": label, "results": results}
+                except Exception as e:
+                    results.append({"variant": label, "error": str(e)[:120]})
+    return {"winner": None, "results": results,
+            "note": "All variants rejected — if none is code 0 the KEY VALUES are likely wrong "
+                    "(typo / AK-SK swapped / stray whitespace in Render env)."}
+
+
 def consume(url: str, task: str, gid: str = "", params: Optional[dict] = None) -> dict:
     """Run a task on a media URL. For async tasks the first call returns a task/gid to poll."""
     body = {"url": url, "task": task, "gid": gid or ""}
