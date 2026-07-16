@@ -814,6 +814,26 @@ async def winner_db_test(vertical: str = "", _auth: bool = Depends(require_servi
     return {"success": True, **winner_library.health(vs)}
 
 
+@router.get("/vmake-test")
+async def vmake_test(url: str = "", _auth: bool = Depends(require_service_key)):
+    """Confirm the Vmake keys (MT_AK/MT_SK) actually authenticate, and reveal the real async
+    contract. Step 1 always runs: signed config.json → meta.code 0 means auth OK. If ?url= is
+    given, step 2 fires one real videoscreenclear consume.json and returns its RAW response so
+    the async spawn/poll shape can be finalized from fact instead of guessed."""
+    from ..services import vmake_service as vm
+    if not vm.is_configured():
+        return {"success": False, "configured": False,
+                "hint": "Set MT_AK and MT_SK on the affiliate-engine Render env, then redeploy."}
+    config_env = await asyncio.to_thread(vm.get_config, "videoscreenclear")
+    auth_ok = vm._ok(config_env)
+    out = {"success": auth_ok, "configured": True, "auth_ok": auth_ok,
+           "config_response": config_env}
+    if url:
+        out["consume_raw"] = await asyncio.to_thread(vm.consume, url, "videoscreenclear", "",
+                                                     {"rsp_media_type": "url"})
+    return out
+
+
 @router.post("/upload-images")
 async def upload_images(payload: dict, _auth: bool = Depends(require_service_key)):
     """Save base64 scenic images to the public /uploads dir and return their public URLs, so the

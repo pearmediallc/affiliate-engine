@@ -107,6 +107,11 @@ class Settings(BaseSettings):
     sync_so_api_key: Optional[str] = None      # sync.so (3 free videos, then paid) — x-api-key
     fal_key: Optional[str] = None              # fal.ai (veed/lipsync) — Authorization: Key <FAL_KEY>
 
+    # Vmake caption/watermark removal — the tool our editors already use (vmake.ai).
+    # SDK-HMAC-SHA256 (Huawei APIG scheme). Set on Render env as MT_AK / MT_SK.
+    vmake_ak: Optional[str] = None
+    vmake_sk: Optional[str] = None
+
     # AWS S3 — persistent storage for generated images/videos
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
@@ -154,6 +159,12 @@ class Settings(BaseSettings):
             self.fal_key = self.fal_api_key
         elif not self.fal_api_key and self.fal_key:
             self.fal_api_key = self.fal_key
+        # Vmake keys ship as MT_AK / MT_SK on Render — accept those exact names too.
+        import os as _os
+        if not self.vmake_ak:
+            self.vmake_ak = _os.getenv("MT_AK") or _os.getenv("VMAKE_AK")
+        if not self.vmake_sk:
+            self.vmake_sk = _os.getenv("MT_SK") or _os.getenv("VMAKE_SK")
         return self
 
     class Config:
