@@ -1067,12 +1067,260 @@ async def learn_verdict(payload: dict, _auth: bool = Depends(require_service_key
 
 @router.get("/learn/summary")
 async def learn_summary(vertical: str = "", _auth: bool = Depends(require_service_key)):
-    """What the brain has learned — voice/character/model win-rates by ROI. Proof it's learning."""
+    """What the brain has learned — per-brain win-rates (anti-noise labels) PLUS each brain's
+    governed-rule promotion state (suggest vs assert). Proof it's learning."""
+    from ..database import SessionLocal
+    from ..services import learning_loop as learn
+    from ..models.learning import CreativeBrainRule
+    db = SessionLocal()
+    try:
+        summ = learn.summary(db, vertical or None)
+        promotion = {}
+        try:
+            q = db.query(CreativeBrainRule)
+            if vertical:
+                q = q.filter(CreativeBrainRule.vertical == vertical)
+            for r in q.all():
+                # mode reflects the ADMIN-APPROVAL gate: only an active (approved) rule is asserted;
+                # a promoted-but-unapproved brain is 'proposed' (awaiting admin), else 'suggest'.
+                promotion[r.brain] = {"vertical": r.vertical, "promoted": bool(r.promoted),
+                                      "active": bool(r.active),
+                                      "mode": ("assert" if r.active else "proposed" if r.promoted else "suggest"),
+                                      "promotion_metrics": r.promotion_metrics}
+        except Exception as e:
+            logger.warning(f"[learn] promotion state read failed: {e}")
+        return {"success": True, "vertical": vertical or "all", "summary": summ, "promotion": promotion}
+    finally:
+        db.close()
+
+
+@router.get("/learn/events")
+async def learn_events(brain: str = "", vertical: str = "", limit: int = 50,
+                       _auth: bool = Depends(require_service_key)):
+    """The changelog: recent LearningEvents newest-first (every keep/reject of a governed rule),
+    filterable by brain/vertical. This is the auditable record of every self-correction."""
+    from ..database import SessionLocal
+    from ..models.learning import LearningEvent
+    db = SessionLocal()
+    try:
+        q = db.query(LearningEvent)
+        if brain:
+            q = q.filter(LearningEvent.brain == brain)
+        if vertical:
+            q = q.filter(LearningEvent.vertical == vertical)
+        rows = q.order_by(LearningEvent.created_at.desc()).limit(min(max(limit, 1), 200)).all()
+        items = [{"brain": r.brain, "vertical": r.vertical, "summary": r.summary,
+                  "agreement_before": r.agreement_before, "agreement_after": r.agreement_after,
+                  "detail": r.detail_json,
+                  "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+        return {"success": True, "count": len(items), "events": items}
+    finally:
+        db.close()
+
+
+@router.post("/learn/run-tuning")
+async def learn_run_tuning(payload: dict = None, _auth: bool = Depends(require_service_key)):
+    """Admin: run every brain's holdout-gated tuner once (nightly-scheduler entry point too).
+    body: {verticals?: [..]}. Each brain mines rules from TRAIN, keeps them only if holdout
+    agreement improves, and writes a LearningEvent either way. Never mutates the render path."""
+    from ..database import SessionLocal
+    from ..services import creative_tuner as ctun
+    verticals = (payload or {}).get("verticals") or None
+    db = SessionLocal()
+    try:
+        results = ctun.run_all(db, verticals)
+        return {"success": True, "ran": len(results), "results": results}
+    finally:
+        db.close()
+
+
+def _proposal_dict(p) -> dict:
+    return {"id": p.id, "brain": p.brain, "vertical": p.vertical, "status": p.status,
+            "agreement_before": p.agreement_before, "agreement_after": p.agreement_after,
+            "evidence": p.detail_json, "reviewed_by": p.reviewed_by,
+            "reviewed_at": p.reviewed_at.isoformat() if p.reviewed_at else None,
+            "review_reason": p.review_reason,
+            "created_at": p.created_at.isoformat() if p.created_at else None}
+
+
+@router.get("/learn/proposals")
+async def learn_proposals(status: str = "pending_admin", brain: str = "", vertical: str = "",
+                          limit: int = 100, _auth: bool = Depends(require_service_key)):
+    """The ADMIN-APPROVAL queue: RuleProposals with their FULL evidence bundle (why/what/when/how).
+    Filter by status (pending_admin|applied|rejected) — pass status='' for all. Newest-first."""
+    from ..database import SessionLocal
+    from ..models.learning import RuleProposal
+    db = SessionLocal()
+    try:
+        q = db.query(RuleProposal)
+        if status:
+            q = q.filter(RuleProposal.status == status)
+        if brain:
+            q = q.filter(RuleProposal.brain == brain)
+        if vertical:
+            q = q.filter(RuleProposal.vertical == vertical)
+        rows = q.order_by(RuleProposal.created_at.desc()).limit(min(max(limit, 1), 500)).all()
+        return {"success": True, "count": len(rows), "proposals": [_proposal_dict(p) for p in rows]}
+    finally:
+        db.close()
+
+
+@router.post("/learn/proposals/{proposal_id}/approve")
+async def learn_proposal_approve(proposal_id: str, payload: dict = None,
+                                 _auth: bool = Depends(require_service_key)):
+    """ADMIN approves: ACTIVATE the brain's CreativeBrainRule (the engine now reads it), mark the
+    proposal 'applied', and write a LearningEvent. This is the ONLY path that sets a rule active."""
+    from ..database import SessionLocal
+    from ..models.learning import RuleProposal, CreativeBrainRule, LearningEvent
+    from datetime import datetime as _dt
+    import uuid as _uuid
+    approver = (payload or {}).get("approver") or "admin"
+    db = SessionLocal()
+    try:
+        p = db.query(RuleProposal).filter(RuleProposal.id == proposal_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="proposal not found")
+        if p.status != "pending_admin":
+            raise HTTPException(status_code=409, detail=f"proposal already {p.status}")
+        proposed = ((p.detail_json or {}).get("proposed_change")) or {}
+        row = db.query(CreativeBrainRule).filter(
+            CreativeBrainRule.brain == p.brain,
+            CreativeBrainRule.vertical == (p.vertical or None)).first()
+        if not row:
+            row = CreativeBrainRule(id=str(_uuid.uuid4()), brain=p.brain, vertical=(p.vertical or None))
+            db.add(row)
+        row.rules_json = {"preferred": dict(proposed.get("preferred") or {}),
+                          "avoided": list(proposed.get("avoided") or [])}
+        row.active = True                # ← the engine may now read this rule
+        p.status = "applied"
+        p.reviewed_by = approver
+        p.reviewed_at = _dt.utcnow()
+        db.add(LearningEvent(
+            id=str(_uuid.uuid4()), vertical=(p.vertical or "all"), brain=p.brain,
+            summary=(f"[{p.brain}/{p.vertical or 'all'}] admin approved rule proposal — now ACTIVE "
+                     f"({len(proposed.get('preferred') or {})} preferred, {len(proposed.get('avoided') or [])} avoided); "
+                     f"holdout {p.agreement_before} → {p.agreement_after}. Approver: {approver}."),
+            agreement_before=p.agreement_before, agreement_after=p.agreement_after,
+            detail_json={"proposal_id": p.id, "action": "approved", "approver": approver,
+                         "activated_rule": row.rules_json}))
+        db.commit()
+        return {"success": True, "proposal": _proposal_dict(p), "active_rule": row.rules_json}
+    finally:
+        db.close()
+
+
+@router.post("/learn/proposals/{proposal_id}/reject")
+async def learn_proposal_reject(proposal_id: str, payload: dict = None,
+                                _auth: bool = Depends(require_service_key)):
+    """ADMIN rejects: mark 'rejected', keep the OLD behavior (no rule activated), write a
+    LearningEvent. body: {reason?, approver?}."""
+    from ..database import SessionLocal
+    from ..models.learning import RuleProposal, LearningEvent
+    from datetime import datetime as _dt
+    import uuid as _uuid
+    reason = (payload or {}).get("reason") or ""
+    approver = (payload or {}).get("approver") or "admin"
+    db = SessionLocal()
+    try:
+        p = db.query(RuleProposal).filter(RuleProposal.id == proposal_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="proposal not found")
+        if p.status != "pending_admin":
+            raise HTTPException(status_code=409, detail=f"proposal already {p.status}")
+        p.status = "rejected"
+        p.reviewed_by = approver
+        p.reviewed_at = _dt.utcnow()
+        p.review_reason = (reason or "")[:500]
+        db.add(LearningEvent(
+            id=str(_uuid.uuid4()), vertical=(p.vertical or "all"), brain=p.brain,
+            summary=(f"[{p.brain}/{p.vertical or 'all'}] admin REJECTED rule proposal — engine unchanged. "
+                     f"Reason: {reason or 'n/a'}. Reviewer: {approver}."),
+            agreement_before=p.agreement_before, agreement_after=p.agreement_after,
+            detail_json={"proposal_id": p.id, "action": "rejected", "approver": approver, "reason": reason}))
+        db.commit()
+        return {"success": True, "proposal": _proposal_dict(p)}
+    finally:
+        db.close()
+
+
+@router.get("/learn/brains")
+async def learn_brains(vertical: str = "", _auth: bool = Depends(require_service_key)):
+    """Per-brain audit for the learning tab: status (gathering|suggesting|promoted), labeled count,
+    holdout agreement, promotion_metrics, current ACTIVE rule (if any), pending/applied proposal
+    counts. Cold start → every brain 'gathering', no active rule."""
+    from ..database import SessionLocal
+    from ..services import learning_loop as learn
+    from ..services import creative_tuner as ctun
+    from ..models.learning import CreativeBrainRule, RuleProposal
+    db = SessionLocal()
+    try:
+        vt = vertical or None
+        out = []
+        for brain in ctun.TUNABLE_BRAINS:
+            labeled = len(ctun._labelled_rows(db, brain, vt))
+            row = db.query(CreativeBrainRule).filter(
+                CreativeBrainRule.brain == brain,
+                CreativeBrainRule.vertical == (vt or None)).first()
+            pending = db.query(RuleProposal).filter(
+                RuleProposal.brain == brain, RuleProposal.status == "pending_admin")
+            applied = db.query(RuleProposal).filter(
+                RuleProposal.brain == brain, RuleProposal.status == "applied")
+            if vt:
+                pending = pending.filter(RuleProposal.vertical == vt)
+                applied = applied.filter(RuleProposal.vertical == vt)
+            n_pending, n_applied = pending.count(), applied.count()
+            promoted = bool(row.promoted) if row else False
+            active = bool(row.active) if row else False
+            # status: promoted (cleared bar) > suggesting (pending proposal) > gathering
+            status = "promoted" if promoted else ("suggesting" if n_pending else "gathering")
+            metrics = (row.promotion_metrics if row else None) or {}
+            out.append({
+                "brain": brain, "vertical": vt or "all", "status": status,
+                "labeled_count": labeled, "promoted": promoted,
+                "holdout_agreement": metrics.get("live_agreement"),
+                "promotion_metrics": metrics or None,
+                "active_rule": (row.rules_json if (row and active and row.rules_json) else None),
+                "has_active_rule": active,
+                "pending_proposals": n_pending, "applied_proposals": n_applied,
+                "last_analyzed_at": row.last_analyzed_at.isoformat() if (row and row.last_analyzed_at) else None,
+            })
+        return {"success": True, "vertical": vt or "all", "brains": out}
+    finally:
+        db.close()
+
+
+@router.get("/learn/decisions/{request_id}")
+async def learn_decisions(request_id: str, _auth: bool = Depends(require_service_key)):
+    """The per-generation decision trace for ONE job: what each brain decided, the human feedback,
+    blamed_brains, the label (win/loss/pending), ROI — plus a per-brain breakdown so the UI can show
+    'voice: chosen=nova, verdict=loss, reason=too young'. Read-only; never raises into anything."""
     from ..database import SessionLocal
     from ..services import learning_loop as learn
     db = SessionLocal()
     try:
-        return {"success": True, "vertical": vertical or "all", "summary": learn.summary(db, vertical or None)}
+        decisions = learn.decisions_for_job(db, request_id)
+        # brain-level breakdown per decision row
+        from ..models.creative_team import CreativeDecision
+        rows = (db.query(CreativeDecision)
+                  .filter(CreativeDecision.request_id == request_id)
+                  .order_by(CreativeDecision.created_at.asc()).all())
+        breakdown = []
+        for r in rows:
+            blamed = learn._blamed(r) or set()
+            brains = {}
+            for brain, col in learn.BRAIN_COLUMN.items():
+                chosen = getattr(r, col, None)
+                if chosen is None:
+                    continue
+                lab = learn._brain_label(r, brain)
+                brains[brain] = {"chosen": chosen,
+                                 "verdict": ("win" if lab == 1 else "loss" if lab == 0 else "pending"),
+                                 "blamed": brain in blamed}
+            breakdown.append({"creative_ref": r.creative_ref, "vertical": r.vertical,
+                              "human_verdict": r.human_verdict, "reason": r.human_reason,
+                              "roi": r.roi, "brains": brains})
+        return {"success": True, "request_id": request_id, "decisions": decisions,
+                "brain_breakdown": breakdown}
     finally:
         db.close()
 
@@ -2830,7 +3078,7 @@ def _clean_script(s: str) -> str:
     return re.sub(r"\s*\n\s*", " ", s).strip()
 
 
-async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None):
+async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
@@ -2844,6 +3092,7 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
     # what produced two sets of captions, the bottom one contradicting the voice. Detect and blur
     # them first, then lay ours over the clean frame.
     delogo = ""
+    removal_method = "none"   # which brain 'caption_remove' actually used: vmake | ffmpeg-blur | none
     if cap_words:
         try:
             work = os.path.join(UPLOAD_DIR, f"capscan_{request_id[:8]}")
@@ -2859,15 +3108,31 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
                 from ..services import vmake_service as vmake
                 src_url = result.get("video_url")
                 cleaned = None
-                if (settings.vmake_caption_removal and vmake.is_configured()
+                # GATED self-correction (caption_remove brain): an ADMIN-APPROVED rule preferring
+                # 'ffmpeg-blur' suppresses vmake; otherwise vmake (editor-grade) stays the default.
+                # No active rule → None → exact current behavior. Wrapped so it can never break.
+                _rm_pref = None
+                try:
+                    from ..services import creative_tuner as ctun
+                    from ..database import SessionLocal as _SL
+                    _rdb = _SL()
+                    try:
+                        _rm_pref = ctun.governed_preference(_rdb, "caption_remove", vertical or None)
+                    finally:
+                        _rdb.close()
+                except Exception:
+                    _rm_pref = None
+                if (_rm_pref != "ffmpeg-blur" and settings.vmake_caption_removal and vmake.is_configured()
                         and isinstance(src_url, str) and src_url.startswith("http")):
                     cleaned = await asyncio.to_thread(vmake.remove_captions_video, src_url)
                 if cleaned:
                     src = await _download_to_temp(cleaned, ".mp4")
                     w, h = await asyncio.to_thread(_video_dims, src)
+                    removal_method = "vmake"
                     logger.info("[captions] Vmake removed burned-in captions (clean master, no blur)")
                 else:
                     delogo = _delogo_chain(boxes, w, h)   # ffmpeg-blur fallback
+                    removal_method = "ffmpeg-blur"
         except Exception as e:
             logger.warning(f"[captions] burned-in caption scan failed (may double up): {e}")
 
@@ -2892,7 +3157,8 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
     await asyncio.to_thread(_ffmpeg, args, 300)
     _ae_persist(out_path, out_name)
     return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script,
-            "captions_burned": bool(ass_path), "scrubbed_original_captions": bool(delogo)}
+            "captions_burned": bool(ass_path), "scrubbed_original_captions": bool(delogo),
+            "caption_removal": removal_method}
 
 
 async def _resume_one_lipsync(row):
@@ -2970,7 +3236,23 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # If the user HANDED US a script, that IS the script — speak it. The writer silently replacing
     # a supplied script is not a feature, it's a bug.
     t0 = act.start("scriptwriter", req.request_id, "strategizing + writing the script")
-    verbatim = bool(base) and (a.get("script_mode") or "").lower() == "verbatim"
+    # GATED self-correction (script_write brain): when a base script exists but the user did NOT
+    # pin a script_mode, an ADMIN-APPROVED rule preferring 'verbatim' respects the supplied words
+    # instead of rewriting. No active rule → unchanged (mode stays as the user/default set it).
+    _script_mode_pin = (a.get("script_mode") or "").lower()
+    if bool(base) and not _script_mode_pin:
+        try:
+            from ..services import creative_tuner as ctun
+            from ..database import SessionLocal as _SL
+            _sdb = _SL()
+            try:
+                if ctun.governed_preference(_sdb, "script_write", vertical or None) == "verbatim":
+                    _script_mode_pin = "verbatim"
+            finally:
+                _sdb.close()
+        except Exception:
+            pass
+    verbatim = bool(base) and _script_mode_pin == "verbatim"
     script = base or brief
     offer_desc = " ".join(x for x in [
         brief,
@@ -3052,6 +3334,12 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         _ldb = SessionLocal()
         try:
             _vscores = learn.voice_scores(_ldb, vertical or None)
+            # GATED self-correction: only a voice_cast brain that cleared the promotion bar may
+            # ASSERT its governed picks. Below the bar / cold start this is {} → behavior unchanged.
+            from ..services import creative_tuner as ctun
+            _gov = ctun.governed_scores(_ldb, "voice_cast", vertical or None)
+            if _gov:
+                _vscores = {**_vscores, **_gov}
         finally:
             _ldb.close()
     except Exception:
@@ -3166,7 +3454,24 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
     _cap_words, _cap_method, _cap_err = [], "", ""
-    _use_veed = bool(a.get("captions")) and (a.get("caption_style") or "clean").lower() == "veed" and bool(settings.fal_key)
+    # GATED self-correction (caption_place brain): only when the user did NOT pin a caption_style
+    # AND an ADMIN-APPROVED rule prefers a method do we bias veed/ffmpeg. No active rule → None →
+    # exact current behavior. Wrapped so it can never break the render.
+    _cap_style = (a.get("caption_style") or "").lower()
+    if not _cap_style:
+        try:
+            from ..services import creative_tuner as ctun
+            from ..database import SessionLocal as _SL
+            _cdb = _SL()
+            try:
+                _cap_pref = ctun.governed_preference(_cdb, "caption_place", vertical or None)  # 'veed'|'ffmpeg'|None
+            finally:
+                _cdb.close()
+            if _cap_pref:
+                _cap_style = _cap_pref
+        except Exception:
+            pass
+    _use_veed = bool(a.get("captions")) and ((_cap_style or "clean") == "veed") and bool(settings.fal_key)
     if a.get("captions"):
         try:
             from ..services import captions as cap
@@ -3185,7 +3490,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     # 4) SAVE — normalize + persist to BOTH buckets (subtitle is built in here, sized to the real frame)
     variant = await _produce_lipsync_variant(req.request_id, name, result, script,
-                                             cap_words=(None if _use_veed else _cap_words))
+                                             cap_words=(None if _use_veed else _cap_words),
+                                             vertical=(vertical or None))
     ass_path = variant.get("captions_burned")
 
     # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
@@ -3233,6 +3539,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         from ..database import SessionLocal
         _db = SessionLocal()
         try:
+            # what each BRAIN actually decided (NULL when not recoverable → excluded from ranking):
+            _script_mode = "verbatim" if verbatim else ("rewrite" if base else "from-scratch")
+            _caption_method = ("veed" if _use_veed else ("ffmpeg" if ass_path else None))
             learn.log_decision(
                 _db, request_id=req.request_id, vertical=(vertical or None),
                 creative_ref=name,   # delivered filename → the key ROI joins back on
@@ -3241,6 +3550,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 voice_id=voice_id, voice_provider=voice_res.get("provider"),
                 voice_cloned=_cloned, lipsync_provider=sub["provider"],
                 script_ref=(a.get("script_ref") or None), captions=bool(ass_path or _use_veed),
+                script_mode=_script_mode, caption_method=_caption_method,
+                caption_removal_method=(variant.get("caption_removal") or None),
                 qc_passed=True, cost_usd=float(_lip_cost or 0))
         finally:
             _db.close()

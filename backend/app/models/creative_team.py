@@ -110,6 +110,16 @@ class CreativeDecision(Base):
     video_model = Column(String, nullable=True)
     script_ref = Column(String, nullable=True)
     captions = Column(Boolean, default=False)
+    # Per-brain choices the pipeline actually made, so the loop can rank each brain on its own.
+    # NULL when the value isn't recoverable at log time (NULLs are simply excluded from ranking).
+    script_mode = Column(String, nullable=True)             # verbatim | rewrite | from-scratch
+    caption_method = Column(String, nullable=True)          # veed | ffmpeg | (null = no captions)
+    caption_removal_method = Column(String, nullable=True)  # vmake | ffmpeg-blur | none
+    # Which brains a human 'regenerated'/'rejected' verdict actually blamed (JSON list, as TEXT).
+    #   NULL  → no attribution (accepted / ROI-only / legacy) — penalizes NO specific brain
+    #   "[]"  → verdict given but ambiguous — trains NO brain, creative-level stat only
+    #   '["voice_cast"]' → ONLY the named brains take the loss; unnamed brains stay unlabeled
+    blamed_brains = Column(Text, nullable=True)
     qc_passed = Column(Boolean, default=True)
     qc_reasons = Column(Text, nullable=True)
     cost_usd = Column(Float, default=0.0)

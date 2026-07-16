@@ -4,7 +4,7 @@ from .image import Image
 from .performance import PerformanceMetric
 from .feedback import GenerationFeedback
 from .user import User, Role, UsageLog
-from .learning import LearningRecord, VerticalKnowledge, AISuggestion, Asset
+from .learning import LearningRecord, VerticalKnowledge, AISuggestion, Asset, LearningEvent, CreativeBrainRule, RuleProposal
 from .job import Job
 from .audit_log import AuditLog
 from .campaign import Character, SceneSetting, Campaign, Shot, Variation
@@ -14,7 +14,7 @@ from .creative_team import CreativeTeamEvent, CreativeDecision
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",
     "User", "Role", "UsageLog",
-    "LearningRecord", "VerticalKnowledge", "AISuggestion", "Asset",
+    "LearningRecord", "VerticalKnowledge", "AISuggestion", "Asset", "LearningEvent", "CreativeBrainRule", "RuleProposal",
     "Job",
     "AuditLog",
     "Character", "SceneSetting", "Campaign", "Shot", "Variation",

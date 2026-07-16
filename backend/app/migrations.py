@@ -42,6 +42,16 @@ _REQUIRED_COLUMNS = [
     ("user_prompt_profiles", "typical_prompt_complexity", "VARCHAR"),
     ("user_prompt_profiles", "total_spend_usd", "DOUBLE PRECISION DEFAULT 0"),
     ("user_prompt_profiles", "last_synthesized_at", "TIMESTAMP"),
+    # Learning loop — holdout-gated promotion state on vertical_knowledge
+    ("vertical_knowledge", "promoted", "BOOLEAN DEFAULT FALSE"),
+    ("vertical_knowledge", "promotion_metrics", "TEXT"),
+    # Creative learning loop — per-brain choices + attribution on creative_decisions
+    ("creative_decisions", "script_mode", "VARCHAR"),
+    ("creative_decisions", "caption_method", "VARCHAR"),
+    ("creative_decisions", "caption_removal_method", "VARCHAR"),
+    ("creative_decisions", "blamed_brains", "TEXT"),
+    # Admin-approval gate — engine reads a governed rule ONLY when an admin approved it (active).
+    ("creative_brain_rules", "active", "BOOLEAN DEFAULT FALSE"),
 ]
 
 

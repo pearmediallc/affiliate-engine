@@ -81,6 +81,37 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"lip-sync resume hook failed to start: {e}")
 
+    # Nightly learning heartbeat — OFF unless LEARN_NIGHTLY=true. Safe to run unattended: the
+    # holdout gate + admin-approval gate mean nightly tuning only ever creates PROPOSALS, never
+    # changes the engine. Minimal asyncio loop (no new dependency), mirrors the resume hook above.
+    try:
+        import os
+        if str(os.getenv("LEARN_NIGHTLY", "")).lower() in ("1", "true", "yes"):
+            import asyncio
+            asyncio.create_task(_nightly_learning_loop())
+            logger.info("nightly learning heartbeat enabled (LEARN_NIGHTLY)")
+    except Exception as e:
+        logger.warning(f"nightly learning heartbeat failed to start: {e}")
+
+
+async def _nightly_learning_loop():
+    """Run creative_tuner.run_all() once per LEARN_NIGHTLY_INTERVAL_SEC (default 24h). Never raises
+    out of the loop — only ever produces RuleProposals (pending_admin), so it can run unattended."""
+    import asyncio, os
+    interval = int(os.getenv("LEARN_NIGHTLY_INTERVAL_SEC", str(24 * 3600)))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            from .services import creative_tuner as ctun
+            db = SessionLocal()
+            try:
+                results = ctun.run_all(db)
+                logger.info(f"[nightly-learn] ran {len(results)} brain tuners")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"[nightly-learn] cycle failed: {e}")
+
 
 # Include all routes under /api/v1
 api_router = create_router()

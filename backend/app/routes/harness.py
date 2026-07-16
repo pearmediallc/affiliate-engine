@@ -175,6 +175,57 @@ async def get_harness_stats(
         db.close()
 
 
+@router.get("/events/{vertical}")
+async def get_learning_events(
+    vertical: str,
+    limit: int = 20,
+    user=Depends(get_current_user),
+):
+    """
+    Recent learning_events for a vertical, newest-first — the audit trail of every
+    keep/rollback decision on the tuning loop. Also returns the vertical's measured
+    promotion state so callers can tell "suggest" (guess) from "assert" (promoted).
+    """
+    from ..models.learning import LearningEvent, VerticalKnowledge
+
+    db = SessionLocal()
+    try:
+        events = (
+            db.query(LearningEvent)
+            .filter(LearningEvent.vertical == vertical)
+            .order_by(LearningEvent.created_at.desc())
+            .limit(max(1, min(limit, 100)))
+            .all()
+        )
+        knowledge = (
+            db.query(VerticalKnowledge)
+            .filter(VerticalKnowledge.vertical == vertical)
+            .first()
+        )
+        return APIResponse(
+            success=True,
+            message=f"Learning events for {vertical}",
+            data={
+                "vertical": vertical,
+                "promoted": bool(knowledge.promoted) if knowledge else False,
+                "promotion_metrics": knowledge.promotion_metrics if knowledge else None,
+                "events": [
+                    {
+                        "id": e.id,
+                        "summary": e.summary,
+                        "agreement_before": e.agreement_before,
+                        "agreement_after": e.agreement_after,
+                        "detail": e.detail_json,
+                        "created_at": e.created_at.isoformat() if e.created_at else None,
+                    }
+                    for e in events
+                ],
+            },
+        )
+    finally:
+        db.close()
+
+
 @router.get("/gates")
 async def describe_gates(user=Depends(get_current_user)):
     """Describe all 5 gates and their current thresholds."""
