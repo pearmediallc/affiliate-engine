@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     # SDK-HMAC-SHA256 (Huawei APIG scheme). Set on Render env as MT_AK / MT_SK.
     vmake_ak: Optional[str] = None
     vmake_sk: Optional[str] = None
+    # Use Vmake (editor-grade) to scrub burned-in captions before re-captioning; ffmpeg-blur is the
+    # fallback. Costs Vmake credits per video — set VMAKE_CAPTION_REMOVAL=false to force ffmpeg only.
+    vmake_caption_removal: bool = True
 
     # AWS S3 — persistent storage for generated images/videos
     aws_access_key_id: Optional[str] = None

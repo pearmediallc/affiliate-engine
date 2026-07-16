@@ -2852,9 +2852,22 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
             frames = await asyncio.to_thread(
                 _extract_frames, src, [max(0.3, (dur or 4) * f) for f in (0.15, 0.45, 0.75)], work)
             boxes = await _detect_caption_boxes(frames)
-            delogo = _delogo_chain(boxes, w, h)
-            if delogo:
+            if boxes:
                 logger.info(f"[captions] source has {len(boxes)} burned-in caption region(s) → scrubbing before ours")
+                # Editor-grade removal first (what our editors do in vmake.ai); ffmpeg-blur is the
+                # fallback. Vmake fetches the URL itself, so only try it when the source is public.
+                from ..services import vmake_service as vmake
+                src_url = result.get("video_url")
+                cleaned = None
+                if (settings.vmake_caption_removal and vmake.is_configured()
+                        and isinstance(src_url, str) and src_url.startswith("http")):
+                    cleaned = await asyncio.to_thread(vmake.remove_captions_video, src_url)
+                if cleaned:
+                    src = await _download_to_temp(cleaned, ".mp4")
+                    w, h = await asyncio.to_thread(_video_dims, src)
+                    logger.info("[captions] Vmake removed burned-in captions (clean master, no blur)")
+                else:
+                    delogo = _delogo_chain(boxes, w, h)   # ffmpeg-blur fallback
         except Exception as e:
             logger.warning(f"[captions] burned-in caption scan failed (may double up): {e}")
 
