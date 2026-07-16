@@ -1,16 +1,16 @@
 """
 Vmake caption/watermark removal — the same tool our editors use in the vmake.ai UI, via its API.
 
-Auth: SDK-HMAC-SHA256 (Huawei APIG signing scheme). Keys come from Render env MT_AK / MT_SK
-(exposed as settings.vmake_ak / settings.vmake_sk). NEVER hard-code them.
+Auth: SDK-HMAC-SHA256. Keys come from Render env MT_AK / MT_SK (settings.vmake_ak/sk). NEVER
+hard-code them. The signature's Authorization value is base64-encoded and prefixed 'Bearer '
+(the detail that makes it work — see _sign).
 
-API-key surface (confirmed by live probing — these two accept the AK/SK signature; the
-query/task/status endpoints are web-session only and are NOT reachable with an API key):
-  POST /skill/config.json   → skill config / cost for a task
-  POST /skill/consume.json  → run a task; async tasks return a task id we poll via the same route
+Actual task execution goes through the official vendored SDK (backend/vmake_sdk), which does the
+full flow: fetch_config → OSS-upload input → consume.json (QUOTA CHECK only) → invoke to a dynamic
+AI host → poll status. The _sign/get_config/consume/diag helpers here are for the /vmake-test
+auth-check endpoint; real caption removal uses remove_captions_video() → SkillClient.run_task.
 
-Video caption/watermark removal task = `videoscreenclear` (async).
-Image watermark erase task = `eraser_watermark` (sync).
+Video caption/watermark removal task = `videoscreenclear`. Image watermark erase = `eraser_watermark`.
 
 Response envelope: {"meta": {"code": 0, "msg": "..."}, "response": {...}}. meta.code == 0 = OK.
 """
@@ -159,14 +159,35 @@ def consume(url: str, task: str, gid: str = "", params: Optional[dict] = None) -
 # terminal status value) is read from the FIRST real consume.json response via /regen/vmake-test,
 # then finalized here. Until then this uses the best-known field names and degrades safely.
 
-def remove_captions_video(video_url: str, poll_seconds: int = 900) -> Optional[str]:
-    """Return a clean (caption-free) video URL, or None so the caller falls back to ffmpeg-blur.
+def _run_task(task: str, media_url: str) -> Optional[str]:
+    """Run a Vmake task on a media URL via the official (vendored) SDK and return the first output
+    URL. The SDK does the whole flow: fetch_config → OSS-upload input → consume (quota) → invoke →
+    poll until done. Returns None on any failure so callers can fall back. Never raises.
 
-    NOT wired yet: the real task is NOT a consume.json call. Per Vmake's SDK the flow is
-    config → OSS-upload the input (STS creds) → consume.json (quota only) → invoke to a dynamic
-    AI host → poll status until done. That needs the official SDK vendored + the alibabacloud_oss_v2
-    dependency. Auth/signing (the hard part) is solved and proven; this is the remaining plumbing.
+    Blocking (polls internally) — call via asyncio.to_thread from async code.
     """
-    logger.info("vmake remove_captions_video not wired yet (needs vendored SDK + OSS upload); "
-                "falling back to ffmpeg-blur")
-    return None
+    if not is_configured():
+        return None
+    try:
+        from vmake_sdk import SkillClient
+        client = SkillClient(settings.vmake_ak, settings.vmake_sk)
+        result = client.run_task(task, media_url, params={"parameter": {"rsp_media_type": "url"}})
+        urls = (result or {}).get("output_urls") or []
+        if urls:
+            return urls[0]
+        logger.warning(f"vmake {task}: no output_urls (status={ (result or {}).get('skill_status') } "
+                       f"err={ (result or {}).get('error') })")
+        return None
+    except Exception as e:
+        logger.warning(f"vmake {task} failed: {e}")
+        return None
+
+
+def remove_captions_video(video_url: str) -> Optional[str]:
+    """Clean (caption/watermark-free) video URL, or None → caller falls back to ffmpeg-blur."""
+    return _run_task("videoscreenclear", video_url)
+
+
+def remove_watermark_image(image_url: str) -> Optional[str]:
+    """Watermark-free image URL, or None on failure."""
+    return _run_task("eraser_watermark", image_url)

@@ -19,3 +19,4 @@ python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.0
 bcrypt==4.0.1
 boto3>=1.28.0
+alibabacloud-oss-v2>=0.2.0   # Vmake SDK uploads inputs to Meitu's Alibaba OSS (vmake_sdk/storage/oss.py)
