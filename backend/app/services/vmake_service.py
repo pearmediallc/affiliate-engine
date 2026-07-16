@@ -41,31 +41,32 @@ def _sha256_hex(b: bytes) -> str:
 
 
 def _sign(method: str, path: str, body: bytes) -> dict:
-    """Build the SDK-HMAC-SHA256 Authorization header (Huawei APIG scheme).
+    """Build the SDK-HMAC-SHA256 signed headers — matches Vmake's official SDK signer exactly.
 
-    Structurally verified live against /skill/config.json: with a well-formed signature the API
-    stops replying 'missing Authorization header' and validates the key instead.
+    The one detail every naive implementation misses: the Authorization value is base64-encoded
+    and prefixed with 'Bearer '. Verified live against /skill/config.json → meta.code 0.
     """
     ak, sk = settings.vmake_ak, settings.vmake_sk
     if not ak or not sk:
         raise RuntimeError("Vmake keys missing — set MT_AK / MT_SK on the backend env")
 
     t = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    headers = {"Host": _HOST, "Content-Type": "application/json", "X-Sdk-Date": t}
+    headers = {"Host": _HOST, "X-Sdk-Date": t}
+    if body:
+        headers["Content-Type"] = "application/json"
 
-    signed_names = sorted(k.lower() for k in headers)
-    canon_headers = "".join(
-        f"{n}:{[headers[k] for k in headers if k.lower() == n][0].strip()}\n" for n in signed_names
-    )
+    signed_names = sorted(k.lower() for k in headers)                 # e.g. content-type;host;x-sdk-date
+    low = {k.lower(): v.strip() for k, v in headers.items()}
+    canon_headers = "\n".join(f"{n}:{low[n]}" for n in signed_names)  # NO trailing newline (SDK style)
     signed_headers = ";".join(signed_names)
-    canon_uri = path if path.endswith("/") else path + "/"
-    canonical_request = "\n".join([method, canon_uri, "", canon_headers, signed_headers, _sha256_hex(body)])
-    string_to_sign = "\n".join(["SDK-HMAC-SHA256", t, _sha256_hex(canonical_request.encode())])
+    canon_uri = path if path.endswith("/") else path + "/"           # SDK forces a trailing slash
+    canonical_request = f"{method}\n{canon_uri}\n\n{canon_headers}\n{signed_headers}\n{_sha256_hex(body)}"
+    string_to_sign = f"SDK-HMAC-SHA256\n{t}\n{_sha256_hex(canonical_request.encode())}"
     signature = hmac.new(sk.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
 
-    headers["Authorization"] = (
-        f"SDK-HMAC-SHA256 Access={ak}, SignedHeaders={signed_headers}, Signature={signature}"
-    )
+    raw_auth = f"SDK-HMAC-SHA256 Access={ak}, SignedHeaders={signed_headers}, Signature={signature}"
+    import base64
+    headers["Authorization"] = "Bearer " + base64.b64encode(raw_auth.encode()).decode()
     return headers
 
 
@@ -86,8 +87,9 @@ def _ok(env: dict) -> bool:
 
 
 def get_config(task: str = "videoscreenclear") -> dict:
-    """Fetch a task's config — the cheapest call that proves auth works (code 0 = keys good)."""
-    return _post("/skill/config.json", {"task": task})
+    """Fetch skill config — the cheapest call that proves auth works (code 0 = keys good).
+    Per WAPI docs config.json takes {gid, version}, not a task."""
+    return _post("/skill/config.json", {"gid": "", "version": "v1.0.0"})
 
 
 # ─── signing diagnostic ──────────────────────────────────────────────────────────────────────
@@ -157,65 +159,14 @@ def consume(url: str, task: str, gid: str = "", params: Optional[dict] = None) -
 # terminal status value) is read from the FIRST real consume.json response via /regen/vmake-test,
 # then finalized here. Until then this uses the best-known field names and degrades safely.
 
-def remove_captions_video(video_url: str, poll_seconds: int = 240) -> Optional[str]:
-    """Returns a clean (caption-free) video URL, or None on any failure so the caller falls back
-    to the ffmpeg-blur path. Never raises."""
-    if not is_configured():
-        return None
-    try:
-        env = consume(video_url, "videoscreenclear", params={"rsp_media_type": "url"})
-        if not _ok(env):
-            logger.warning(f"vmake videoscreenclear spawn failed: {env.get('meta')}")
-            return None
-        resp = env.get("response", {}) or {}
-        # Direct result (some tasks return synchronously)
-        done = _extract_result_url(resp)
-        if done:
-            return done
-        # Otherwise poll by the returned task/gid
-        task_id = resp.get("gid") or resp.get("task_id") or resp.get("taskId") or resp.get("id")
-        if not task_id:
-            logger.warning(f"vmake videoscreenclear: no task id in {resp}")
-            return None
-        deadline = time.time() + poll_seconds
-        while time.time() < deadline:
-            time.sleep(6)
-            p = consume(video_url, "videoscreenclear", gid=str(task_id), params={"rsp_media_type": "url"})
-            if not _ok(p):
-                continue
-            r = p.get("response", {}) or {}
-            u = _extract_result_url(r)
-            if u:
-                return u
-            if str(r.get("status", "")).lower() in ("failed", "error"):
-                logger.warning(f"vmake task {task_id} failed: {r}")
-                return None
-        logger.warning(f"vmake task {task_id} timed out after {poll_seconds}s")
-        return None
-    except Exception as e:
-        logger.warning(f"vmake remove_captions_video error: {e}")
-        return None
+def remove_captions_video(video_url: str, poll_seconds: int = 900) -> Optional[str]:
+    """Return a clean (caption-free) video URL, or None so the caller falls back to ffmpeg-blur.
 
-
-def _extract_result_url(resp: dict) -> Optional[str]:
-    """Best-effort pull of a result media URL out of the response envelope."""
-    if not isinstance(resp, dict):
-        return None
-    for k in ("url", "result_url", "resultUrl", "output_url", "media_url", "download_url"):
-        v = resp.get(k)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
-    # nested {result: {url}} / {data: {url}} / list forms
-    for k in ("result", "data", "output", "media"):
-        v = resp.get(k)
-        if isinstance(v, dict):
-            u = _extract_result_url(v)
-            if u:
-                return u
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            u = _extract_result_url(v[0])
-            if u:
-                return u
-        if isinstance(v, str) and v.startswith("http"):
-            return v
+    NOT wired yet: the real task is NOT a consume.json call. Per Vmake's SDK the flow is
+    config → OSS-upload the input (STS creds) → consume.json (quota only) → invoke to a dynamic
+    AI host → poll status until done. That needs the official SDK vendored + the alibabacloud_oss_v2
+    dependency. Auth/signing (the hard part) is solved and proven; this is the remaining plumbing.
+    """
+    logger.info("vmake remove_captions_video not wired yet (needs vendored SDK + OSS upload); "
+                "falling back to ffmpeg-blur")
     return None
