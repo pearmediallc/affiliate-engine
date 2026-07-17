@@ -1458,6 +1458,69 @@ async def regen_image(payload: dict, _auth: bool = Depends(require_service_key))
             "provider": provider, "model": model, "cost_usd": data.get("cost_usd")}
 
 
+@router.post("/recast-avatar")
+async def recast_avatar(payload: dict, _auth: bool = Depends(require_service_key)):
+    """RECAST a NEW avatar face when the avatar-lipsync path found no near-similar REAL library clip.
+    Nano Banana (Gemini image) portrait of the SAME type+setup → Seedance image-to-video talking head
+    → returns a SHORT clip URL the normal lip-sync recipe drives (it loops/extends the clip to cover
+    the VO). DEFENSIVE: returns {success:false} on any failure so the caller falls back to the
+    original attached face — this never hard-fails a live request.
+    body: {traits:{gender,age_band,scene,wardrobe,ethnicity,style,vertical}, seconds?, request_id?}"""
+    traits = payload.get("traits") or {}
+    clip_sec = max(4, min(int(payload.get("seconds") or 5), 8))   # keep it SHORT — lip-sync loops it
+    try:
+        from ..services.image_generator import ImageGeneratorService
+        from ..services.storage import StorageService
+        from ..services import fal_video as fv
+        # 1) PORTRAIT — Nano Banana / Gemini image, same type+setup, front-facing, neutral mouth
+        age = str(traits.get("age_band") or "").replace("plus", "+")
+        head = " ".join(x for x in [age, traits.get("ethnicity") or "", traits.get("gender") or "person"] if x).strip()
+        parts = [f"Photorealistic vertical 9:16 portrait of a {head}"]
+        if traits.get("wardrobe"): parts.append(f"wearing {traits['wardrobe']}")
+        if traits.get("scene"):    parts.append(f"in {traits['scene']}")
+        parts.append("front-facing talking-head framing, head and shoulders, looking straight at the "
+                     "camera, neutral closed mouth, relaxed natural expression, even soft lighting")
+        portrait_prompt = (", ".join(parts) +
+            ". Authentic UGC look, natural skin texture with real pores, realistic lighting, correct "
+            "anatomy; ONE single person only; NO on-screen text, no watermark, no plastic AI skin.")
+        svc = ImageGeneratorService()
+        img = await svc._generate_with_provider(portrait_prompt, "9:16")
+        portrait_url, img_path = img.get("url"), img.get("path")
+        if img_path:
+            key = f"regen/recast_portrait_{os.path.basename(img_path)}"
+            u = StorageService.upload_file(img_path, key)
+            if u:
+                portrait_url = StorageService.presign_url(key, expires=604800) or u
+        if not portrait_url:
+            return {"success": False, "error": "portrait generation returned no image"}
+
+        # 2) TALKING HEAD — Seedance image-to-video (portrait is the true first frame; cheapest i2v)
+        motion = ("The person looks straight at the camera and talks naturally to it, subtle head "
+                  "movement, natural blinking, gentle mouth motion, static background, locked-off "
+                  "talking-head shot.")
+        vid = await asyncio.to_thread(
+            fv.generate_video, "fal-seedance", motion,
+            image_url=portrait_url, seconds=clip_sec, aspect_ratio="9:16", resolution="480p")
+        video_url, local = vid.get("video_url"), vid.get("local_path")
+        if local:
+            key = f"regen/recast_talkinghead_{os.path.basename(local)}"
+            u = StorageService.upload_file(local, key)
+            if u:
+                video_url = StorageService.presign_url(key, expires=604800) or u
+        if not video_url:
+            return {"success": False, "error": "talking-head generation returned no video"}
+
+        cost = float(vid.get("cost_usd") or 0) + float(img.get("cost_usd") or 0)
+        rid = payload.get("request_id")
+        if rid:
+            _track_cost(rid, "recast_avatar", "fal+gemini", model="seedance-i2v", unit_type="run", cost_usd=cost)
+        return {"success": True, "video_url": video_url, "portrait_url": portrait_url,
+                "clip_seconds": clip_sec, "cost_usd": round(cost, 4)}
+    except Exception as e:
+        logger.warning(f"[recast-avatar] generation failed: {e}")
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:180]}"}
+
+
 @router.post("/creative-team/enhance")
 async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_service_key)):
     """LLM assist for the Studio composer:
@@ -3240,6 +3303,39 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # pin a script_mode, an ADMIN-APPROVED rule preferring 'verbatim' respects the supplied words
     # instead of rewriting. No active rule → unchanged (mode stays as the user/default set it).
     _script_mode_pin = (a.get("script_mode") or "").lower()
+    _interpreted_mode = _script_mode_pin           # remembered for the learning loop (before we normalize)
+    _modify_instruction = (a.get("modify_instruction") or "").strip()
+    _clip_transcript = (a.get("character_transcript") or "").strip()
+    # ATTACHMENT-SOURCED interpretation modes (from the ORBIT file-request parser). Honor them, then
+    # normalize to the existing verbatim path so everything downstream is unchanged:
+    #   reuse  → speak the clip's own transcript as-is.
+    #   modify → a concrete corrected line (base) speaks verbatim; else apply the small edit to the
+    #            transcript (a SURGICAL price/number/state swap, not a rewrite).
+    # Anything missing falls back to today's behavior, so live generation is never broken.
+    if _script_mode_pin == "reuse" and not base and _clip_transcript:
+        base = _clip_transcript
+        _script_mode_pin = "verbatim"
+    elif _script_mode_pin == "modify":
+        if base:
+            _script_mode_pin = "verbatim"          # the parser already extracted the corrected line
+        elif _modify_instruction and _clip_transcript:
+            try:
+                _d = await _gemini_json(
+                    "Apply this SMALL edit to the ad voiceover transcript. Make ONLY the change "
+                    "described (e.g. a price/number/state swap, or removing one mention). Keep every "
+                    "other word identical — do NOT rewrite or restyle. "
+                    f'Return JSON {{"script":"..."}}.\nEdit: "{_modify_instruction[:300]}".\n'
+                    f'Transcript: "{_clip_transcript[:1500]}".')
+                _edited = (_d.get("script") or "").strip()
+                base = _edited or _clip_transcript
+                _script_mode_pin = "verbatim"
+            except Exception as e:
+                logger.warning(f"[avatar-lipsync] modify edit failed, speaking transcript: {e}")
+                base = _clip_transcript
+                _script_mode_pin = "verbatim"
+        elif _clip_transcript:
+            base = _clip_transcript
+            _script_mode_pin = "verbatim"
     if bool(base) and not _script_mode_pin:
         try:
             from ..services import creative_tuner as ctun
@@ -3540,12 +3636,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         _db = SessionLocal()
         try:
             # what each BRAIN actually decided (NULL when not recoverable → excluded from ranking):
-            _script_mode = "verbatim" if verbatim else ("rewrite" if base else "from-scratch")
+            # keep the PARSER's interpreted mode (modify/reuse/verbatim) so the brains learn from the
+            # attachment-sourced jobs too; fall back to the derived mode when none was supplied.
+            _script_mode = _interpreted_mode or ("verbatim" if verbatim else ("rewrite" if base else "from-scratch"))
             _caption_method = ("veed" if _use_veed else ("ffmpeg" if ass_path else None))
+            # RECAST: tag the character_key so the loop can later learn recast (library|generated)
+            # quality from ROI/editor feedback — no new column/table needed.
+            _ckey = a.get("character_asset_id") or a.get("source_filename") or char_url
+            _recast_src = a.get("recast_source")
+            if _recast_src and _recast_src != "fallback":
+                _ckey = f"recast-{_recast_src}:{_ckey}"
             learn.log_decision(
                 _db, request_id=req.request_id, vertical=(vertical or None),
                 creative_ref=name,   # delivered filename → the key ROI joins back on
-                character_key=(a.get("character_asset_id") or a.get("source_filename") or char_url),
+                character_key=_ckey,
                 character_gender=a.get("gender"), character_age=a.get("age_band"),
                 voice_id=voice_id, voice_provider=voice_res.get("provider"),
                 voice_cloned=_cloned, lipsync_provider=sub["provider"],
