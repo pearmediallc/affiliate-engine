@@ -41,6 +41,10 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 # Kokoro (Replicate) is last so the Replicate rate-limit/credit is reserved for lip-sync.
 FALLBACK_ORDER = ["openai", "gemini", "deepgram", "elevenlabs", "kokoro"]
 
+# Read pace applied at SYNTH time (not post-hoc atempo — that would desync captions, which align
+# on the final audio). 1.1x makes the DR hook punchier without tipping into chipmunk.
+VOICE_SPEED = 1.1
+
 # ── Curated preset catalog (casting-tagged so the brain can pick the right voice) ──
 # age_band ∈ {under35,35-44,45-55,55plus}; gender ∈ {female,male}
 VOICE_CATALOG = [
@@ -258,8 +262,11 @@ def _syn_gemini(text: str, voice: str, out_path: str, style: Optional[str] = Non
     key = settings.gemini_api_key
     if not key:
         raise RuntimeError("no gemini key")
-    # Gemini TTS takes the delivery direction inline, as prose.
-    prompt = f"Say this in a {style} tone, like a real person talking to camera: {text}" if style else text
+    # Gemini TTS takes the delivery direction inline, as prose. It has no numeric speed field, so
+    # the brisk DR pace is steered in the DIRECTION clause (never after {text}, or it'd be spoken).
+    prompt = (f"Say this in a {style} tone at a brisk, upbeat pace, like a real person talking to camera: {text}"
+              if style else
+              f"Say this at a brisk, upbeat pace, like a real person talking to camera: {text}")
     r = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent",
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -300,7 +307,7 @@ def _syn_fal_clone(text: str, out_path: str, sample_url: str, ref_text: Optional
     if not sample_url:
         raise RuntimeError("fal clone needs a reference audio sample")
     payload = {"gen_text": text[:5000], "ref_audio_url": sample_url,
-               "model_type": "F5-TTS", "remove_silence": True}
+               "model_type": "F5-TTS", "remove_silence": True, "speed": VOICE_SPEED}
     if ref_text:
         payload["ref_text"] = ref_text[:2000]   # else fal ASRs the reference itself
     r = requests.post(f"https://fal.run/{FAL_CLONE_MODEL}",
@@ -350,7 +357,7 @@ def _dl(url: str, out_path: str) -> str:
 
 # ── Per-provider synthesis (each writes mp3/wav to out_path) ───────────────────
 def _syn_kokoro(text: str, voice: str, out_path: str) -> dict:
-    url = _replicate_run("jaaari", "kokoro-82m", {"text": text, "voice": voice, "speed": 1.0})
+    url = _replicate_run("jaaari", "kokoro-82m", {"text": text, "voice": voice, "speed": VOICE_SPEED})
     if not url:
         raise RuntimeError("kokoro no output")
     _dl(url, out_path)
@@ -360,9 +367,10 @@ def _syn_kokoro(text: str, voice: str, out_path: str) -> dict:
 def _syn_openai(text: str, voice: str, out_path: str, style: Optional[str] = None) -> dict:
     if not settings.openai_api_key:
         raise RuntimeError("no openai key")
-    payload = {"model": "gpt-4o-mini-tts", "input": text, "voice": voice, "response_format": "mp3"}
+    payload = {"model": "gpt-4o-mini-tts", "input": text, "voice": voice, "response_format": "mp3",
+               "speed": VOICE_SPEED}
     if style:
-        payload["instructions"] = f"Speak in a {style} tone, natural and human, like a real person in a casual selfie video."
+        payload["instructions"] = f"Speak in a {style} tone, natural and human, like a real person in a casual selfie video, brisk upbeat pace."
     r = requests.post("https://api.openai.com/v1/audio/speech",
                       headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
                       json=payload, timeout=120)

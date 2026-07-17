@@ -5,6 +5,7 @@ Accurate captions from OUR known script (no ASR guesswork → no fillers/gaps):
   2) build a clean ASS subtitle (short phrase lines, word-timed)
   3) the caller burns it with ffmpeg (subtitles=…), or VEED-via-fal for fancy styles.
 """
+import difflib
 import logging
 import os
 import re
@@ -56,33 +57,45 @@ def even_split(text: str, duration: float) -> list:
     return out
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def _relabel_with_script(timed: list, script: str) -> list:
     """Keep the aligner's TIMINGS but make the caption TEXT the exact SCRIPT tokens, so the burn
     reads as WRITTEN ("$31", not Whisper's transcribed "thirty one"). Whisper/Deepgram transcribe
     the AUDIO, which drops glyphs the voice can't pronounce (the "$"); the script is ground truth.
-    Best-effort by sequence: 1:1 when the counts match, else spread the script tokens across the
-    spoken window the aligner found — the SCRIPT token always wins."""
+
+    Per-span alignment: 1:1 when the counts match; otherwise diff the aligner words against the
+    script tokens and KEEP each matched word's REAL timestamp — redistribute ONLY inside a
+    mismatched span (e.g. "$31" ↔ "thirty one"), over that span's own sub-window. This keeps
+    on-beat timing everywhere except the tiny number/symbol spans, instead of re-laying the whole
+    track as an even split (which drifts captions ahead of the voice on any pause)."""
     tokens = [w for w in re.split(r"\s+", (script or "").strip()) if w]
     if not tokens or not timed:
         return timed
     if len(tokens) == len(timed):                      # clean 1:1 — exact per-word timing kept
         return [{"word": tok, "start": t.get("start", 0), "end": t.get("end", 0)}
                 for tok, t in zip(tokens, timed)]
-    # counts drifted (e.g. "$31" ↔ "thirty one") — spread the script across the aligned window,
-    # weighted by token length, so we still show the real text on roughly the right beat.
-    start0 = float(timed[0].get("start") or 0)
-    end0 = float(timed[-1].get("end") or 0)
-    span = end0 - start0
-    if span <= 0:
-        return [{"word": tok, "start": start0, "end": start0} for tok in tokens]
-    weights = [max(2, len(tok)) for tok in tokens]
-    total = float(sum(weights))
-    out, t = [], start0
-    for tok, wt in zip(tokens, weights):
-        dur = span * (wt / total)
-        out.append({"word": tok, "start": round(t, 3), "end": round(t + dur, 3)})
-        t += dur
-    return out
+    a = [_norm(t.get("word", "")) for t in timed]
+    b = [_norm(tok) for tok in tokens]
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_opcodes():
+        if tag == "equal":                             # matched → keep REAL whisper timing
+            for k in range(j2 - j1):
+                t = timed[i1 + k]
+                out.append({"word": tokens[j1 + k], "start": t.get("start", 0), "end": t.get("end", 0)})
+        else:                                          # local spread only (e.g. "$31" <-> "thirty one")
+            seg = timed[i1:i2] or timed[max(0, i1 - 1):i1] or timed
+            s, e = float(seg[0].get("start") or 0), float(seg[-1].get("end") or 0)
+            toks = tokens[j1:j2]
+            if not toks:
+                continue
+            span = max(0.0, e - s); wts = [max(2, len(x)) for x in toks]; tot = float(sum(wts)); t = s
+            for tok, wt in zip(toks, wts):
+                d = span * (wt / tot) if span > 0 else 0.0
+                out.append({"word": tok, "start": round(t, 3), "end": round(t + d, 3)}); t += d
+    return out or timed
 
 
 def align(audio_path: str, text: str) -> tuple:

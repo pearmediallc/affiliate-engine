@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 _BASE = "https://api.elevenlabs.io/v1"
 # Multilingual v2 is the standard high-quality cloning model.
 _TTS_MODEL = "eleven_multilingual_v2"
+# Read pace applied at SYNTH time (mirrors voice_studio.VOICE_SPEED). EL's voice_settings.speed
+# range is 0.7–1.2, so 1.1 is safely in-range — a punchier DR read without going chipmunk.
+VOICE_SPEED = 1.1
 
 
 class ElevenLabsService:
@@ -62,7 +65,7 @@ class ElevenLabsService:
         body = {
             "text": text,
             "model_id": _TTS_MODEL,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.0},
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.0, "speed": VOICE_SPEED},
         }
         with httpx.stream("POST", f"{_BASE}/text-to-speech/{voice_id}",
                           headers=ElevenLabsService._headers(json_ct=True),
