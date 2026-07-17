@@ -707,13 +707,82 @@ async def seedance_test_status(task_id: str, _auth: bool = Depends(require_servi
             "failMsg": d.get("failMsg"), "costTime": d.get("costTime")}
 
 
+# ── tag-asset cache ───────────────────────────────────────────────────────────
+# The clip content behind an S3 key never changes, so a full ffprobe+Whisper+Gemini
+# pass is paid ONCE and every later call (preview re-reads, re-generation) is a DB read.
+def _s3_key_from_url(url: str) -> str:
+    """Stable cache key = the S3 object (host + path) WITHOUT the presign query string.
+    Presigned URLs carry X-Amz-Signature/Expires that change on every call, so keying on
+    the raw url would never hit. We strip the query and key on host+path only."""
+    try:
+        from urllib.parse import urlsplit, unquote
+        u = urlsplit(url or "")
+        return unquote(f"{u.netloc}{u.path}").strip().strip("/")
+    except Exception:
+        return ""
+
+
+def _asset_tag_get(s3_key: str):
+    """Return the cached tag-asset dict for a key, or None. Never raises (a cache miss must
+    never break preview or generation)."""
+    if not s3_key:
+        return None
+    try:
+        from ..database import SessionLocal
+        from ..models.asset_tag import AssetTag
+        db = SessionLocal()
+        try:
+            row = db.query(AssetTag).filter(AssetTag.s3_key == s3_key).first()
+            return json.loads(row.tags_json) if row else None
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"tag-asset cache read failed: {e}")
+        return None
+
+
+def _asset_tag_put(s3_key: str, result: dict) -> None:
+    """Upsert a tag-asset result by key. Never raises — a cache-write failure must not break
+    the generation we just paid for."""
+    if not s3_key or not isinstance(result, dict):
+        return
+    try:
+        from ..database import SessionLocal
+        from ..models.asset_tag import AssetTag
+        payload = json.dumps(result)
+        db = SessionLocal()
+        try:
+            row = db.query(AssetTag).filter(AssetTag.s3_key == s3_key).first()
+            if row:
+                row.tags_json = payload
+            else:
+                db.add(AssetTag(s3_key=s3_key, tags_json=payload))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"tag-asset cache write failed: {e}")
+
+
 @router.post("/tag-asset")
 async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: str = Form(""),
                     age_band: str = Form(""), gender: str = Form(""), state: str = Form(""),
+                    cached_only: bool = Form(False),
                     _auth: bool = Depends(require_service_key)):
     """Index one asset: ffprobe + transcribe + vision-tag so the brain can pick the RIGHT reference.
     Folder-priors (age_band/gender/state/kind/vertical) come in as ground truth; vision confirms +
-    enriches (face_score, wardrobe, setting, style, captions). Returns the full tag record."""
+    enriches (face_score, wardrobe, setting, style, captions). Returns the full tag record.
+
+    Cached per stable S3 key: a cache hit returns immediately (no download/transcribe/vision).
+    cached_only=true makes this READ-ONLY — on a miss it returns instantly WITHOUT paying to
+    compute, so the CL preview can ask for analysis only if it already exists."""
+    s3_key = _s3_key_from_url(url)
+    cached = _asset_tag_get(s3_key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    if cached_only:
+        # preview asked for read-only: never download/transcribe/vision on a miss.
+        return {"success": True, "cached": False, "num_faces": None, "url": url, "kind": kind}
     work = tempfile.mkdtemp()
     p = None
     try:
@@ -755,7 +824,7 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
         usable_as = "avatar_lipsync" if (role == "talking_head" and face >= 0.6) else role
         # reusable talking length ≈ duration when it's a talker (approx; refined by clean-seg later)
         max_talk_sec = round(dur or 0, 1) if usable_as == "avatar_lipsync" else 0
-        return {"success": True, "url": url, "kind": kind, "vertical": vertical,
+        result = {"success": True, "url": url, "kind": kind, "vertical": vertical,
                 "duration": round(dur or 0, 1), "aspect": aspect, "has_captions": has_caps,
                 "transcript": (transcript or "")[:1500],
                 "role": role, "usable_as": usable_as, "face_score": round(face, 2),
@@ -770,6 +839,8 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
                 "character": tags.get("character") or ((f"{age_band} {gender}".strip()) or ""),
                 "scene": tags.get("scene") or "", "on_screen": tags.get("on_screen") or "",
                 "emotion": tags.get("emotion") or ""}
+        _asset_tag_put(s3_key, result)   # persist so the next call (preview/re-gen) is a DB read
+        return {**result, "cached": False}
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:180]}"}
     finally:

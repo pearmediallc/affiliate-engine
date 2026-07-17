@@ -10,6 +10,7 @@ from .audit_log import AuditLog
 from .campaign import Character, SceneSetting, Campaign, Shot, Variation
 from .harness import GenerationEvent, UserPromptProfile
 from .creative_team import CreativeTeamEvent, CreativeDecision
+from .asset_tag import AssetTag
 
 __all__ = [
     "Client", "Template", "Image", "PerformanceMetric", "GenerationFeedback",
@@ -20,4 +21,5 @@ __all__ = [
     "Character", "SceneSetting", "Campaign", "Shot", "Variation",
     "GenerationEvent", "UserPromptProfile",
     "CreativeTeamEvent",
+    "AssetTag",
 ]
