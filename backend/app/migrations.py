@@ -50,6 +50,8 @@ _REQUIRED_COLUMNS = [
     ("creative_decisions", "caption_method", "VARCHAR"),
     ("creative_decisions", "caption_removal_method", "VARCHAR"),
     ("creative_decisions", "blamed_brains", "TEXT"),
+    # Diversification axis the creative was generated along (character|script|hook|format)
+    ("creative_decisions", "variation_axis", "VARCHAR"),
     # Admin-approval gate — engine reads a governed rule ONLY when an admin approved it (active).
     ("creative_brain_rules", "active", "BOOLEAN DEFAULT FALSE"),
 ]

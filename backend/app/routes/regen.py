@@ -3301,6 +3301,36 @@ async def resume_pending_lipsync():
         asyncio.create_task(_resume_one_lipsync(row))
 
 
+def _script_axis_directive(index: int, total: int) -> str:
+    """The instruction that makes the writer produce the index-th DISTINCT script — a different hook
+    AND angle per index — for the SAME offer/vertical/character."""
+    return (f"IMPORTANT — DIVERSIFICATION: this is script variation {index} of {total} in a set "
+            f"generated for the SAME offer, vertical, and character. Make it MEANINGFULLY DIFFERENT "
+            f"from the other variations: a DISTINCT opening hook AND a DISTINCT angle — not a reworded "
+            f"version of the same script. Do not reuse the framing another variation would pick.")
+
+
+async def _diversify_hook(script: str, index: int, total: int, offer_value: str, seconds: int) -> str:
+    """HOOK axis: rewrite ONLY the opening 1-2 sentences so this variation opens differently, keeping
+    every following sentence identical. Defensive — returns the ORIGINAL script on any failure so a
+    diversification miss never crashes (or even alters) the render."""
+    try:
+        d = await _gemini_json(
+            "Here is a first-person UGC ad voiceover script. Rewrite ONLY the opening hook (its first "
+            "1-2 sentences) so it opens with a DIFFERENT angle. Keep EVERY following sentence EXACTLY "
+            "as given — do not touch the body or the CTA. "
+            f"This is hook variation {index} of {total}; make this opening meaningfully distinct from "
+            f"the other variations (a different first line, not a reword)."
+            + (f" Keep the offer {offer_value} intact." if offer_value else "")
+            + f" Keep it spoken, ~{seconds}s, no stage directions. "
+            f'Script: "{script[:1500]}". Return JSON {{"script":"..."}}.')
+        new = _clean_script((d.get("script") or "").strip())
+        return new or script
+    except Exception as e:
+        logger.warning(f"[avatar-lipsync] hook diversification skipped: {e}")
+        return script
+
+
 async def recipe_avatar_lipsync(req: RunRequest) -> list:
     """The team's real CapCut flow, automated end-to-end: take a REAL character clip from
     our own asset library, write/adapt a natural spoken script (inserting the offer value),
@@ -3321,6 +3351,26 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     vertical = a.get("vertical") or req.context.get("vertical") or ""
     base = (a.get("script") or "").strip()
     brief = (a.get("brief") or req.expectation or "").strip()
+
+    # ── DIVERSIFICATION AXIS (shared contract with the creative-library caller) ────────────────
+    # CL may ask for N GENUINELY-different variations of ONE request along one axis. Absent / total<=1
+    # → exactly today's single-variation behavior, unchanged. Parsed defensively; a bad value → no-op.
+    _axis = (a.get("variation_axis") or "").strip().lower()
+    try:
+        _vidx = int(a.get("variation_index") or 1)
+    except (TypeError, ValueError):
+        _vidx = 1
+    try:
+        _vtot = int(a.get("variation_total") or 1)
+    except (TypeError, ValueError):
+        _vtot = 1
+    _diversify = _axis in ("script", "hook", "character", "format") and _vtot > 1 and _vidx >= 1
+    # This recipe produces ONE footage FORMAT only (talking-head lip-sync on the supplied real clip),
+    # so a 'format' ask has no alternate format to pick HERE → fall back to 'character' behavior (face
+    # variety is delivered upstream by CL passing a distinct character_video_url per index).
+    _axis_eff = "character" if (_diversify and _axis == "format") else _axis
+    _axis_note = (f"format axis: only talking-head available in this recipe → treated like character"
+                  if (_diversify and _axis == "format") else "")
 
     # 1) SCRIPT.
     # If the user HANDED US a script, that IS the script — speak it. The writer silently replacing
@@ -3376,6 +3426,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception:
             pass
     verbatim = bool(base) and _script_mode_pin == "verbatim"
+    # SCRIPT axis: ask the writer for the index-th DISTINCT script (a different hook AND angle). Only
+    # applies when we're actually writing — a verbatim user script can't be rewritten, so the script
+    # axis degrades to varying the HOOK only (handled after the script is finalized, below).
+    _script_directive = (_script_axis_directive(_vidx, _vtot)
+                         if (_diversify and _axis_eff == "script" and not verbatim) else "")
     script = base or brief
     offer_desc = " ".join(x for x in [
         brief,
@@ -3389,7 +3444,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             raise _Verbatim()          # the user's words win — skip the writer AND the critic
         from ..services import creative_team as team
         _strategy, script = await team.strategize_and_write(
-            offer_desc=offer_desc, vertical=(vertical or "home_insurance"), request_type="ugc")
+            offer_desc=offer_desc, vertical=(vertical or "home_insurance"), request_type="ugc",
+            variation_directive=_script_directive)
         script = (script or base or brief).strip()
         # Critic pass — score the opening hook; rewrite only if weak (guards against slop)
         try:
@@ -3415,6 +3471,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 f"Vertical: {vertical or 'direct-response'}. ~{seconds}s (~{int(seconds * 2.6)} words). "
                 + (f'Base: "{base[:1000]}". ' if base else "") + (f'Brief: "{brief[:500]}". ' if brief else "")
                 + (f'Must say {offer_value}. ' if offer_value else "")
+                + (_script_directive + " " if _script_directive else "")
                 + 'Hook hard in the first line, no stage directions. Return JSON {"script":"..."}.')
             script = (d.get("script") or script).strip()
         except Exception:
@@ -3422,6 +3479,12 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     script = _clean_script(script)
     if not script:
         raise RuntimeError("avatar-lipsync: no script and could not generate one")
+    # HOOK axis — keep the body, vary only the opening per index. Also the graceful degrade for a
+    # SCRIPT axis on a verbatim user script (we can't rewrite their words, so we vary the hook only).
+    if _diversify and (_axis_eff == "hook" or (_axis_eff == "script" and verbatim)):
+        script = await _diversify_hook(script, _vidx, _vtot, offer_value, seconds)
+        if _axis_eff == "script" and verbatim:
+            _axis_note = "script axis on a verbatim user script → varied the opening HOOK only"
     act.finish("scriptwriter", req.request_id, t0,
                detail=("used YOUR script verbatim · " if verbatim else "") + script[:160])
     _track_cost(req.request_id, "script", ("none" if verbatim else "gemini"),
@@ -3663,6 +3726,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
           + (" · script: yours, verbatim" if verbatim else "")
           + (f" · captions {_cap_method}" if (a.get("captions") and ass_path) else "")
           + (" · captions VEED" if _use_veed else "")
+          + (f" · variation {_vidx}/{_vtot} on the {_axis} axis" if _diversify else "")
+          + (f" · ⚠ {_axis_note}" if _axis_note else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
     variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": _cloned,
                     "voice_swapped": bool(_swapped), "voice_requested": voice_res.get("requested"),
@@ -3696,6 +3761,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 script_ref=(a.get("script_ref") or None), captions=bool(ass_path or _use_veed),
                 script_mode=_script_mode, caption_method=_caption_method,
                 caption_removal_method=(variant.get("caption_removal") or None),
+                # the REQUESTED diversification axis (NULL for single-variation jobs) so editor
+                # feedback ("wanted different scripts, not faces") can later train an axis classifier.
+                variation_axis=(_axis or None),
                 qc_passed=True, cost_usd=float(_lip_cost or 0))
         finally:
             _db.close()

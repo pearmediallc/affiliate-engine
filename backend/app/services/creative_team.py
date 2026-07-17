@@ -351,7 +351,8 @@ _STRATEGY_SPEC = {"diagnosis": str, "lagging_metric": str, "angle": str,
 
 async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: str,
                                loser_transcript: str = "", loser_metrics: Optional[dict] = None,
-                               winner_hook: str = "", winner_transcript: str = "") -> tuple:
+                               winner_hook: str = "", winner_transcript: str = "",
+                               variation_directive: str = "") -> tuple:
     """MERGED Strategist + Script Writer in ONE round-trip (diagnosis + script together) — halves
     latency/cost vs two sequential calls. Returns (strategy: Strategy, script: str). Falls back to
     the two deterministic heuristics if the LLM is unavailable."""
@@ -374,7 +375,7 @@ LOSER METRICS (lower=worse): {json.dumps(metrics)[:500]}
 LOSER TRANSCRIPT: {_sanitize(loser_transcript, MAX_TRANSCRIPT)}
 WINNING HOOK to open on: {_sanitize(winner_hook, MAX_HOOK)}
 WINNER SCRIPT (proven structure): {_sanitize(winner_transcript, MAX_WINNER_TX)}
-
+{(_sanitize(variation_directive, 400) + chr(10)) if variation_directive else ""}
 Script rules: hook in the first sentence; one idea per sentence; clean CTA; 40-90 words; first-person;
 no stage directions or on-screen-text markers.
 Return STRICT JSON: {{"diagnosis": "...", "lagging_metric": "hook_rate|hold_rate|offer_cr|ctr|roas|unknown",

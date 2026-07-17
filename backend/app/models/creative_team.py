@@ -120,6 +120,10 @@ class CreativeDecision(Base):
     #   "[]"  → verdict given but ambiguous — trains NO brain, creative-level stat only
     #   '["voice_cast"]' → ONLY the named brains take the loss; unnamed brains stay unlabeled
     blamed_brains = Column(Text, nullable=True)
+    # Which diversification AXIS this creative was generated along (character|script|hook|format),
+    # NULL for single-variation jobs. Lets editor feedback ("wanted different scripts, not faces")
+    # later train an axis classifier — the loop knows WHAT kind of variety was asked for.
+    variation_axis = Column(String, index=True, nullable=True)
     qc_passed = Column(Boolean, default=True)
     qc_reasons = Column(Text, nullable=True)
     cost_usd = Column(Float, default=0.0)
