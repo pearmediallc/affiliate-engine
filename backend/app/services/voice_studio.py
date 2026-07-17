@@ -15,7 +15,7 @@ Providers, in cost order (fallback chain flows down this list):
 
 Public API:
   list_voices()                                   -> [{id,name,provider,gender,age_band,style,cloned}]
-  pick_voice(gender=, age_band=, style=)          -> voice dict   (brain casting, 45-55 woman default)
+  pick_voice(gender=, age_band=, style=)          -> voice dict   (brain casting; gender is a HARD filter, unknown gender raises UnknownGenderError)
   synthesize(text, voice_id=, out_path=, style=)  -> {path, provider, voice, cost_usd}
   clone_voice(sample_url, name)                   -> {voice_id, provider}   (chatterbox; 11labs fallback)
 """
@@ -197,21 +197,42 @@ def age_style(age_band: str | None, gender: str | None = None) -> str:
     }.get(age_band or "", f"a {who} speaking naturally to camera")
 
 
+class UnknownGenderError(ValueError):
+    """pick_voice was asked to cast without a known character gender. We refuse to guess — a man
+    must never receive a woman's voice — so the caller must fail the voice cast CLOSED (surface
+    "character gender unknown — voice not cast") rather than ship a guessed voice. It subclasses
+    ValueError so a plain `except ValueError` still catches it."""
+    pass
+
+
 def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
                style: Optional[str] = None, cloned: Optional[list] = None,
                tone: Optional[str] = None, roi_scores: Optional[dict] = None) -> dict:
     """Brain casting: best catalog match among voices we can ACTUALLY synthesize.
-    Default bias = 45-55 woman (house rule). `tone` is the script's register
-    (e.g. "serious, informational" / "upbeat") so the voice matches the writing."""
-    gender = gender or "female"
+    Gender is a HARD filter — only voices of the character's gender are eligible; there is NO
+    default gender, an unknown gender raises UnknownGenderError so the pipeline fails closed
+    instead of guessing. `tone` is the script's register (e.g. "serious, informational" /
+    "upbeat") so the voice matches the writing."""
+    g = (gender or "").strip().lower()
+    if g not in ("male", "female"):
+        # NEVER guess gender — a wrong guess ships a man with a woman's voice. Fail closed and let
+        # the caller abort the voice cast with a clear reason.
+        raise UnknownGenderError(
+            f"character gender unknown — voice not cast (got {gender!r}; expected 'male' or 'female')")
     age_band = age_band or "45-55"
-    # only voices whose provider key is live, and never auto-cast an androgynous voice
-    pool = [v for v in list_voices(cloned, only_available=True) if v.get("auto_cast") is not False]
+    # HARD gender filter: only voices of THIS gender are eligible — the other gender is excluded
+    # entirely (never a soft weight), and we never auto-cast an androgynous voice.
+    pool = [v for v in list_voices(cloned, only_available=True)
+            if v.get("auto_cast") is not False and (v.get("gender") or "").lower() == g]
+    if not pool:
+        # this gender has NO eligible voice in ANY configured provider — surface it clearly;
+        # do NOT fall back to the other gender.
+        raise ValueError(f"no {g} voice available in any configured provider")
     want = " ".join(x for x in [style, tone] if x).lower()
     scored = []
     for v in pool:
         s = 0
-        if v.get("gender") == gender: s += 5          # gender is non-negotiable
+        # gender already guaranteed to match (hard-filtered above) — rank within by age/tone/roi
         if v.get("age_band") == age_band: s += 3
         vstyle = (v.get("style") or "").lower()
         if want and vstyle:                            # tone/style overlap on any word
@@ -219,14 +240,11 @@ def pick_voice(*, gender: Optional[str] = None, age_band: Optional[str] = None,
         if v.get("provider") in ("elevenlabs", "openai", "deepgram"): s += 1   # avoid Replicate for auto-cast
         if v.get("cloned"): s += 2                     # prefer our own cloned voices when present
         # LEARNED bias: a voice that has earned ROI gets up to +2. Bounded so it TIE-BREAKS among
-        # gender/age-correct voices — it can never override a gender match (+5). Zero at cold start.
+        # age-correct voices of the SAME gender. Zero at cold start.
         s += 2 * float((roi_scores or {}).get(v.get("id"), 0) or 0)
         scored.append((s, v))
     scored.sort(key=lambda x: x[0], reverse=True)
-    if scored:
-        return scored[0][1]
-    # nothing configured at all — fall back to the catalog default rather than crashing
-    return _by_id("openai:nova") or {"id": "kokoro:af_sarah", "provider": "kokoro"}
+    return scored[0][1]
 
 
 # ── Gemini TTS (prebuilt voices + natural-language style steering) ────────────

@@ -56,15 +56,51 @@ def even_split(text: str, duration: float) -> list:
     return out
 
 
+def _relabel_with_script(timed: list, script: str) -> list:
+    """Keep the aligner's TIMINGS but make the caption TEXT the exact SCRIPT tokens, so the burn
+    reads as WRITTEN ("$31", not Whisper's transcribed "thirty one"). Whisper/Deepgram transcribe
+    the AUDIO, which drops glyphs the voice can't pronounce (the "$"); the script is ground truth.
+    Best-effort by sequence: 1:1 when the counts match, else spread the script tokens across the
+    spoken window the aligner found — the SCRIPT token always wins."""
+    tokens = [w for w in re.split(r"\s+", (script or "").strip()) if w]
+    if not tokens or not timed:
+        return timed
+    if len(tokens) == len(timed):                      # clean 1:1 — exact per-word timing kept
+        return [{"word": tok, "start": t.get("start", 0), "end": t.get("end", 0)}
+                for tok, t in zip(tokens, timed)]
+    # counts drifted (e.g. "$31" ↔ "thirty one") — spread the script across the aligned window,
+    # weighted by token length, so we still show the real text on roughly the right beat.
+    start0 = float(timed[0].get("start") or 0)
+    end0 = float(timed[-1].get("end") or 0)
+    span = end0 - start0
+    if span <= 0:
+        return [{"word": tok, "start": start0, "end": start0} for tok in tokens]
+    weights = [max(2, len(tok)) for tok in tokens]
+    total = float(sum(weights))
+    out, t = [], start0
+    for tok, wt in zip(tokens, weights):
+        dur = span * (wt / total)
+        out.append({"word": tok, "start": round(t, 3), "end": round(t + dur, 3)})
+        t += dur
+    return out
+
+
 def align(audio_path: str, text: str) -> tuple:
     """Word timings that are NEVER empty. Returns (words, method).
     Real aligners first (their timings track the actual voice, so captions stay on the beat);
-    even-split only as a last resort — it is approximate and WILL feel off-pace."""
-    for name, fn in (("elevenlabs-fa", lambda: _elevenlabs_align(audio_path, text)),
-                     ("whisper", lambda: _whisper_align(audio_path)),
-                     ("deepgram", lambda: _deepgram_align(audio_path))):
+    even-split only as a last resort — it is approximate and WILL feel off-pace.
+
+    ElevenLabs FA aligns OUR script text directly, so its words already read as written. The
+    Whisper/Deepgram fallbacks TRANSCRIBE the audio (losing the "$" etc.), so we keep their real
+    TIMINGS but relabel the text with the SCRIPT tokens whenever we have a script."""
+    for name, fn, from_script in (
+            ("elevenlabs-fa", lambda: _elevenlabs_align(audio_path, text), True),
+            ("whisper", lambda: _whisper_align(audio_path), False),
+            ("deepgram", lambda: _deepgram_align(audio_path), False)):
         out = fn()
         if out:
+            if not from_script and (text or "").strip():   # transcription path → script text wins
+                out = _relabel_with_script(out, text)
             logger.info(f"captions: aligned via {name} ({len(out)} words)")
             return out, name
     dur = audio_duration(audio_path)

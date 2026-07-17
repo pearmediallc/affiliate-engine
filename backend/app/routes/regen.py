@@ -742,6 +742,7 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
                     '"wardrobe":"<short or none>", "scene":"<setting in <=8 words>", '
                     '"style":"<ugc_handheld|cinematic|animated|studio, or none>", '
                     '"face_score":<0.0-1.0 how clean/front-facing a single talking face is; 0 if no face>, '
+                    '"num_faces":<int count of distinct human faces clearly visible in frame; 0 if none>, '
                     '"num_people":<int>, '
                     '"on_screen":"<key objects/proof e.g. document, phone, house, cash, or none>", '
                     '"emotion":"<energy/expression in 1-2 words>"}')
@@ -763,6 +764,9 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
                 "state": state or "", "max_talk_sec": max_talk_sec,
                 "ethnicity": tags.get("ethnicity") or "", "wardrobe": tags.get("wardrobe") or "",
                 "style": tags.get("style") or "", "num_people": tags.get("num_people"),
+                # distinct faces in frame → CL warns when a clip has 2+ people (they'd share one
+                # voice today). null when the vision model didn't return it (never fail on absence).
+                "num_faces": tags.get("num_faces"),
                 "character": tags.get("character") or ((f"{age_band} {gender}".strip()) or ""),
                 "scene": tags.get("scene") or "", "on_screen": tags.get("on_screen") or "",
                 "emotion": tags.get("emotion") or ""}
@@ -1298,27 +1302,38 @@ async def learn_decisions(request_id: str, _auth: bool = Depends(require_service
     from ..services import learning_loop as learn
     db = SessionLocal()
     try:
-        decisions = learn.decisions_for_job(db, request_id)
-        # brain-level breakdown per decision row
-        from ..models.creative_team import CreativeDecision
-        rows = (db.query(CreativeDecision)
-                  .filter(CreativeDecision.request_id == request_id)
-                  .order_by(CreativeDecision.created_at.asc()).all())
+        decisions = learn.decisions_for_job(db, request_id)   # already defensive → [] on any error
         breakdown = []
-        for r in rows:
-            blamed = learn._blamed(r) or set()
-            brains = {}
-            for brain, col in learn.BRAIN_COLUMN.items():
-                chosen = getattr(r, col, None)
-                if chosen is None:
-                    continue
-                lab = learn._brain_label(r, brain)
-                brains[brain] = {"chosen": chosen,
-                                 "verdict": ("win" if lab == 1 else "loss" if lab == 0 else "pending"),
-                                 "blamed": brain in blamed}
-            breakdown.append({"creative_ref": r.creative_ref, "vertical": r.vertical,
-                              "human_verdict": r.human_verdict, "reason": r.human_reason,
-                              "roi": r.roi, "brains": brains})
+        # brain-level breakdown per decision row. GUARDED: this query SELECTs the per-brain columns,
+        # so a schema-drift OperationalError/UndefinedColumn in prod (a creative_decisions table that
+        # predates a migrated column, e.g. caption_method) must degrade to [] here — NOT 500 the
+        # endpoint. The docstring promise ("never raises") only holds because of this guard.
+        try:
+            from ..models.creative_team import CreativeDecision
+            rows = (db.query(CreativeDecision)
+                      .filter(CreativeDecision.request_id == request_id)
+                      .order_by(CreativeDecision.created_at.asc()).all())
+            for r in rows:
+                blamed = learn._blamed(r) or set()
+                brains = {}
+                for brain, col in learn.BRAIN_COLUMN.items():
+                    chosen = getattr(r, col, None)
+                    if chosen is None:
+                        continue
+                    lab = learn._brain_label(r, brain)
+                    brains[brain] = {"chosen": chosen,
+                                     "verdict": ("win" if lab == 1 else "loss" if lab == 0 else "pending"),
+                                     "blamed": brain in blamed}
+                breakdown.append({"creative_ref": r.creative_ref, "vertical": r.vertical,
+                                  "human_verdict": r.human_verdict, "reason": r.human_reason,
+                                  "roi": r.roi, "brains": brains})
+        except Exception as e:
+            try:
+                db.rollback()   # a failed SELECT leaves the session in a broken txn on Postgres
+            except Exception:
+                pass
+            logger.warning(f"[learn] decisions breakdown failed for {request_id}: {e}")
+            breakdown = []
         return {"success": True, "request_id": request_id, "decisions": decisions,
                 "brain_breakdown": breakdown}
     finally:
@@ -1359,9 +1374,17 @@ async def list_voices(gender: str = "", age_band: str = "", _auth: bool = Depend
     voices = vs.list_voices(only_available=True)
     if gender: voices = [v for v in voices if v.get("gender") == gender]
     if age_band: voices = [v for v in voices if v.get("age_band") == age_band]
+    # Only recommend when a gender is actually specified — pick_voice refuses to guess gender,
+    # so an unspecified/absent gender means no recommendation (the picker shows the full list).
+    recommended = None
+    if gender:
+        try:
+            recommended = vs.pick_voice(gender=gender, age_band=age_band or None)
+        except ValueError:
+            recommended = None
     return {"success": True, "count": len(voices), "voices": voices,
             "clone_available": vs.clone_available(),
-            "recommended": vs.pick_voice(gender=gender or None, age_band=age_band or None)}
+            "recommended": recommended}
 
 
 @router.post("/tts")
@@ -2307,9 +2330,13 @@ async def recipe_script_rewrite(req: RunRequest) -> list:
             from ..services import voice_studio as _vs
             ctx = req.context or {}
             char = ctx.get("character") or {}
-            picked = _vs.pick_voice(gender=ctx.get("gender") or char.get("gender"),
-                                    age_band=ctx.get("age_band") or char.get("age_band"),
-                                    tone=(req.context.get("diagnosis", {}) or {}).get("directive_hint"))
+            try:
+                picked = _vs.pick_voice(gender=ctx.get("gender") or char.get("gender"),
+                                        age_band=ctx.get("age_band") or char.get("age_band"),
+                                        tone=(req.context.get("diagnosis", {}) or {}).get("directive_hint"))
+            except ValueError as _ve:
+                # unknown character gender / no eligible voice — don't guess a preset; fail closed.
+                raise RuntimeError(f"voice not cast: {_ve}")
             await asyncio.to_thread(_vs.synthesize, new_script, voice_id=picked.get("id"), out_path=vo)
 
         name, out_path, url = _out_url(req, "script")
@@ -3440,9 +3467,17 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             _ldb.close()
     except Exception:
         _vscores = {}
-    voice_id = a.get("voice_id") or vs.pick_voice(
-        gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone"),
-        roi_scores=_vscores).get("id")
+    voice_id = a.get("voice_id")
+    if not voice_id:
+        try:
+            voice_id = vs.pick_voice(
+                gender=a.get("gender"), age_band=a.get("age_band"), tone=a.get("tone"),
+                roi_scores=_vscores).get("id")
+        except ValueError as _ve:
+            # No known character gender (or no eligible voice for it) — NEVER guess, or a man
+            # ships with a woman's voice. Fail the voice cast CLOSED with a clear reason.
+            _set_lipsync_status(req.request_id, "failed", str(_ve)[:250])
+            raise RuntimeError(str(_ve))
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
     # TELL the model who is speaking. Casting a "55plus" voice is not enough on its own — the
     # delivery has to be directed too, or a 70-year-old woman on screen is read by a bright
@@ -3501,7 +3536,12 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     # ── VERIFIER GATE (deterministic, no LLM) — the money is spent at lip-sync, so a slow/mismatched
     # voice must be caught HERE, not shipped. This is the loop's gate; it never edits itself.
-    _vmeta = next((v for v in vs.list_voices() if v.get("id") == voice_id), {})
+    # Grade the voice we ACTUALLY cast: synthesize() can fall back to a different provider/voice, so
+    # resolve the real cast voice's meta first, and only fall back to the requested id (e.g. when the
+    # cast voice is a clone of the character, which is that character's own gender by construction).
+    _cast_id = f"{voice_res.get('provider')}:{voice_res.get('voice')}"
+    _vmeta = (next((v for v in vs.list_voices() if v.get("id") == _cast_id), None)
+              or next((v for v in vs.list_voices() if v.get("id") == voice_id), {}))
     from ..services import creative_qc as qc
     _qc = qc.verify_pre_lipsync(
         script=script, vo_seconds=vo_sec,
