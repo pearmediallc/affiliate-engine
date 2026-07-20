@@ -3011,8 +3011,11 @@ async def _cast_library_avatar(intent: dict):
             s -= 1
         if want_a and (t.get("age_band") or "").lower() == want_a:
             s += 2
+        # FIX 3: STRONGLY prefer same-vertical clips (dominates gender/age) so a talking-head fallback
+        # doesn't cast an off-topic-vertical face. Soft (additive) — never a hard filter, so when no
+        # vertical-tagged clip exists the full ranked set still stands (relaxes automatically).
         if want_vert and (t.get("vertical") or "").lower() == want_vert:
-            s += 1
+            s += 6
         if want_scene and want_scene in (t.get("scene") or "").lower():
             s += 1
         return s
@@ -3084,9 +3087,35 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
             logger.error(f"[generate] avatar-lipsync fallback failed: {e}")
             reasons.append(f"avatar-lipsync: {str(e)[:120]}")
 
-    # TIER 2 — curated best-match library clip (no generation at all)
+    # TIER 2 — curated best-match library clip (no generation at all).
+    # FIX 2: topic-gate the raw clip before shipping. When we CAN vision-check it and it's clearly
+    # OFF-TOPIC for this offer, do NOT ship it — raise the clean, actionable failure instead of
+    # surfacing an unrelated clip as "the answer". GUARD: if the relevance check itself is
+    # unavailable/errors (no vision key, download/ffmpeg fail, no frames), log and ALLOW — a
+    # vision-less env must never be bricked. (_asset_is_relevant already fails-open on its own.)
     pick = avatar_url or any_url
     if pick:
+        _on_topic = True
+        try:
+            import tempfile as _tf, shutil as _sh
+            _wd = _tf.mkdtemp()
+            try:
+                _clip = await _download_to_temp(pick, suffix=".mp4")
+                _frames = await asyncio.to_thread(_extract_frames, _clip, [0.5, 1.5], _wd)
+                if _frames:
+                    _on_topic = await _asset_is_relevant(_frames, prompt)
+                # no frames → cannot verify → treat as unverifiable (allow)
+            finally:
+                _sh.rmtree(_wd, ignore_errors=True)
+        except Exception as _e:
+            logger.warning(f"[generate] TIER2 relevance check unavailable, allowing clip: {_e}")
+            _on_topic = True
+        if not _on_topic:
+            logger.warning("[generate] TIER2 library clip is OFF-TOPIC for the offer — refusing to ship it")
+            raise _AllVideoProvidersDown(
+                "Text-to-video providers are unavailable and the closest library clip is off-topic for "
+                "this offer, so nothing on-topic can be produced. " + note + " Top up Kie.ai or fal "
+                "credits, or add relevant tagged library clips.")
         return [{"recipe": "Generate — Curated library match (providers unavailable)",
                  "video_url": pick, "confidence": 0.3,
                  "whats_changed": ("Closest match from your library — " + note + " Generation providers "
@@ -3127,6 +3156,7 @@ async def recipe_generate(req: RunRequest) -> list:
             "first 2 seconds, no silent lead-in, no dead air, no slow intro.")
     try:
         name, out_path, url = _out_url(req, "genvideo")
+        _avatar_plan = False   # FIX 1: set when the brain's plan routes this request to avatar-lipsync
 
         # EVERYTHING goes through the creative office (nothing bypassed): the team refines the
         # prompt (anti-slop + no-on-screen-text) and the desks light up under this job_id.
@@ -3146,10 +3176,57 @@ async def recipe_generate(req: RunRequest) -> list:
             # AUTO: let the brain's Playbook route pick the engine (ChatGPT-style — user needn't choose)
             if engine in ("", "auto"):
                 routed = ((plan.get("plan") or {}).get("route") or {}).get("engine") or "seedance"
+                # FIX 1: a talking-head/UGC plan (route=avatar_lipsync) must run the FUNDED avatar-
+                # lipsync recipe (TTS + LatentSync — NO t2v credits), not collapse to Seedance which
+                # dies on credits. Flag it here; the reroute (with a castable-avatar guard) runs below,
+                # OUTSIDE this try so a recipe failure/Cancelled isn't swallowed. Scenic/b-roll routes
+                # (seedance / veo_extend / image_to_video) are UNCHANGED — genuine text-to-video.
+                if routed == "avatar_lipsync":
+                    _avatar_plan = True
                 engine = "veo-extend" if routed == "veo_extend" else ("seedance" if routed in ("seedance", "avatar_lipsync", "image_to_video") else "seedance")
-                logger.info(f"[generate] brain routed engine → {engine} (from {routed})")
+                logger.info(f"[generate] brain routed engine → {engine} (from {routed}"
+                            + ("; talking-head plan → will try funded avatar-lipsync" if _avatar_plan else "") + ")")
         except Exception as e:
             logger.warning(f"generate: team pass skipped ({e})")
+
+        # FIX 1 (reroute): plan chose avatar_lipsync → run the funded lip-sync recipe instead of a
+        # credit-hungry t2v. GUARDS: only when a suitable avatar clip is castable (CL-supplied
+        # fallback_avatar_url, else a library cast); if NONE is castable we KEEP t2v (fall through) —
+        # never hard-fail. If the recipe itself errors (non-cancellation), also fall back to t2v.
+        if _avatar_plan:
+            _cl = req.assets if isinstance(req.assets, dict) else {}
+            _cast_url = _cl.get("fallback_avatar_url") or _cl.get("library_avatar_url")
+            if not _cast_url:
+                try:
+                    _cu, _ct, _au, _at = await _cast_library_avatar(await _parse_intent_text(prompt))
+                    _cast_url = _cu   # only the avatar-lipsync-ready pick (never the any-clip pick)
+                except Exception as _e:
+                    logger.warning(f"[generate] avatar cast probe failed: {_e}")
+                    _cast_url = None
+            if _cast_url:
+                _vert = (req.context.get("vertical", "") if isinstance(req.context, dict) else "") or ""
+                req.assets = {**(req.assets or {}),
+                              "character_video_url": _cast_url,
+                              "script": (assets.get("prompt") or prompt),
+                              "seconds": int(seconds), "vertical": _vert}
+                logger.info(f"[generate] plan → avatar_lipsync; running funded lip-sync on {_cast_url}")
+                try:
+                    out = await recipe_avatar_lipsync(req)
+                except Cancelled:
+                    raise
+                except Exception as _e:
+                    logger.error(f"[generate] plan avatar-lipsync failed ({_e}) — falling back to t2v")
+                    out = None
+                if out:
+                    for r in out:
+                        r["recipe"] = "Generate — Avatar Lip-sync (talking-head plan)"
+                        r["whats_changed"] = ("Talking-head plan — cast a matching library avatar and "
+                            "lip-synced your script to it (no text-to-video credits used). "
+                            + (r.get("whats_changed") or ""))[:600]
+                    return out
+            else:
+                logger.info("[generate] plan → avatar_lipsync but no castable avatar — keeping text-to-video")
+
         prompt = (prompt + HOOK + NO_TEXT)[:1900]
 
         if engine in ("veo-extend", "veo", "veo3-google"):
