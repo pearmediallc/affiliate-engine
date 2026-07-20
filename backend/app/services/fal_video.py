@@ -53,14 +53,21 @@ def generate_video(model_id: str, prompt: str, *, image_url: str = None, seconds
     r = requests.post(base, headers={**h, "Content-Type": "application/json"}, json=inp, timeout=30)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"fal {model_id} {r.status_code}: {r.text[:200]}")
-    rid = r.json().get("request_id")
+    sub = r.json()
+    rid = sub.get("request_id")
+    # fal collapses MULTI-segment model slugs (e.g. fal-ai/bytedance/seedance/v1/lite/text-to-video)
+    # down to the APP prefix (fal-ai/bytedance) in its queue URLs — so rebuilding the poll URL from
+    # the full slug 404/405s and yields a non-JSON body ("Expecting value: line 1 column 1"). ALWAYS
+    # follow the status_url / response_url fal hands back in the submit response instead.
+    status_url = sub.get("status_url") or f"{base}/requests/{rid}/status"
+    result_url = sub.get("response_url") or f"{base}/requests/{rid}"
     out = None
     for _ in range(150):   # ~10 min
         time.sleep(4)
-        s = requests.get(f"{base}/requests/{rid}/status", headers=h, timeout=30).json()
+        s = requests.get(status_url, headers=h, timeout=30).json()
         st = (s.get("status") or "").upper()
         if st == "COMPLETED":
-            res = requests.get(f"{base}/requests/{rid}", headers=h, timeout=30).json()
+            res = requests.get(result_url, headers=h, timeout=30).json()
             out = (res.get("video") or {}).get("url") or res.get("video_url")
             break
         if st in ("FAILED", "ERROR"):
