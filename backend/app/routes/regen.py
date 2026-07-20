@@ -3063,7 +3063,11 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
            text-to-video credits), then
        (2) return the single best-match library clip as a curated suggestion.
     The user ALWAYS gets something usable — never a bare 'credits insufficient' error."""
-    note = "Text-to-video providers unavailable (" + "; ".join(reasons[:3]) + ")."
+    # Build the human note FRESH at each use from the CURRENT reasons list — never snapshot it here.
+    # TIER1 (avatar-lipsync) appends its own failure reason AFTER this point, so a snapshot taken now
+    # would silently drop the real cause and make an avatar-lipsync failure look like a bare t2v outage.
+    def _note() -> str:
+        return "Text-to-video providers unavailable (" + "; ".join(reasons[:6]) + ")."
     intent = await _parse_intent_text(prompt)
     avatar_url, _atags, any_url, _anytags = await _cast_library_avatar(intent)
     # PREFER a clip cast from the REAL curated avatar library (creative-library's asset_library,
@@ -3092,7 +3096,7 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
             out = await recipe_avatar_lipsync(req)
             for r in (out or []):
                 r["recipe"] = "Generate — Library Avatar Lip-sync (t2v fallback)"
-                r["whats_changed"] = ("Built from your library footage — " + note + " Cast a matching "
+                r["whats_changed"] = ("Built from your library footage — " + _note() + " Cast a matching "
                     "avatar clip and lip-synced your script to it (no text-to-video credits used). "
                     + (r.get("whats_changed") or ""))[:600]
             if out:
@@ -3130,18 +3134,18 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
             logger.warning("[generate] TIER2 library clip is OFF-TOPIC for the offer — refusing to ship it")
             raise _AllVideoProvidersDown(
                 "Text-to-video providers are unavailable and the closest library clip is off-topic for "
-                "this offer, so nothing on-topic can be produced. " + note + " Top up Kie.ai or fal "
+                "this offer, so nothing on-topic can be produced. " + _note() + " Top up Kie.ai or fal "
                 "credits, or add relevant tagged library clips.")
         return [{"recipe": "Generate — Curated library match (providers unavailable)",
                  "video_url": pick, "confidence": 0.3,
-                 "whats_changed": ("Closest match from your library — " + note + " Generation providers "
+                 "whats_changed": ("Closest match from your library — " + _note() + " Generation providers "
                     "are unavailable, so we surfaced your best existing clip instead of failing. "
                     "Top up Kie.ai or fal credits to generate net-new video.")[:600]}]
 
     # nothing at all — clean, actionable message (never a raw provider error)
     raise _AllVideoProvidersDown(
         "All video providers are unavailable and no library footage exists to fall back on. "
-        + note + " Top up Kie.ai or fal credits, or add tagged library clips.")
+        + _note() + " Top up Kie.ai or fal credits, or add tagged library clips.")
 
 
 async def recipe_generate(req: RunRequest) -> list:
