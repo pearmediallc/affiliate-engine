@@ -3205,9 +3205,25 @@ async def recipe_generate(req: RunRequest) -> list:
                     _cast_url = None
             if _cast_url:
                 _vert = (req.context.get("vertical", "") if isinstance(req.context, dict) else "") or ""
+                # FIX: the avatar must SPEAK the Creative Director's WRITTEN ad script (strategist/
+                # scriptwriter output), NOT the raw scene-description prompt (which the avatar would
+                # otherwise read aloud). Fallback chain: written ad script → concatenated talking-head
+                # beat lines → raw prompt (last resort). Never empty.
+                _spoken_script = ""
+                try:
+                    _spoken_script = (plan.get("script") or "").strip()
+                    if not _spoken_script:
+                        _lines = [str(b.get("line") or "").strip()
+                                  for b in (plan.get("beats") or [])
+                                  if b.get("shot_type") == "talking_head" and str(b.get("line") or "").strip()]
+                        _spoken_script = " ".join(_lines).strip()
+                except Exception as _e:
+                    logger.warning(f"[generate] written-script lookup failed: {_e}")
+                    _spoken_script = ""
+                _spoken_script = _spoken_script or (assets.get("prompt") or prompt)
                 req.assets = {**(req.assets or {}),
                               "character_video_url": _cast_url,
-                              "script": (assets.get("prompt") or prompt),
+                              "script": _spoken_script,
                               "seconds": int(seconds), "vertical": _vert}
                 logger.info(f"[generate] plan → avatar_lipsync; running funded lip-sync on {_cast_url}")
                 try:
