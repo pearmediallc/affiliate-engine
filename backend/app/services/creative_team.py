@@ -720,6 +720,29 @@ def _summarize_master_plan(plan: dict) -> str:
         return "orchestrating the master plan"
 
 
+def _summarize_beat_prompts(beats: list) -> str:
+    """Surface the ACTUAL prompts the Prompt Writer composed (per-beat, truncated) so the work-log
+    shows the real composition, not just a '{n} prompts composed' count. Defensive: never raises;
+    degrades to the generic count label."""
+    try:
+        bs = beats or []
+        parts = []
+        for b in bs:
+            i = b.get("i", "?")
+            kind = b.get("shot_type") or "?"
+            prompt = " ".join(str(b.get("prompt") or "").split())
+            if not prompt:
+                continue
+            snippet = prompt[:120] + ("…" if len(prompt) > 120 else "")
+            parts.append(f"beat {i} ({kind}): {snippet}")
+        summary = " | ".join(parts).strip()
+        if not summary:
+            return f"{len(bs)} prompts composed"
+        return (f"{len(bs)} prompts composed — " + summary)[:600]
+    except Exception:
+        return f"{len(beats or [])} prompts composed"
+
+
 async def run_creative_team(
     *,
     offer_desc: str,
@@ -802,7 +825,7 @@ async def run_creative_team(
     ts = act.start("prompt", job_id, "composing anti-slop prompts")
     beats = prompt_writer(beats=beats, entity_desc=character, vertical=vertical,
                           n_reference_images=n_reference_images, has_reference_video=has_reference_video)
-    act.finish("prompt", job_id, ts, ok=True, detail=f"{len(beats)} prompts composed",
+    act.finish("prompt", job_id, ts, ok=True, detail=_summarize_beat_prompts(beats),
                helpfulness=1.0 if beats else 0.0)
 
     # 7) Critic: PURE judgment, then apply_revisions mutates (separation of concerns).
