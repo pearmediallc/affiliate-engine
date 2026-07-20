@@ -684,6 +684,42 @@ async def _run(persona: str, job_id: str, task: str, coro, *, helpfulness=None):
         raise
 
 
+def _summarize_master_plan(plan: dict) -> str:
+    """Turn the Creative Director's plan object into a concise, human-readable work-log entry so the
+    persona feed shows the ACTUAL master plan (approach + per-beat source/technique + model route),
+    not a generic 'orchestrating' label. Defensive: never raises; degrades to the generic label."""
+    try:
+        p = plan or {}
+        parts = []
+        approach = (p.get("approach") or "").strip()
+        if approach:
+            parts.append(f"Approach: {approach}")
+        route = p.get("route") or {}
+        route_bits = " / ".join(str(route.get(k)) for k in ("style", "engine") if route.get(k))
+        model_intent = (p.get("model_intent") or "").strip()
+        if route_bits or model_intent:
+            parts.append(f"Route: {route_bits}{(' — ' + model_intent) if model_intent else ''}".strip())
+        struct = p.get("structure") or []
+        if struct:
+            beats = []
+            for s in struct:
+                sec = s.get("section") or "?"
+                kind = s.get("beat_kind") or "?"
+                tech = s.get("technique") or "?"
+                beats.append(f"{sec}:{kind}/{tech}")
+            parts.append("Beats: " + " → ".join(beats))
+        ref = (p.get("reference_plan") or "").strip()
+        if ref:
+            parts.append(f"References: {ref}")
+        notes = (p.get("notes") or "").strip()
+        if notes:
+            parts.append(f"Notes: {notes}")
+        summary = " | ".join(parts).strip()
+        return summary or "orchestrating the master plan"
+    except Exception:
+        return "orchestrating the master plan"
+
+
 async def run_creative_team(
     *,
     offer_desc: str,
@@ -715,14 +751,21 @@ async def run_creative_team(
     # ensure this job has a room (idempotent — the recipe usually begins it with a better label)
     act.begin_job(job_id, label=job_id, expected_sec=60)
 
-    # 0) The leader sets the master plan first.
-    plan = await _run("director", job_id, "orchestrating the master plan",
-                      creative_director(
-                          offer_desc=offer_desc, vertical=vertical, request_type=request_type,
-                          model=model, winner_hook=winner_hook, winner_transcript=winner_transcript,
-                          available_references=available_references,
-                          has_real_character=has_real_character, has_winner_video=has_winner_video),
-                      helpfulness=lambda p: 1.0 if p.get("structure") else 0.5)
+    # 0) The leader sets the master plan first. Inlined (not via _run) so the work-log records the
+    # ACTUAL plan the Creative Director produced — beats, source/technique per beat, model route —
+    # instead of the opaque "orchestrating the master plan" label (transparency).
+    ts_d = act.start("director", job_id, "orchestrating the master plan")
+    try:
+        plan = await creative_director(
+            offer_desc=offer_desc, vertical=vertical, request_type=request_type,
+            model=model, winner_hook=winner_hook, winner_transcript=winner_transcript,
+            available_references=available_references,
+            has_real_character=has_real_character, has_winner_video=has_winner_video)
+        act.finish("director", job_id, ts_d, ok=True, detail=_summarize_master_plan(plan),
+                   helpfulness=1.0 if plan.get("structure") else 0.5)
+    except Exception as e:
+        act.finish("director", job_id, ts_d, ok=False, detail=f"orchestrating the master plan: {e}")
+        raise
 
     # 1+2) Strategist + Script Writer share ONE round-trip (merged), reported as both personas.
     ts_s = act.start("strategist", job_id, "diagnosing loser vs winner")
