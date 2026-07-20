@@ -1338,34 +1338,64 @@ async def learn_brains(vertical: str = "", _auth: bool = Depends(require_service
         vt = vertical or None
         out = []
         for brain in ctun.TUNABLE_BRAINS:
-            labeled = len(ctun._labelled_rows(db, brain, vt))
-            row = db.query(CreativeBrainRule).filter(
-                CreativeBrainRule.brain == brain,
-                CreativeBrainRule.vertical == (vt or None)).first()
-            pending = db.query(RuleProposal).filter(
-                RuleProposal.brain == brain, RuleProposal.status == "pending_admin")
-            applied = db.query(RuleProposal).filter(
-                RuleProposal.brain == brain, RuleProposal.status == "applied")
-            if vt:
-                pending = pending.filter(RuleProposal.vertical == vt)
-                applied = applied.filter(RuleProposal.vertical == vt)
-            n_pending, n_applied = pending.count(), applied.count()
-            promoted = bool(row.promoted) if row else False
-            active = bool(row.active) if row else False
-            # status: promoted (cleared bar) > suggesting (pending proposal) > gathering
-            status = "promoted" if promoted else ("suggesting" if n_pending else "gathering")
-            metrics = (row.promotion_metrics if row else None) or {}
-            out.append({
-                "brain": brain, "vertical": vt or "all", "status": status,
-                "labeled_count": labeled, "promoted": promoted,
-                "holdout_agreement": metrics.get("live_agreement"),
-                "promotion_metrics": metrics or None,
-                "active_rule": (row.rules_json if (row and active and row.rules_json) else None),
-                "has_active_rule": active,
-                "pending_proposals": n_pending, "applied_proposals": n_applied,
-                "last_analyzed_at": row.last_analyzed_at.isoformat() if (row and row.last_analyzed_at) else None,
-            })
+            # GUARDED per-brain: _labelled_rows / the rule+proposal queries SELECT columns that a
+            # schema-drifted prod DB may not have (a legacy creative_decisions predating caption_method
+            # / variation_axis / creative_ref, or missing learning tables entirely). Any such
+            # OperationalError/ProgrammingError must degrade THIS brain to a 'gathering' default and
+            # roll back the broken txn — NOT 500 the whole endpoint. Same class as /learn/decisions.
+            try:
+                labeled = len(ctun._labelled_rows(db, brain, vt))
+                row = db.query(CreativeBrainRule).filter(
+                    CreativeBrainRule.brain == brain,
+                    CreativeBrainRule.vertical == (vt or None)).first()
+                pending = db.query(RuleProposal).filter(
+                    RuleProposal.brain == brain, RuleProposal.status == "pending_admin")
+                applied = db.query(RuleProposal).filter(
+                    RuleProposal.brain == brain, RuleProposal.status == "applied")
+                if vt:
+                    pending = pending.filter(RuleProposal.vertical == vt)
+                    applied = applied.filter(RuleProposal.vertical == vt)
+                n_pending, n_applied = pending.count(), applied.count()
+                promoted = bool(row.promoted) if row else False
+                active = bool(row.active) if row else False
+                # status: promoted (cleared bar) > suggesting (pending proposal) > gathering
+                status = "promoted" if promoted else ("suggesting" if n_pending else "gathering")
+                metrics = (row.promotion_metrics if row else None) or {}
+                out.append({
+                    "brain": brain, "vertical": vt or "all", "status": status,
+                    "labeled_count": labeled, "promoted": promoted,
+                    "holdout_agreement": metrics.get("live_agreement"),
+                    "promotion_metrics": metrics or None,
+                    "active_rule": (row.rules_json if (row and active and row.rules_json) else None),
+                    "has_active_rule": active,
+                    "pending_proposals": n_pending, "applied_proposals": n_applied,
+                    "last_analyzed_at": row.last_analyzed_at.isoformat() if (row and row.last_analyzed_at) else None,
+                })
+            except Exception as e:
+                try:
+                    db.rollback()   # a failed SELECT leaves the session in a broken txn on Postgres
+                except Exception:
+                    pass
+                logger.warning(f"[learn] brains status failed for brain={brain} vertical={vt}: {e}")
+                out.append({
+                    "brain": brain, "vertical": vt or "all", "status": "gathering",
+                    "labeled_count": 0, "promoted": False,
+                    "holdout_agreement": None, "promotion_metrics": None,
+                    "active_rule": None, "has_active_rule": False,
+                    "pending_proposals": 0, "applied_proposals": 0,
+                    "last_analyzed_at": None,
+                })
         return {"success": True, "vertical": vt or "all", "brains": out}
+    except Exception as e:
+        # Anything OUTSIDE the per-brain guard (TUNABLE_BRAINS drift, missing learning
+        # tables/models, broken session) must NOT 500 the learning tab — degrade to an
+        # empty-but-valid payload. Same class as /learn/decisions.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(f"[learn] brains endpoint failed vertical={vertical}: {e}")
+        return {"success": True, "vertical": vertical or "all", "brains": []}
     finally:
         db.close()
 
