@@ -1074,13 +1074,12 @@ async def set_engine_config(payload: dict, _auth: bool = Depends(require_service
             "default_quality": _ENGINE["default_quality"]}
 
 
-@router.post("/parse-intent")
-async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)):
-    """LLM-parse a plain-language creative command into structured intent (robust to odd phrasings
-    like 'grandma', 'guy in his 60s', multi-clause briefs). Falls back to {} if the LLM is down."""
-    cmd = (payload.get("command") or "").strip()
+async def _parse_intent_text(cmd: str) -> dict:
+    """Shared parse-intent logic: LLM-parse a plain-language creative command into structured intent
+    (gender/age_band/vertical/scene/tone/…). Returns {} on empty input or LLM failure — never raises."""
+    cmd = (cmd or "").strip()
     if not cmd:
-        return {"success": True, "intent": {}}
+        return {}
     from ..services import creative_playbook as pb
     verticals = "|".join(sorted(pb.VERTICALS.keys()))
     prompt = (
@@ -1100,10 +1099,17 @@ async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)
     )
     try:
         d = await _gemini_json(prompt)
-        return {"success": True, "intent": d or {}}
+        return d or {}
     except Exception as e:
         logger.warning(f"parse-intent failed: {e}")
-        return {"success": True, "intent": {}}
+        return {}
+
+
+@router.post("/parse-intent")
+async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)):
+    """LLM-parse a plain-language creative command into structured intent (robust to odd phrasings
+    like 'grandma', 'guy in his 60s', multi-clause briefs). Falls back to {} if the LLM is down."""
+    return {"success": True, "intent": await _parse_intent_text((payload.get("command") or "").strip())}
 
 
 @router.post("/learn/roi")
@@ -2864,6 +2870,203 @@ async def _veo_wait(op_name: str, timeout: int = 1200):
     raise RuntimeError("Veo operation timed out")
 
 
+# ── Video-provider fallback ───────────────────────────────────────────────────────────────────
+# A single provider running out of credits (e.g. Kie.ai Seedance → {'code':500,'msg':'Credits
+# insufficient … Please top up'}) must NOT dead-end the whole request. On a credits/quota/billing/5xx
+# error we advance to the next CONFIGURED provider; when every paid text-to-video provider is down we
+# fall back to the AVATAR-LIPSYNC lane on existing library footage, then to a curated best-match clip.
+_VIDEO_UNAVAILABLE_RE = re.compile(
+    r"credit|insufficient|top[\s-]?up|balance|quota|out of|exhaust|payment required|billing|"
+    r"not enough|no fal key|not configured|\b40[123]\b|\b429\b|\b50[023]\b",
+    re.I)
+
+
+def _is_provider_unavailable(exc: Exception) -> bool:
+    """True when a provider error reads like credits/quota/billing/5xx — i.e. 'try the next provider',
+    not a genuine content/logic failure. Defensive: any keyword/status match in the message counts."""
+    return bool(_VIDEO_UNAVAILABLE_RE.search(str(exc) or ""))
+
+
+class _AllVideoProvidersDown(RuntimeError):
+    """Every configured text-to-video provider is unavailable (credits/quota/billing/5xx)."""
+
+
+def _t2v_providers() -> list:
+    """Ordered, CONFIGURED text-to-video providers for the generate lane. Kie-Seedance is primary
+    (full reference set: image+video+audio); fal lanes (seedance→kling→wan) are the credits-out
+    fallback and share FAL_KEY. Only providers whose key is set are included."""
+    prov = []
+    if settings.kie_api_key:
+        prov.append("kie-seedance")
+    if settings.fal_key:
+        prov += ["fal-seedance", "fal-kling", "fal-wan"]
+    return prov
+
+
+async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seconds, resolution,
+                             aspect_ratio, generate_audio, first, produced) -> Optional[str]:
+    """Render ONE text-to-video clip, trying each configured provider in order. On a
+    credits/quota/billing/5xx (or any) error from one provider, log the reason and advance to the
+    next. Returns a local mp4 path (recording the winning provider in `produced['provider']`), or
+    raises _AllVideoProvidersDown listing each provider's reason when every one is unavailable."""
+    from ..services.kieai_service import KieAIService
+    from ..services import fal_video as fv
+    reasons = []
+    for prov in _t2v_providers():
+        try:
+            if prov == "kie-seedance":
+                res = await asyncio.to_thread(
+                    KieAIService.generate_video_seedance,
+                    prompt=prompt,
+                    reference_image_urls=(image_urls or None),
+                    reference_video_urls=(video_urls or None) if first else None,
+                    reference_audio_urls=(audio_urls or None) if first else None,
+                    duration=int(seconds), resolution=resolution, aspect_ratio=aspect_ratio,
+                    generate_audio=bool(generate_audio))
+                cp = res.get("local_path") or res.get("video_path")
+            else:
+                # fal lanes take a single first-frame image ref only (no video/audio refs)
+                img = (image_urls or [None])[0]
+                res = await asyncio.to_thread(
+                    fv.generate_video, prov, prompt,
+                    image_url=img, seconds=int(seconds), aspect_ratio=aspect_ratio,
+                    resolution=resolution)
+                cp = res.get("local_path")
+            if cp and os.path.exists(cp):
+                produced["provider"] = prov
+                if reasons:
+                    logger.warning(f"[generate] {prov} produced the clip after fallbacks: {reasons}")
+                return cp
+            reasons.append(f"{prov}: no output")
+        except Cancelled:
+            raise
+        except Exception as e:
+            tag = "unavailable" if _is_provider_unavailable(e) else "error"
+            reasons.append(f"{prov}: {tag} ({str(e)[:120]})")
+            logger.warning(f"[generate] {prov} {tag} ({str(e)[:160]}) — trying next provider")
+            continue
+    raise _AllVideoProvidersDown(
+        "all text-to-video providers unavailable — " + "; ".join(reasons or ["none configured"]))
+
+
+async def _cast_library_avatar(intent: dict):
+    """Scan the tagged asset library for the best clip matching the parsed intent (gender/age/scene/
+    vertical). Read-only DB scan; never raises. Returns (avatar_pick_url, avatar_tags, any_pick_url,
+    any_tags): the best avatar-lipsync-ready talker AND the best clip of any kind (curated last-resort)."""
+    want_g = (intent.get("gender") or "").lower()
+    want_a = (intent.get("age_band") or "").lower()
+    want_scene = (intent.get("scene") or "").lower()
+    want_vert = (intent.get("vertical") or "").lower()
+    try:
+        from ..database import SessionLocal
+        from ..models.asset_tag import AssetTag
+        db = SessionLocal()
+        try:
+            rows = db.query(AssetTag).all()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"[generate] library scan failed: {e}")
+        return None, None, None, None
+
+    def _score(t: dict, lip: bool) -> float:
+        s = 5.0 if lip else 0.0
+        s += 2 * float(t.get("face_score") or 0)
+        g = (t.get("gender") or "").lower()
+        if want_g and g == want_g:
+            s += 3
+        elif want_g and g:
+            s -= 1
+        if want_a and (t.get("age_band") or "").lower() == want_a:
+            s += 2
+        if want_vert and (t.get("vertical") or "").lower() == want_vert:
+            s += 1
+        if want_scene and want_scene in (t.get("scene") or "").lower():
+            s += 1
+        return s
+
+    best_lip = best_lip_s = best_any = best_any_s = None
+    best_lip_s = -1e9
+    best_any_s = -1e9
+    for row in rows:
+        try:
+            t = json.loads(row.tags_json)
+        except Exception:
+            continue
+        if not t.get("url"):
+            continue
+        lip = (t.get("usable_as") == "avatar_lipsync") and bool(t.get("max_talk_sec"))
+        s = _score(t, lip)
+        if s > best_any_s:
+            best_any_s, best_any = s, t
+        if lip and s > best_lip_s:
+            best_lip_s, best_lip = s, t
+    return ((best_lip.get("url") if best_lip else None), best_lip,
+            (best_any.get("url") if best_any else None), best_any)
+
+
+async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_ratio: str,
+                                      seconds: int, reasons: list) -> list:
+    """Last-resort tiers when every paid text-to-video provider is out of credits/quota:
+       (1) re-route into the AVATAR-LIPSYNC recipe on a cast library clip (lipsync + cheap TTS — no
+           text-to-video credits), then
+       (2) return the single best-match library clip as a curated suggestion.
+    The user ALWAYS gets something usable — never a bare 'credits insufficient' error."""
+    note = "Text-to-video providers unavailable (" + "; ".join(reasons[:3]) + ")."
+    intent = await _parse_intent_text(prompt)
+    avatar_url, _atags, any_url, _anytags = await _cast_library_avatar(intent)
+    # PREFER a clip cast from the REAL curated avatar library (creative-library's asset_library,
+    # usable_as='avatar_lipsync', cast by gender/age/scene/face_score — the SAME library the normal
+    # avatar-lipsync path uses). The caller (CL) hands it off in assets.fallback_avatar_url. The
+    # AssetTag scan above is only a per-generation result cache and is usually empty/sparse, so it
+    # must not be the primary source for the fallback clip.
+    _cl = req.assets if isinstance(req.assets, dict) else {}
+    _lib_url = _cl.get("fallback_avatar_url") or _cl.get("library_avatar_url")
+    if _lib_url:
+        avatar_url = _lib_url
+        any_url = any_url or _lib_url
+
+    # TIER 1 — avatar-lipsync on the cast library clip (reuses recipe_avatar_lipsync end-to-end)
+    if avatar_url:
+        try:
+            _vert = intent.get("vertical") or (req.context.get("vertical")
+                    if isinstance(req.context, dict) else "") or ""
+            req.assets = {**(req.assets or {}),
+                          "character_video_url": avatar_url,
+                          "script": prompt,
+                          "seconds": int(seconds),
+                          "vertical": _vert}
+            logger.warning(f"[generate] all t2v providers down — re-routing to avatar-lipsync on "
+                           f"library clip {avatar_url}")
+            out = await recipe_avatar_lipsync(req)
+            for r in (out or []):
+                r["recipe"] = "Generate — Library Avatar Lip-sync (t2v fallback)"
+                r["whats_changed"] = ("Built from your library footage — " + note + " Cast a matching "
+                    "avatar clip and lip-synced your script to it (no text-to-video credits used). "
+                    + (r.get("whats_changed") or ""))[:600]
+            if out:
+                return out
+        except Cancelled:
+            raise
+        except Exception as e:
+            logger.error(f"[generate] avatar-lipsync fallback failed: {e}")
+            reasons.append(f"avatar-lipsync: {str(e)[:120]}")
+
+    # TIER 2 — curated best-match library clip (no generation at all)
+    pick = avatar_url or any_url
+    if pick:
+        return [{"recipe": "Generate — Curated library match (providers unavailable)",
+                 "video_url": pick, "confidence": 0.3,
+                 "whats_changed": ("Closest match from your library — " + note + " Generation providers "
+                    "are unavailable, so we surfaced your best existing clip instead of failing. "
+                    "Top up Kie.ai or fal credits to generate net-new video.")[:600]}]
+
+    # nothing at all — clean, actionable message (never a raw provider error)
+    raise _AllVideoProvidersDown(
+        "All video providers are unavailable and no library footage exists to fall back on. "
+        + note + " Top up Kie.ai or fal credits, or add tagged library clips.")
+
+
 async def recipe_generate(req: RunRequest) -> list:
     """DIRECT generation from a PROMPT + optional REFERENCE IMAGE(S), engine of the user's choice:
       • 'seedance' (Kie): reference-image-conditioned clip(s) — Seedance keeps subject/scene/voice
@@ -2966,7 +3169,7 @@ async def recipe_generate(req: RunRequest) -> list:
             # fall through to the Seedance lane below
 
         # ── Seedance 2.0 (Kie) — native single clip up to 15s, full reference set ──
-        from ..services.kieai_service import KieAIService
+        # (Kie call now goes through _generate_t2v_clip, which adds fal fallback on credits-out.)
         from ..services import creative_team_activity as act
         dur = max(4, min(15, seconds))   # Seedance range 4-15s
         act.set_expected_sec(req.request_id, 180)   # Seedance ~2-4 min per clip
@@ -2993,7 +3196,9 @@ async def recipe_generate(req: RunRequest) -> list:
         W2, H2 = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
         is_talk = bool(video_urls) or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc)\b", prompt, re.I))
         clip_paths = []
-        for ci in range(n_clips):
+        produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
+        try:
+          for ci in range(n_clips):
             await _abort_if_cancelled(req, f"seedance clip {ci+1}/{n_clips}")
             act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per}s · {aspect_ratio}")
             imgs = list(image_urls or [])
@@ -3009,23 +3214,30 @@ async def recipe_generate(req: RunRequest) -> list:
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
             beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": ""}
 
+            # Provider fallback: Kie-Seedance → fal-seedance → fal-kling → fal-wan. A credits/quota/5xx
+            # error on one advances to the next; _AllVideoProvidersDown only if every configured one is down.
             async def _attempt(bt, _imgs=imgs, _first=(ci == 0)):
-                res = await asyncio.to_thread(
-                    KieAIService.generate_video_seedance,
+                return await _generate_t2v_clip(
                     prompt=bt.get("prompt"),
-                    reference_image_urls=(_imgs or None),
-                    reference_video_urls=(prepped_vids or None) if _first else None,
-                    reference_audio_urls=(audio_urls or None) if _first else None,
-                    duration=per, resolution=resolution, aspect_ratio=aspect_ratio,
-                    generate_audio=bool(generate_audio))
-                cp2 = res.get("local_path") or res.get("video_path")
-                return cp2 if (cp2 and os.path.exists(cp2)) else None
+                    image_urls=_imgs, video_urls=prepped_vids, audio_urls=audio_urls,
+                    seconds=per, resolution=resolution, aspect_ratio=aspect_ratio,
+                    generate_audio=generate_audio, first=_first, produced=produced)
 
             cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
             if cp and os.path.exists(cp):
                 clip_paths.append(cp)
+        except _AllVideoProvidersDown as _pd_exc:
+            if clip_paths:
+                logger.warning(f"[generate] t2v ran out mid-stitch ({_pd_exc}) — stitching the "
+                               f"{len(clip_paths)} clip(s) already rendered")
+            else:
+                logger.warning(f"[generate] {_pd_exc} — routing to library fallback tiers")
+                return await _generate_library_fallback(req, prompt, aspect_ratio, seconds,
+                                                        reasons=[str(_pd_exc)])
         if not clip_paths:
-            raise RuntimeError("generate: Seedance produced no clip (check Kie credits)")
+            # every provider unavailable AND nothing rendered → library fallback (never a bare error)
+            return await _generate_library_fallback(req, prompt, aspect_ratio, seconds,
+                                                    reasons=["no clip produced (check Kie/fal credits)"])
         if len(clip_paths) == 1:
             import shutil; shutil.copy(clip_paths[0], out_path)
         else:
@@ -3046,24 +3258,34 @@ async def recipe_generate(req: RunRequest) -> list:
                 ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
-        # accurate Kie Seedance cost — OFFICIAL per-second rates by resolution; with-input is cheaper
-        _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
+        # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
-        _rr = _KIE_RATE.get(str(resolution).lower(), _KIE_RATE["720p"])
-        _persec = _rr[0] if _with_input else _rr[1]
+        _prov = produced.get("provider") or "kie-seedance"
+        if str(_prov).startswith("fal"):
+            # fal lanes bill a flat per-second rate per model (fal-seedance/kling/wan) — use fal's.
+            from ..services.fal_video import FAL_VIDEO_COST_PER_SEC
+            _persec = FAL_VIDEO_COST_PER_SEC.get(_prov, 0.09)
+        else:
+            # Kie Seedance — OFFICIAL per-second rates by resolution; with-input is cheaper.
+            _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
+            _rr = _KIE_RATE.get(str(resolution).lower(), _KIE_RATE["720p"])
+            _persec = _rr[0] if _with_input else _rr[1]
         _vid_sec = len(clip_paths) * per
-        _track_cost(req.request_id, "video", "kie-seedance", model=f"seedance-{resolution}",
+        _track_cost(req.request_id, "video", _prov, model=f"seedance-{resolution}",
                     units=_vid_sec, unit_type="sec", cost_usd=round(_persec * _vid_sec, 4),
-                    note=("with-input" if _with_input else "text→video"))
+                    note=("with-input" if _with_input else "text→video")
+                         + ("" if _prov == "kie-seedance" else f" · fallback provider {_prov}"))
         refs = []
         if image_urls: refs.append(f"{len(image_urls)} image(s)")
         if video_urls: refs.append(f"{len(video_urls)} video(s)")
         if audio_urls: refs.append(f"{len(audio_urls)} audio")
+        _prov_note = "" if _prov == "kie-seedance" else f" · via {_prov} (fallback — Kie unavailable)"
         return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
                  "whats_changed": (f"Seedance 2.0 · {len(clip_paths)}×{per}s (~{len(clip_paths)*per}s) · {aspect_ratio} · {resolution}"
                     f"{' · refs: ' + ', '.join(refs) if refs else ''}"
                     f"{' · audio' if generate_audio else ''}"
-                    + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "") + ".")}]
+                    + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "")
+                    + _prov_note + ".")}]
     finally:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
