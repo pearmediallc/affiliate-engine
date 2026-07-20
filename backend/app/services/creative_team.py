@@ -281,6 +281,28 @@ Return STRICT JSON:
     return _strategist_heuristic(offer_desc, winner_hook, metrics)
 
 
+def _has_real_metrics(metrics: Optional[dict]) -> bool:
+    """True only when the input is backed by a REAL creative with REAL spend from the DB.
+    A fresh Studio-generated script carries no spend → False → no past-performance verdict."""
+    if not metrics:
+        return False
+    try:
+        return float(metrics.get("spend") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _forward_heuristic(offer_desc: str, winner_hook: str) -> dict:
+    """Ungrounded input (fresh script, NO metrics, NO real creative): forward-looking BEST-PRACTICE
+    guidance — never a verdict on past performance. Used when the LLM is unavailable."""
+    return {"diagnosis": "New script — no performance history yet; guidance below is forward-looking best practice.",
+            "lagging_metric": "unknown",
+            "angle": f"Lead with the single strongest proof/payoff of: {offer_desc[:120]}",
+            "keep": ["the offer", "the winning hook angle" if winner_hook else "the core message"],
+            "change": ["open on the payoff in the first 2s", "one idea per sentence", "end on a clean CTA"],
+            "fix": f"To maximize this, hook on the payoff in 2s and keep the offer intact. {('Use hook: ' + winner_hook) if winner_hook else ''}".strip()}
+
+
 def _strategist_heuristic(offer_desc: str, winner_hook: str, metrics: dict) -> dict:
     """Deterministic diagnosis from real metrics (used when the LLM is unavailable)."""
     v = cm.judge_creative(metrics) if metrics.get("spend") else {}
@@ -359,6 +381,24 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
     from . import creative_playbook as pb
     from . import creative_learning as learn
     metrics = loser_metrics or {}
+    grounded = _has_real_metrics(metrics)
+    # GROUNDING GUARD: only diagnose PAST performance when a real creative with real spend is behind
+    # the input. A fresh Studio-generated script has no metrics/no prior ad — inventing "the original
+    # failed because… / low engagement" would be a hallucinated verdict, so we switch to forward-
+    # looking best-practice guidance instead (never a verdict on performance that never happened).
+    if grounded:
+        task_instr = ("First DIAGNOSE why this ad underperformed (GROUND every claim in the LOSER "
+                      "METRICS below — cite the actual lagging number, use ROI not ROAS) and pick "
+                      "the smallest high-leverage fix, THEN write the new spoken script implementing it.")
+        diag_hint = "one sentence grounded in the real metrics: what is dragging performance"
+    else:
+        task_instr = ("This is a NEW script with NO performance history — there is NO prior ad, NO "
+                      "metrics, NO spend behind it. Do NOT critique past performance and do NOT claim "
+                      "anything 'failed', had 'low engagement', or a 'weak hook that didn't grab' — "
+                      "there is zero data to support that. Instead give FORWARD-LOOKING best-practice "
+                      "guidance to maximize this script, THEN write the improved script.")
+        diag_hint = ("forward-looking opportunity, NOT a verdict on past performance "
+                     "(e.g. 'To maximize this, open on the payoff…')")
     prompt = f"""{pb.MISSION}
 
 {pb.vertical_brief(vertical)}
@@ -366,27 +406,27 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
 {learn.lessons_for_prompt(vertical=vertical)}
 
 {_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
-Writer on THIS project (above). First DIAGNOSE why this ad underperformed and pick the smallest
-high-leverage fix, THEN write the new spoken script implementing that fix. Keep the offer intact.
+Writer on THIS project (above). {task_instr} Keep the offer intact.
 
 OFFER: {_sanitize(offer_desc, MAX_OFFER)}
 VERTICAL: {vertical}   REQUEST TYPE: {request_type}
-LOSER METRICS (lower=worse): {json.dumps(metrics)[:500]}
-LOSER TRANSCRIPT: {_sanitize(loser_transcript, MAX_TRANSCRIPT)}
+{("REAL LOSER METRICS (from live data, lower=worse): " + json.dumps(metrics)[:500]) if grounded else "PERFORMANCE DATA: none — this is a fresh script with no metrics."}
+{"LOSER TRANSCRIPT" if grounded else "SOURCE SCRIPT (draft to improve, not a past ad)"}: {_sanitize(loser_transcript, MAX_TRANSCRIPT)}
 WINNING HOOK to open on: {_sanitize(winner_hook, MAX_HOOK)}
 WINNER SCRIPT (proven structure): {_sanitize(winner_transcript, MAX_WINNER_TX)}
 {(_sanitize(variation_directive, 400) + chr(10)) if variation_directive else ""}
 Script rules: hook in the first sentence; one idea per sentence; clean CTA; 40-90 words; first-person;
 no stage directions or on-screen-text markers.
-Return STRICT JSON: {{"diagnosis": "...", "lagging_metric": "hook_rate|hold_rate|offer_cr|ctr|roas|unknown",
+Return STRICT JSON: {{"diagnosis": "{diag_hint}", "lagging_metric": "hook_rate|hold_rate|offer_cr|ctr|roas|unknown",
   "angle": "...", "keep": ["..."], "change": ["..."], "fix": "one-line directive",
   "script": "the spoken script as plain sentences"}}"""
     out = await _gemini_json(prompt, temperature=0.5)
     if out and out.get("script"):
         strategy = _coerce(out, _STRATEGY_SPEC)
         return strategy, str(out.get("script")).strip()
-    # fallback: deterministic diagnosis (metric-aware) + deterministic script
-    strategy = _strategist_heuristic(offer_desc, winner_hook, metrics)
+    # fallback: metric-grounded diagnosis when we have real metrics, else forward-looking guidance
+    strategy = (_strategist_heuristic(offer_desc, winner_hook, metrics) if grounded
+                else _forward_heuristic(offer_desc, winner_hook))
     return strategy, _script_heuristic(offer_desc, loser_transcript, winner_hook)
 
 

@@ -2659,6 +2659,7 @@ async def recipe_full_ad(req: RunRequest) -> list:
             job_id=req.request_id, vertical=vertical,
             request_type=(req.variation_type or "ugc"), model=req.model or "seedance-2",
             loser_transcript=transcript, winner_hook=winner_hook,
+            loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
             entity_desc=entity_desc,
             has_real_character=bool(anchor_url), has_winner_video=bool(lw),
             n_reference_images=1 if anchor_url else 0)
@@ -2761,6 +2762,7 @@ async def recipe_from_assets(req: RunRequest) -> list:
             offer_desc=script[:300], job_id=req.request_id, vertical=vertical,
             request_type=(req.variation_type if req.variation_type in ("broll", "Broll") else "broll"),
             model=req.model or "seedance-2", loser_transcript=script,
+            loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
             has_real_character=False, has_winner_video=False, n_reference_images=1)
         beats = plan.get("beats") or []
         if not beats:
@@ -3105,6 +3107,7 @@ async def recipe_generate(req: RunRequest) -> list:
                 offer_desc=prompt, job_id=req.request_id, vertical=vertical,
                 request_type=("broll" if (video_urls or image_urls) else "ugc"),
                 model=engine, loser_transcript=prompt,
+                loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
                 has_winner_video=bool(video_urls), n_reference_images=len(image_urls),
                 run_critic=True)
             refined = (plan.get("beats") or [{}])[0].get("prompt")
