@@ -43,6 +43,8 @@ ROSTER = [
      "desc": "Guards against AI-slop; rejects and revises weak beats."},
     {"id": "learner",    "role": "Learner",           "seat": "right", "emoji": "📚",
      "desc": "Feeds winning patterns back into the library after outcomes land."},
+    {"id": "finance",    "role": "Finance",           "seat": "head",  "emoji": "💰",
+     "desc": "Runs the provider/credit preflight and tracks live per-job spend by provider."},
 ]
 _ROSTER_BY_ID = {r["id"]: r for r in ROSTER}
 
@@ -133,6 +135,19 @@ def tick(job_id: str, note: str = "") -> None:
     if note:
         logger.info(f"[office] {job_id} progress: {note[:160]}")
         _persist("generation", "progress", job_id=job_id, detail=note[:160])   # durable
+
+
+def bill(job_id: str, provider: str, usd: float, note: str = "") -> None:
+    """Finance running-billing feed line — per-provider spend as it lands, so the office shows live
+    cost. Event name 'bill' is not counted in reports() (no pass/fail skew). Best-effort + durable."""
+    line = f"💰 {provider} · ${float(usd or 0):.4f}" + (f" · {note}" if note else "")
+    with _LOCK:
+        j = _JOBS.get(job_id)
+        if j:
+            j["updated"] = _now()
+            j["feed"].appendleft({"t": _now(), "persona": "finance", "event": "bill",
+                                  "detail": line[:160], "usd": float(usd or 0), "provider": provider})
+    _persist("finance", "bill", job_id=job_id, detail=line[:160])
 
 
 # ── per-persona step events ────────────────────────────────────────────────────

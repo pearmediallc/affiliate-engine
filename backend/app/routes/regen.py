@@ -16,6 +16,7 @@ import os
 import re
 import json
 import base64
+import time
 import logging
 import asyncio
 import tempfile
@@ -2935,6 +2936,19 @@ def _t2v_providers() -> list:
     return prov
 
 
+# FIX B: provider-down cache — a t2v provider that just failed on credits/quota/billing/5xx is
+# flagged down for a TTL. This lets the preflight decide, BEFORE any paid attempt, whether the
+# doomed Kie attempt is worth making. No cheap balance API exists (confirmed) — the cached flag is
+# the mechanism; the TTL self-heals on top-up (a provider re-enters _t2v_available once it expires).
+_PROVIDER_DOWN: dict = {}   # provider -> expiry unix ts
+
+
+def _t2v_available() -> list:
+    """Configured t2v providers NOT currently flagged down (cache TTL expired = back in)."""
+    now = time.time()
+    return [p for p in _t2v_providers() if _PROVIDER_DOWN.get(p, 0) < now]
+
+
 async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seconds, resolution,
                              aspect_ratio, generate_audio, first, produced) -> Optional[str]:
     """Render ONE text-to-video clip, trying each configured provider in order. On a
@@ -2974,6 +2988,8 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
             raise
         except Exception as e:
             tag = "unavailable" if _is_provider_unavailable(e) else "error"
+            if tag == "unavailable":
+                _PROVIDER_DOWN[prov] = time.time() + 600   # FIX B: flag down 10min (self-heals on top-up)
             reasons.append(f"{prov}: {tag} ({str(e)[:120]})")
             logger.warning(f"[generate] {prov} {tag} ({str(e)[:160]}) — trying next provider")
             continue
@@ -3173,6 +3189,16 @@ async def recipe_generate(req: RunRequest) -> list:
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
                 prompt = f"{prompt}. {refined}"
+            # FIX A: drive avatar-lipsync off the PLAN'S ROUTE regardless of the explicit engine. CL
+            # sends engine="seedance", so the engine-gated block below never fires — but a talking-head
+            # plan (route=avatar_lipsync) must still run the FUNDED lip-sync recipe (TTS+LatentSync — no
+            # t2v credits), not collapse to Seedance which dies on credits. GUARD: this only FLAGS the
+            # plan; the reroute below has a castable-avatar guard — a SCENIC/non-talking-head plan (its
+            # route is seedance/veo_extend/image_to_video, never avatar_lipsync) never trips this, and
+            # even an avatar plan with no castable avatar falls through to t2v. Scenic stays t2v.
+            plan_route = ((plan.get("plan") or {}).get("route") or {}).get("engine")
+            if plan_route == "avatar_lipsync":
+                _avatar_plan = True
             # AUTO: let the brain's Playbook route pick the engine (ChatGPT-style — user needn't choose)
             if engine in ("", "auto"):
                 routed = ((plan.get("plan") or {}).get("route") or {}).get("engine") or "seedance"
@@ -3188,6 +3214,23 @@ async def recipe_generate(req: RunRequest) -> list:
                             + ("; talking-head plan → will try funded avatar-lipsync" if _avatar_plan else "") + ")")
         except Exception as e:
             logger.warning(f"generate: team pass skipped ({e})")
+
+        # FIX C (Finance) + FIX B (preflight): before ANY paid attempt, the Finance seat records the
+        # provider/credit decision. Talking-head plan → avatar-lipsync (funded, cheaper); if every t2v
+        # provider is known-down (cached) this also spares the doomed Kie attempt. Scenic/non-avatar
+        # plan → t2v (seedance/veo). Best-effort — never blocks generation.
+        try:
+            from ..services import creative_team_activity as _fin
+            _fin_ts = _fin.start("finance", req.request_id, "provider/credit preflight")
+            if _avatar_plan:
+                _decision = ("t2v unavailable → routing avatar-lipsync (funded)"
+                             if not _t2v_available() else "plan → avatar-lipsync (funded, cheaper than t2v)")
+            else:
+                _decision = f"t2v {'funded' if _t2v_available() else 'down (cache) — will attempt then fall back'} → {engine}"
+            _fin.finish("finance", req.request_id, _fin_ts, detail=_decision)
+            logger.info(f"[finance] preflight: {_decision}")
+        except Exception as _e:
+            logger.warning(f"[generate] finance preflight skipped ({_e})")
 
         # FIX 1 (reroute): plan chose avatar_lipsync → run the funded lip-sync recipe instead of a
         # credit-hungry t2v. GUARDS: only when a suitable avatar clip is castable (CL-supplied
@@ -3465,6 +3508,13 @@ def _track_cost(request_id, step, provider, *, model=None, units=None, unit_type
     except Exception as e:
         logger.warning(f"track_cost failed ({step}/{provider}): {e}")
     logger.info(f"[cost] {request_id} {step} · {provider} · ${float(cost_usd or 0):.4f}{' · ' + note if note else ''}")
+    # FIX C: Finance running-billing feed line — per-provider spend as it lands, so the office shows
+    # live cost and the top-right billing pill can total it. Best-effort.
+    try:
+        from ..services import creative_team_activity as _fin
+        _fin.bill(request_id, provider, float(cost_usd or 0), note or (model or step))
+    except Exception:
+        pass
 
 
 # ── Durable lip-sync resume (long renders survive an AE restart) ──────────────
