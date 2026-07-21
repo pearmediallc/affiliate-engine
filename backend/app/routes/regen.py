@@ -484,17 +484,21 @@ def _ffprobe_duration(path: str) -> float:
     except Exception:
         return 0.0
 
-def _has_audio_stream(path: str) -> bool:
-    """DETERMINISTIC: does the file contain an audio stream? A vision/frame critic literally cannot
-    hear, so 'the fallback shipped silent video' is invisible to it — this one ffprobe is the correct
-    check. (Presence, not loudness; a present-but-silent track is a separate rare case.)"""
-    try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
-                              "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-        return "audio" in out
-    except Exception:
-        return True   # fail-open: never fail delivery on a probe error
+def _probe_audio(path: str):
+    """DETERMINISTIC tri-state: True (has an audio stream) / False (definitely none) / None (probe
+    failed — unknown). A vision/frame critic literally cannot hear, so 'the fallback shipped silent
+    video' is invisible to it — this ffprobe is the correct check. Returning None on error (instead
+    of a blind True) lets the caller fall back to the CAPABILITY matrix rather than mislabel a silent
+    clip as narrated. Retries once before giving up."""
+    for _ in range(2):
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                                  "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", path],
+                                 capture_output=True, text=True, timeout=30).stdout.strip()
+            return "audio" in out
+        except Exception:
+            continue
+    return None
 
 def _ffmpeg(args, timeout: int = 600):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
@@ -3027,15 +3031,25 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
     from ..services import fal_video as fv
     from ..services import capabilities as caps
     reasons = []
-    # REQUIREMENT-DRIVEN routing: when audio is needed, try the providers that can actually PRODUCE
-    # audio first (only Kie today); the silent fal lanes stay as a last resort (and recipe_generate
-    # then muxes a TTS voiceover so the ad isn't shipped silent). This is why we no longer route to a
-    # model that can't do what was asked and only discover it after — capability is an input, not a
-    # post-hoc surprise.
-    _order = _t2v_providers()
+    _base = _t2v_providers()
+    # STALE-MATRIX GUARD: warn (don't block) if a configured provider isn't declared in VIDEO_CAPS —
+    # an undeclared provider would otherwise fail-open through every requirement check.
+    for _p in _base:
+        if not caps.known(_p):
+            logger.warning(f"[generate] provider {_p} not in VIDEO_CAPS — capability UNVERIFIED; "
+                           f"add it to capabilities.py (routing currently treats it as fully capable)")
+    # REQUIREMENT-DRIVEN routing: when audio is needed, try the NATIVE-AUDIO providers first —
+    # Kie-Seedance, then Veo 3.1 (also native audio, via the same Kie key) as a second real-audio
+    # option — and only then the silent fal lanes as a last resort (recipe_generate muxes a TTS
+    # voiceover onto a silent clip so nothing ships mute). Capability is an input to the decision,
+    # not a post-hoc surprise. Non-audio jobs never pull in the pricier Veo lane.
     if generate_audio:
-        _ac = caps.audio_capable(_order)
-        _order = _ac + [p for p in _order if p not in _ac]
+        _order = caps.audio_capable(_base)
+        if settings.kie_api_key and "kie-veo" not in _order:
+            _order.append("kie-veo")
+        _order += [p for p in _base if p not in _order]
+    else:
+        _order = _base
     for prov in _order:
         try:
             if prov == "kie-seedance":
@@ -3048,6 +3062,14 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
                     duration=int(seconds), resolution=resolution, aspect_ratio=aspect_ratio,
                     generate_audio=bool(generate_audio))
                 cp = res.get("local_path") or res.get("video_path")
+            elif prov == "kie-veo":
+                # Veo 3.1 — NATIVE audio (48kHz + dialogue). t2v only via this path; caps at 8s, so a
+                # longer request degrades to 8 narrated seconds (better than a silent fallback).
+                res = await asyncio.to_thread(
+                    KieAIService.generate_video_veo, prompt=prompt,
+                    duration=min(8, int(seconds)), ratio=aspect_ratio,
+                    fast=(str(resolution).lower() in ("480p", "540p")))
+                cp = res.get("video_path") or res.get("local_path")
             else:
                 # fal lanes take a single first-frame image ref only (no video/audio refs)
                 img = (image_urls or [None])[0]
@@ -3548,7 +3570,12 @@ async def recipe_generate(req: RunRequest) -> list:
         # script with TTS and mux it so the ad isn't silent; if that can't run, ship + flag honestly.
         _audio_state = "native"   # native (provider produced it) | tts (we narrated) | none (silent)
         if generate_audio:
-            if _has_audio_stream(out_path):
+            from ..services import capabilities as _caps
+            _probe = _probe_audio(out_path)                       # True | False | None(unknown)
+            _prov_has_audio = _caps.provides_audio(produced.get("provider") or "")
+            if _probe is True or (_probe is None and _prov_has_audio):
+                # confirmed audio, OR the probe couldn't tell but the provider is DECLARED audio-capable
+                # (don't let a probe error mislabel a KNOWN-silent provider's clip as 'native').
                 _audio_state = "native"
             elif await _mux_tts_voiceover(req, out_path, _vo_script, work):
                 _audio_state = "tts"
@@ -3564,6 +3591,10 @@ async def recipe_generate(req: RunRequest) -> list:
             # fal lanes bill a flat per-second rate per model (fal-seedance/kling/wan) — use fal's.
             from ..services.fal_video import FAL_VIDEO_COST_PER_SEC
             _persec = FAL_VIDEO_COST_PER_SEC.get(_prov, 0.09)
+        elif _prov == "kie-veo":
+            from ..services.pricing import Pricing
+            _persec = (Pricing.VEO31_FAST_PER_SEC if str(resolution).lower() in ("480p", "540p")
+                       else Pricing.VEO31_STANDARD_PER_SEC)
         else:
             # Kie Seedance — OFFICIAL per-second rates by resolution; with-input is cheaper.
             _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
