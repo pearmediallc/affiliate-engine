@@ -1928,6 +1928,12 @@ def _budget_blocked():
 
 async def _execute(req: RunRequest):
     """Pick recipe by variation_type → produce variants → POST back to callback."""
+    # SINGLE chokepoint: every recipe (generate / avatar-lipsync / avatar / special / router) is
+    # dispatched from here, and this runs as the background task, so setting the request-id contextvar
+    # ONCE here attributes ALL nested Gemini reasoning/vision spend (incl. creative_team's own helper)
+    # to this job. Without this, any recipe not reached via a per-recipe set would bill to None and
+    # silently vanish from the ledger. Per-recipe sets remain as defensive redundancy.
+    _CURRENT_RID.set(req.request_id)
     from ..services import creative_team_activity as act
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
     label = f"{vtype} · {(req.context.get('creative_filename') or req.assets.get('prompt') or req.request_id)[:60]}"
@@ -3758,6 +3764,7 @@ async def _resume_one_lipsync(row):
     from ..services import lip_sync
     from ..services import creative_team_activity as act
     rid = row["id"]
+    _CURRENT_RID.set(rid)   # fresh task after a restart — set the contextvar so any cost logged here bills to this job
     try:
         result = None
         for _ in range(150):   # ~10 min
