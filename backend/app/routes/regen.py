@@ -42,15 +42,13 @@ CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
 # The current regen request_id, so low-level Gemini helpers can attribute their token spend to the
 # right job WITHOUT threading request_id through every call site. Set at each recipe's entry.
 _CURRENT_RID = contextvars.ContextVar("regen_request_id", default=None)
-# Gemini 2.5 Flash token pricing (USD/token) — so the creative team's reasoning + all vision/parse
-# calls land in the SAME ledger as the big-ticket voice/lipsync/video spend, not just those.
-_GEMINI_IN_PER_TOK = 0.30 / 1_000_000
-_GEMINI_OUT_PER_TOK = 2.50 / 1_000_000
 
 
 def _track_gemini_cost(data: dict, step: str):
     """Best-effort: read usageMetadata off a Gemini response and log its token cost against the
-    current request (contextvar). No-op if usage is absent or no request is in context. Never raises."""
+    current request (contextvar). Prices via the central Pricing class (the ONE rate source) so the
+    reasoning/vision spend uses the same authoritative, env-overridable rates as everything else —
+    NOT a hand-typed number. No-op if usage is absent or no request is in context. Never raises."""
     try:
         rid = _CURRENT_RID.get()
         if not rid:
@@ -60,7 +58,8 @@ def _track_gemini_cost(data: dict, step: str):
         ct = int(u.get("candidatesTokenCount") or 0)
         if not (pt or ct):
             return
-        cost = round(pt * _GEMINI_IN_PER_TOK + ct * _GEMINI_OUT_PER_TOK, 6)
+        from ..services.pricing import Pricing
+        cost = Pricing.text(input_tokens=pt, output_tokens=ct, model=GEMINI_MODEL)
         _track_cost(rid, step, "gemini", model=GEMINI_MODEL, units=pt + ct, unit_type="tokens",
                     cost_usd=cost, note=f"{pt}in+{ct}out")
     except Exception:
