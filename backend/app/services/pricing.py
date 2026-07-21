@@ -234,8 +234,10 @@ class Pricing:
     # ---------------------------------------------------------------- TEXT (Gemini)
 
     # Gemini 2.5 Flash — $/1M tokens (input/output approximations for ad-script lengths)
-    GEMINI_FLASH_INPUT_PER_1M = _env_float("PRICE_GEMINI_FLASH_INPUT_PER_1M", 0.075)
-    GEMINI_FLASH_OUTPUT_PER_1M = _env_float("PRICE_GEMINI_FLASH_OUTPUT_PER_1M", 0.30)
+    # Gemini 2.5 Flash — verified 2026 rate (Google AI pricing): $0.30/1M in, $2.50/1M out
+    # (thinking tokens billed as output). Was 0.075/0.30 (a stale earlier-flash rate).
+    GEMINI_FLASH_INPUT_PER_1M = _env_float("PRICE_GEMINI_FLASH_INPUT_PER_1M", 0.30)
+    GEMINI_FLASH_OUTPUT_PER_1M = _env_float("PRICE_GEMINI_FLASH_OUTPUT_PER_1M", 2.50)
     GEMINI_PRO_INPUT_PER_1M = _env_float("PRICE_GEMINI_PRO_INPUT_PER_1M", 1.25)
     GEMINI_PRO_OUTPUT_PER_1M = _env_float("PRICE_GEMINI_PRO_OUTPUT_PER_1M", 5.00)
 

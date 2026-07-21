@@ -4151,7 +4151,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     if not result:
         raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
     act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
-    _lip_cost = {"fal": round(seconds / 60 * 0.10, 4), "latentsync": 0.088, "wav2lip": 0.03}.get(sub["provider"], 0.0)
+    # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
+    # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
+    # are per-prediction. sync.so uses a free credit → $0.
+    _lip_cost = {"fal": round(seconds * 0.07, 4), "latentsync": 0.088, "wav2lip": 0.03,
+                 "sync": 0.0}.get(sub["provider"], 0.0)
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
