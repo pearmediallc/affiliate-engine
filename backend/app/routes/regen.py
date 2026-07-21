@@ -484,6 +484,18 @@ def _ffprobe_duration(path: str) -> float:
     except Exception:
         return 0.0
 
+def _has_audio_stream(path: str) -> bool:
+    """DETERMINISTIC: does the file contain an audio stream? A vision/frame critic literally cannot
+    hear, so 'the fallback shipped silent video' is invisible to it — this one ffprobe is the correct
+    check. (Presence, not loudness; a present-but-silent track is a separate rare case.)"""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                              "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", path],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        return "audio" in out
+    except Exception:
+        return True   # fail-open: never fail delivery on a probe error
+
 def _ffmpeg(args, timeout: int = 600):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
                    check=True, timeout=timeout,
@@ -2992,8 +3004,18 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
     raises _AllVideoProvidersDown listing each provider's reason when every one is unavailable."""
     from ..services.kieai_service import KieAIService
     from ..services import fal_video as fv
+    from ..services import capabilities as caps
     reasons = []
-    for prov in _t2v_providers():
+    # REQUIREMENT-DRIVEN routing: when audio is needed, try the providers that can actually PRODUCE
+    # audio first (only Kie today); the silent fal lanes stay as a last resort (and recipe_generate
+    # then muxes a TTS voiceover so the ad isn't shipped silent). This is why we no longer route to a
+    # model that can't do what was asked and only discover it after — capability is an input, not a
+    # post-hoc surprise.
+    _order = _t2v_providers()
+    if generate_audio:
+        _ac = caps.audio_capable(_order)
+        _order = _ac + [p for p in _order if p not in _ac]
+    for prov in _order:
         try:
             if prov == "kie-seedance":
                 res = await asyncio.to_thread(
@@ -3183,6 +3205,37 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
         + _note() + " Top up Kie.ai or fal credits, or add tagged library clips.")
 
 
+async def _mux_tts_voiceover(req: "RunRequest", video_path: str, vo_script: str, work: str) -> bool:
+    """Capability-honest recovery: when audio was requested but the clip came from a SILENT provider
+    (fal fallback), speak the VO script with TTS and mux it on — so a credits-out fallback still ships
+    a NARRATED ad, not a silent one. Only runs when the prompt is an actual spoken script (≥12 words),
+    never on a bare visual prompt ('a sunset') where synthesized narration would be nonsense. Modifies
+    video_path in place. Best-effort — returns True iff a voiceover was added; never raises."""
+    try:
+        words = [w for w in re.split(r"\s+", (vo_script or "").strip()) if w]
+        if len(words) < 12:
+            return False
+        from ..services import voice_studio as vs
+        vo = os.path.join(work, f"vo_{req.request_id[:8]}.mp3")
+        res = await asyncio.to_thread(lambda: vs.synthesize(vo_script, out_path=vo))
+        if not (res and os.path.exists(vo)):
+            return False
+        _track_cost(req.request_id, "voice", res.get("provider") or "openai", model=str(res.get("voice")),
+                    units=len(vo_script), unit_type="chars", cost_usd=res.get("cost_usd") or 0,
+                    note="TTS voiceover — silent-provider recovery")
+        muxed = os.path.join(work, "muxed_vo.mp4")
+        await asyncio.to_thread(_ffmpeg, ["-i", video_path, "-i", vo, "-map", "0:v:0", "-map", "1:a:0",
+                                          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", muxed])
+        import shutil
+        shutil.move(muxed, video_path)
+        return True
+    except Cancelled:
+        raise
+    except Exception as e:
+        logger.warning(f"[generate] TTS voiceover mux failed: {e}")
+        return False
+
+
 async def recipe_generate(req: RunRequest) -> list:
     """DIRECT generation from a PROMPT + optional REFERENCE IMAGE(S), engine of the user's choice:
       • 'seedance' (Kie): reference-image-conditioned clip(s) — Seedance keeps subject/scene/voice
@@ -3194,6 +3247,8 @@ async def recipe_generate(req: RunRequest) -> list:
     assets = req.assets or req.directive.get("assets", {}) or {}
     engine = (assets.get("engine") or "seedance").lower()
     prompt = (assets.get("prompt") or "").strip()
+    _vo_script = prompt   # the CLEAN spoken script (before the team appends visual refinement) — used
+                          # only to narrate a silent-fallback clip via TTS, never the visual prompt.
     image_urls = [u for u in (assets.get("image_urls") or []) if u]
     video_urls = [u for u in (assets.get("video_urls") or []) if u]
     audio_urls = [u for u in (assets.get("audio_urls") or []) if u]
@@ -3466,6 +3521,20 @@ async def recipe_generate(req: RunRequest) -> list:
             await asyncio.to_thread(_ffmpeg,
                 ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
+        # ── AUDIO BACKSTOP (deterministic) + capability-honest recovery ──────────────────────────
+        # A frame critic cannot hear, so a silent fallback clip would ship undetected. ffprobe the
+        # REAL output: if audio was requested but the (silent fal) provider produced none, narrate the
+        # script with TTS and mux it so the ad isn't silent; if that can't run, ship + flag honestly.
+        _audio_state = "native"   # native (provider produced it) | tts (we narrated) | none (silent)
+        if generate_audio:
+            if _has_audio_stream(out_path):
+                _audio_state = "native"
+            elif await _mux_tts_voiceover(req, out_path, _vo_script, work):
+                _audio_state = "tts"
+            else:
+                _audio_state = "none"
+                logger.warning(f"[generate] audio requested but provider {produced.get('provider')} "
+                               f"shipped SILENT video and no narratable script — delivering without audio")
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
@@ -3492,7 +3561,10 @@ async def recipe_generate(req: RunRequest) -> list:
         return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
                  "whats_changed": (f"Seedance 2.0 · {len(clip_paths)}×{per}s (~{len(clip_paths)*per}s) · {aspect_ratio} · {resolution}"
                     f"{' · refs: ' + ', '.join(refs) if refs else ''}"
-                    f"{' · audio' if generate_audio else ''}"
+                    # HONEST audio label — reflects the ACTUAL output, not the request flag.
+                    + ({"native": " · audio", "tts": " · voiceover (TTS — Kie down, narrated the script)",
+                        "none": " · ⚠ no audio (silent fallback — top up Kie for narrated video)"}.get(_audio_state, "")
+                       if generate_audio else "")
                     + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "")
                     + _prov_note + ".")}]
     finally:
