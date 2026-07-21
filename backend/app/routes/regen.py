@@ -1779,8 +1779,15 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
         "4) make_image — user wants a still image/poster/photo:\n"
         '   {"action":"make_image","prompt":"..."}\n'
-        "5) reply — conversational, a question, or ambiguous:\n"
-        '   {"action":"reply","text":"..."}\n'
+        "5) reply — conversational, a question, ambiguous, OR gathering details (see below):\n"
+        '   {"action":"reply","text":"..."}\n\n'
+        "FOLLOW-UP BEFORE WRITING (so scripts convert, not go vague): when the user asks for a "
+        "script/video but the request lacks the specifics needed for a CONVERTING result — per the "
+        "STYLE DNA above, e.g. the offer/savings angle, the region/state, a personal story vs a "
+        "straight pitch, the target audience, any real numbers/proof — use action 'reply' to ask 2-4 "
+        "SHORT, targeted questions FIRST (one line each, concrete choices where useful), instead of "
+        "writing a generic script. BUT if the user already gave those specifics, said 'just write "
+        "it'/'surprise me', or is iterating on an existing script, ACT and write it — don't stall.\n"
     )
     try:
         out = await _gemini_json(ask)
