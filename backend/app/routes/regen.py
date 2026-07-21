@@ -1748,11 +1748,25 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         tag = f"[{kind}]" if kind and kind != "text" else ""
         lines.append(f"{role}{tag}: {txt}")
     hist_text = "\n".join(lines) or "(empty)"
+    # Tune Studio scripts to the vertical's PROVEN converting DNA (same as the orbit/file-request
+    # path). Detect the vertical from the caller's hint OR the message/history, then inject the
+    # distilled style-DNA so a "write me a home insurance script" ask yields a curated, on-style
+    # script — not vague generic copy. No DNA for a vertical → degrades to generic (unchanged).
+    from ..services import vertical_dna
+    _vt = (vertical or "").strip().lower()
+    if not _vt or _vt == "general":
+        _blob = (message + " " + hist_text).lower()
+        if re.search(r"home\s*insurance|homeowner", _blob):
+            _vt = "home insurance"
+    _dna = vertical_dna.style_guide(_vt)
+    _dna_block = (f"STYLE DNA for this vertical — any write_script / write_ad_copy MUST follow it "
+                  f"(match the tone/need/structure; use real specifics; never generic):\n{_dna}\n\n") if _dna else ""
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
         "then output ONE strict-JSON action. Prefer acting over asking — only ask when genuinely ambiguous.\n\n"
+        + _dna_block +
         f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
-        f"DEFAULT VERTICAL: {vertical or 'general'}\n\n"
+        f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
         "1) write_script — user wants script(s)/variations/hooks for a video ad:\n"
         '   {"action":"write_script","vertical":"<vertical>","count":N,"scripts":[{"title":"...","text":"..."}]}\n'

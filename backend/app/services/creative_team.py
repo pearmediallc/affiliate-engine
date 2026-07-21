@@ -346,10 +346,12 @@ async def script_writer(*, offer_desc: str, vertical: str, strategy: dict,
                         winner_transcript: str = "") -> str:
     """Write/enhance the spoken script per the Strategist's fix. Keep the offer; open on the
     winning hook. Returns plain script text (spoken lines only, no stage directions)."""
+    from . import vertical_dna
+    _dna = vertical_dna.style_guide(vertical)
     prompt = f"""{_coach_pre('scriptwriter')}You are the Script Writer on a direct-response creative team. Write a tight,
 natural spoken script (first-person, conversational, no stage directions, no on-screen text
 markers) for a short vertical ad.
-
+{(chr(10) + _dna + chr(10)) if _dna else ''}
 OFFER (must stay intact): {offer_desc}
 VERTICAL: {vertical}
 STRATEGIST FIX: {strategy.get('fix','')}
@@ -406,9 +408,11 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
                       "guidance to maximize this script, THEN write the improved script.")
         diag_hint = ("forward-looking opportunity, NOT a verdict on past performance "
                      "(e.g. 'To maximize this, open on the payoff…')")
+    from . import vertical_dna
     prompt = f"""{pb.MISSION}
 
 {pb.vertical_brief(vertical)}
+{vertical_dna.style_guide(vertical)}
 
 {learn.lessons_for_prompt(vertical=vertical)}
 
