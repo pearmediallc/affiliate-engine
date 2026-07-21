@@ -4225,6 +4225,40 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"VEED captions failed, keeping base video: {e}")
     _set_lipsync_status(req.request_id, "done")
+
+    # ── POST-RENDER VISUAL QA (grade + coach, NO retry) ──────────────────────────────────────────
+    # The avatar-lipsync path produced its clip but nothing ever critiqued the OUTPUT — so no persona
+    # was ever faulted, accountability stayed pinned at 100%, and no 1:1 coaching was written. Run the
+    # SAME vision Critic the t2v path uses on the FINAL delivered clip: reward the personas on a pass,
+    # or attribute faults + write the one-on-one note (fed back into the next run via _coach_pre) on a
+    # miss. Best-effort — never blocks or breaks delivery; grade-only, no regeneration.
+    try:
+        from ..services import creative_team as team
+        _final_clip = os.path.join(UPLOAD_DIR, name)
+        _qwork = tempfile.mkdtemp()
+        try:
+            _qframes = await asyncio.to_thread(_extract_frames, _final_clip,
+                                               [1.0, max(1.5, seconds * 0.5)], _qwork)
+            if _qframes:
+                _tq = act.start("critic", req.request_id, "visual QA on the final avatar clip")
+                _beat = {"i": 0, "shot_type": "talking_head", "prompt": (script or "")[:400]}
+                _ev = await team.evaluate_clip(_qframes, _beat)
+                _passed = team.eval_passed(_ev)
+                act.finish("critic", req.request_id, _tq, ok=True, revised=(not _passed),
+                           detail=(f"final clip scored {_ev.get('overall')}/10 · faults: "
+                                   + ", ".join(_ev.get("fault_personas") or ["none"])),
+                           helpfulness=float(_ev.get("overall", 10)) / 10.0)
+                if _passed:
+                    for _p in ("prompt", "character", "shots"):
+                        act.reward(_p, job_id=req.request_id)
+                else:
+                    team.coach_from_eval(_beat, _ev, job_id=req.request_id)   # dock + 1:1 note + learn
+        finally:
+            import shutil as _sh2
+            _sh2.rmtree(_qwork, ignore_errors=True)
+    except Exception as _qe:
+        logger.warning(f"[avatar-lipsync] post-render QA skipped: {_qe}")
+
     # auto-feedback statement for THIS generation (shown per video). Report what ACTUALLY happened —
     # a clone that fell back to a preset must not still claim "cloned from character".
     _cloned = voice_res.get("provider") in ("fal-clone", "chatterbox")
