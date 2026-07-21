@@ -107,6 +107,13 @@ async def _gemini_json(prompt: str, *, temperature: float = 0.4,
             r = await c.post(url, json=body)
             r.raise_for_status()
             data = r.json()
+        # cost the team's reasoning tokens into the SAME ledger as the provider spend (lazy import
+        # avoids a circular load; the current request_id is read from a contextvar set by the recipe).
+        try:
+            from ..routes.regen import _track_gemini_cost
+            _track_gemini_cost(data, "team-reasoning")
+        except Exception:
+            pass
         out = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
         _LLM_STATS["ok"] += 1
         return out

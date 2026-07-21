@@ -21,6 +21,7 @@ import logging
 import asyncio
 import tempfile
 import subprocess
+import contextvars
 from typing import Optional, Any
 
 import httpx
@@ -37,6 +38,33 @@ router = APIRouter()
 
 GEMINI_MODEL = "gemini-2.5-flash"
 CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
+
+# The current regen request_id, so low-level Gemini helpers can attribute their token spend to the
+# right job WITHOUT threading request_id through every call site. Set at each recipe's entry.
+_CURRENT_RID = contextvars.ContextVar("regen_request_id", default=None)
+# Gemini 2.5 Flash token pricing (USD/token) — so the creative team's reasoning + all vision/parse
+# calls land in the SAME ledger as the big-ticket voice/lipsync/video spend, not just those.
+_GEMINI_IN_PER_TOK = 0.30 / 1_000_000
+_GEMINI_OUT_PER_TOK = 2.50 / 1_000_000
+
+
+def _track_gemini_cost(data: dict, step: str):
+    """Best-effort: read usageMetadata off a Gemini response and log its token cost against the
+    current request (contextvar). No-op if usage is absent or no request is in context. Never raises."""
+    try:
+        rid = _CURRENT_RID.get()
+        if not rid:
+            return
+        u = (data or {}).get("usageMetadata") or {}
+        pt = int(u.get("promptTokenCount") or 0)
+        ct = int(u.get("candidatesTokenCount") or 0)
+        if not (pt or ct):
+            return
+        cost = round(pt * _GEMINI_IN_PER_TOK + ct * _GEMINI_OUT_PER_TOK, 6)
+        _track_cost(rid, step, "gemini", model=GEMINI_MODEL, units=pt + ct, unit_type="tokens",
+                    cost_usd=cost, note=f"{pt}in+{ct}out")
+    except Exception:
+        pass
 AE_PUBLIC_URL = os.getenv("AE_PUBLIC_URL", "https://affiliate-engine-pl4p.onrender.com")
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -161,6 +189,7 @@ async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
         r = await c.post(url, json=body)
         r.raise_for_status()
         data = r.json()
+    _track_gemini_cost(data, "vision")
     return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
 
 
@@ -637,6 +666,7 @@ async def _gemini_json(prompt: str) -> dict:
             r = await c.post(url, json=body)
             r.raise_for_status()
             data = r.json()
+        _track_gemini_cost(data, "reasoning")
         txt = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(txt)
     except Exception as ge:
@@ -3155,6 +3185,7 @@ async def recipe_generate(req: RunRequest) -> list:
       • 'veo-extend' (Google Veo 3.1): a base clip (from the image if given, else text) then NATIVE
         +7s extends for seamless longer video.
     Reads req.assets = {engine, prompt, image_urls[], seconds}."""
+    _CURRENT_RID.set(req.request_id)   # so Gemini reasoning/vision tokens bill to this job
     assets = req.assets or req.directive.get("assets", {}) or {}
     engine = (assets.get("engine") or "seedance").lower()
     prompt = (assets.get("prompt") or "").strip()
@@ -3810,6 +3841,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     generate a matching voice (optionally CLONED from the character's own footage for max
     naturalness), then re-lipsync the footage to that voice with LatentSync. No synthetic
     avatar — it's our own person, so it never looks 'AIfied'."""
+    _CURRENT_RID.set(req.request_id)   # so Gemini reasoning/vision tokens bill to this job
     from ..services import voice_studio as vs
     from ..services.lip_sync import LipSyncService
     from ..services import creative_team_activity as act
