@@ -233,8 +233,11 @@ def _cta_button_lines(text: str, start: float, end: float, play_w: int, play_h: 
     ffmpeg pass, no image assets, no new dependency."""
     cx = play_w // 2
     cy = play_h - marginv           # button centre (\an5), independent of caption flow
-    dur = max(0.8, end - start)     # a CTA needs a beat to register + act on
-    end = start + dur
+    # Use the caller's `end` verbatim — it ALREADY held the CTA (up to ~2.5s) and capped it at the
+    # next caption's start. Stretching here (the old max(0.8,…)) pushed the pulsing button PAST that
+    # cap, so it overlapped the next caption. Only guard a degenerate zero/negative window.
+    if end - start < 0.25:
+        end = start + 0.25
     cyc = 0.65                       # one pulse cycle
     lines, t, first = [], start, True
     while t < end - 1e-3:
