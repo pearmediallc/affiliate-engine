@@ -224,6 +224,38 @@ def _cta_spans(words: list) -> list:
     return merged
 
 
+def _cta_button_lines(text: str, start: float, end: float, play_w: int, play_h: int, marginv: int, k: float) -> list:
+    """Render a spoken CTA as an ANIMATED, HIGHLIGHTED button instead of a static box:
+       • pop-in when it first appears, then a gentle continuous pulse (grows/shrinks) so the eye
+         is pulled to it — a clear 'tap me' affordance the old static box lacked;
+       • an expanding, fading outline RING once per pulse = a tap-ripple around the button.
+    Pure ASS animation (\\t transforms) so it stays in the SAME single libass burn — no extra
+    ffmpeg pass, no image assets, no new dependency."""
+    cx = play_w // 2
+    cy = play_h - marginv           # button centre (\an5), independent of caption flow
+    dur = max(0.8, end - start)     # a CTA needs a beat to register + act on
+    end = start + dur
+    cyc = 0.65                       # one pulse cycle
+    lines, t, first = [], start, True
+    while t < end - 1e-3:
+        ce = min(t + cyc, end)
+        ms = max(120, int((ce - t) * 1000))
+        half = max(60, ms // 2)
+        if first:                    # pop-in: snap up from small, overshoot, settle
+            eff = r"{\an5\pos(%d,%d)\fscx70\fscy70\t(0,200,\fscx106\fscy106)\t(200,%d,\fscx100\fscy100)}" % (cx, cy, ms)
+            first = False
+        else:                        # steady pulse: grow then shrink within the cycle
+            eff = r"{\an5\pos(%d,%d)\t(0,%d,\fscx106\fscy106)\t(%d,%d,\fscx100\fscy100)}" % (cx, cy, half, half, ms)
+        lines.append("Dialogue: 2,%s,%s,Cta,,0,0,0,,%s%s" % (_fmt(t), _fmt(ce), eff, text))
+        # tap-ripple ring: expand the outline + fade to transparent over ~0.6s (layer BELOW the button)
+        r_ms = min(ms, 600)
+        ring = r"{\an5\pos(%d,%d)\bord%d\blur2\t(0,%d,\bord%d\blur9\alpha&HFF&)}" % (
+            cx, cy, max(4, int(5 * k)), r_ms, max(18, int(22 * k)))
+        lines.append("Dialogue: 1,%s,%s,CtaGlow,,0,0,0,,%s%s" % (_fmt(t), _fmt(min(t + r_ms / 1000.0, end)), ring, text))
+        t = ce
+    return lines
+
+
 def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1080, play_h: int = 1920) -> str | None:
     """TikTok/Reels-style burned captions — NOT movie subtitles.
 
@@ -255,7 +287,10 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
         # white text, fat black outline, bottom-centre — the TikTok look
         f"Style: Def,Arial,{fs},&H00FFFFFF,&H00000000,&H00000000,-1,0,1,{outline},{shadow},2,{side},{side},{marginv}\n"
         # BorderStyle=3 = opaque box → renders as a button; Outline value is the button padding.
-        f"Style: Cta,Arial,{cta_fs},&H00FFFFFF,&H00E07A1F,&H00000000,-1,0,3,{max(10, int(16 * k))},0,2,{side},{side},{marginv}\n\n"
+        f"Style: Cta,Arial,{cta_fs},&H00FFFFFF,&H00E07A1F,&H00000000,-1,0,3,{max(10, int(16 * k))},0,2,{side},{side},{marginv}\n"
+        # CtaGlow = outline-only ring (transparent fill) that expands + fades = a "tap here" ripple
+        # around the button. BorderStyle=1 so only the bright border shows; animated in the events.
+        f"Style: CtaGlow,Arial,{cta_fs},&HFF000000,&H0000D7FF,&H00000000,-1,0,1,{max(4, int(5 * k))},0,5,{side},{side},{marginv}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         % (play_w, play_h)
     )
@@ -305,7 +340,10 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
             end = max(end, c["start"] + 0.9)
         if end - c["start"] < 0.35:                      # too quick to read → give it a beat
             end = c["start"] + 0.35
-        lines.append(f"Dialogue: 0,{_fmt(c['start'])},{_fmt(end)},{c['style']},,0,0,0,,{c['text']}")
+        if c["style"] == "Cta":                          # spoken CTA → animated highlighted button
+            lines.extend(_cta_button_lines(c["text"], c["start"], end, play_w, play_h, marginv, k))
+        else:
+            lines.append(f"Dialogue: 0,{_fmt(c['start'])},{_fmt(end)},{c['style']},,0,0,0,,{c['text']}")
     with open(out_ass_path, "w") as f:
         f.write(header + "\n".join(lines) + "\n")
     return out_ass_path
