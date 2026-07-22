@@ -3304,7 +3304,7 @@ async def recipe_generate(req: RunRequest) -> list:
     video_urls = [u for u in (assets.get("video_urls") or []) if u]
     audio_urls = [u for u in (assets.get("audio_urls") or []) if u]
     aspect_ratio = assets.get("aspect_ratio") or "9:16"
-    resolution = assets.get("resolution") or "720p"
+    resolution = assets.get("resolution") or "480p"   # DEFAULT 480p (cheaper/faster); explicit override wins
     generate_audio = assets.get("generate_audio", True)
     seconds = int(assets.get("seconds") or (16 if engine == "veo-extend" else 15))
     if not prompt:
