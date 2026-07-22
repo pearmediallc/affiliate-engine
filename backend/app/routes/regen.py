@@ -1762,6 +1762,12 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         _blob = (message + " " + hist_text).lower()
         if re.search(r"home\s*insurance|homeowner", _blob):
             _vt = "home insurance"
+        elif re.search(r"\bguns?\b|firearm|2a\b|second amendment|ammo|concealed carry", _blob):
+            _vt = "guns"
+        elif re.search(r"sweepstake|sweeps\b|giveaway|gift ?card", _blob):
+            _vt = "sweeps"
+    # ALWAYS returns the universal craft DNA (+ the vertical's need if we have it), so every script —
+    # any vertical — carries the proven converting craft, not just home insurance.
     _dna = vertical_dna.style_guide(_vt)
     _dna_block = (f"STYLE DNA for this vertical — any write_script / write_ad_copy MUST follow it "
                   f"(match the tone/need/structure; use real specifics; never generic):\n{_dna}\n\n") if _dna else ""
