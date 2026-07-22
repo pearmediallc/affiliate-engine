@@ -1769,6 +1769,8 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     # ALWAYS returns the universal craft DNA (+ the vertical's need if we have it), so every script —
     # any vertical — carries the proven converting craft, not just home insurance.
     _dna = vertical_dna.style_guide(_vt)
+    from ..services import script_brief
+    _brief_checklist = script_brief.checklist_text()   # the factors a superb script needs (format, audience, setting, angle, offer, geo, tone, length)
     _dna_block = (f"STYLE DNA for this vertical — any write_script / write_ad_copy MUST follow it "
                   f"(match the tone/need/structure; use real specifics; never generic):\n{_dna}\n\n") if _dna else ""
     ask = (
@@ -1789,15 +1791,15 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
         "4) make_image — user wants a still image/poster/photo:\n"
         '   {"action":"make_image","prompt":"..."}\n'
-        "5) reply — conversational, a question, ambiguous, OR gathering details (see below):\n"
+        "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
         '   {"action":"reply","text":"..."}\n\n'
-        "FOLLOW-UP BEFORE WRITING (so scripts convert, not go vague): when the user asks for a "
-        "script/video but the request lacks the specifics needed for a CONVERTING result — per the "
-        "STYLE DNA above, e.g. the offer/savings angle, the region/state, a personal story vs a "
-        "straight pitch, the target audience, any real numbers/proof — use action 'reply' to ask 2-4 "
-        "SHORT, targeted questions FIRST (one line each, concrete choices where useful), instead of "
-        "writing a generic script. BUT if the user already gave those specifics, said 'just write "
-        "it'/'surprise me', or is iterating on an existing script, ACT and write it — don't stall.\n"
+        "FOLLOW-UP BEFORE WRITING (so scripts are SUPERB, not vague): when the user asks for a "
+        "script/video but hasn't given the creative brief, use action 'reply' to ask for the MISSING "
+        "factors below as a tight NUMBERED list, using the given options — then write once you have "
+        "them. Only ask what's missing: if the user already stated a factor, or says 'just write "
+        "it'/'you pick'/'surprise me', or is iterating on an existing script, DON'T re-ask — fill "
+        "sensible defaults from the vertical and write. Open with one friendly line, then the list.\n"
+        + _brief_checklist + "\n"
     )
     try:
         out = await _gemini_json(ask)
