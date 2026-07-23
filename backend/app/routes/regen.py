@@ -1656,9 +1656,9 @@ async def recast_avatar(payload: dict, _auth: bool = Depends(require_service_key
         if traits.get("scene"):    parts.append(f"in {traits['scene']}")
         parts.append("front-facing talking-head framing, head and shoulders, looking straight at the "
                      "camera, neutral closed mouth, relaxed natural expression, even soft lighting")
-        portrait_prompt = (", ".join(parts) +
-            ". Authentic UGC look, natural skin texture with real pores, realistic lighting, correct "
-            "anatomy; ONE single person only; NO on-screen text, no watermark, no plastic AI skin.")
+        from ..services import prompt_craft as _pc
+        portrait_prompt = (", ".join(parts) + ". " + _pc.UGC_PORTRAIT_TAGS +
+            " ONE single person only; NO on-screen text, no watermark.")
         svc = ImageGeneratorService()
         img = await svc._generate_with_provider(portrait_prompt, "9:16")
         portrait_url, img_path = img.get("url"), img.get("path")

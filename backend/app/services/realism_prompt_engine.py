@@ -119,7 +119,11 @@ def build_prompt(
     if ref["model_rule"]:
         prompt += " " + ref["model_rule"]
     prompt += _mentions(model, n_reference_images, has_reference_video)
-    return prompt[:1900]
+    # Model-aware cap: Seedance/Kie ingest long detailed prompts well (per our team's skill), so don't
+    # slice off the rich craft detail at 1900; models with real limits keep the tighter cap.
+    _m = (model or "").lower()
+    _cap = 6000 if ("seedance" in _m or "kie" in _m or "veo" in _m) else 1900
+    return prompt[:_cap]
 
 
 def build_winner_clone_prompt(

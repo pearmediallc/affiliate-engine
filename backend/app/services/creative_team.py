@@ -211,7 +211,8 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
         plan_route["notes"] = (plan_route.get("notes", "") + f" (learned: avoid {plan_route['engine']} for {plan_route['style']})").strip()
     playbook = pb.summary_for_prompt()
     lessons = learn.lessons_for_prompt(style=plan_route["style"], vertical=vertical)
-    prompt = f"""{playbook}\n\n{lessons}\n\nYou are the Creative Director — the leader of a direct-response video team. You
+    from . import prompt_craft
+    prompt = f"""{playbook}\n\n{lessons}\n\n{prompt_craft.UGC_AD_CRAFT}\n\nYou are the Creative Director — the leader of a direct-response video team. You
 decide the whole plan and delegate. Be concrete about REFERENCES, MODEL, and where we LIP-SYNC a
 talking person vs HARD-CUT to an insert (b-roll / map / product).
 
@@ -446,7 +447,10 @@ async def director(*, script: str, request_type: str, vertical: str) -> list:
     """Break the script into timed beats and direct each: scene, emotion, gesture, environment,
     and the ONE continuous action. Returns list of beat dicts."""
     clips = rpe.split_into_clips(script, max_words=30)
-    prompt = f"""{_coach_pre('scene')}You are the Director on a creative team. For each spoken beat below, direct the
+    from . import prompt_craft
+    prompt = f"""{_coach_pre('scene')}{prompt_craft.SEEDANCE_SHOT_CRAFT}
+
+You are the Director on a creative team. For each spoken beat below, direct the
 performance for a realistic vertical ad. ONE continuous physical action per beat (never sequence
 two actions). Emotions and gestures must feel candid, not staged.
 
@@ -487,7 +491,10 @@ async def character_manager(*, request_type: str, vertical: str,
         age = hint.get("age", "45+"); gender = hint.get("gender", "woman"); region = hint.get("region", "American")
         return (f"a real, ordinary {region} {gender} aged {age}, natural un-retouched skin with pores, "
                 f"minimal makeup, everyday casual clothes, believable candid demeanor")
-    prompt = f"""{_coach_pre('character')}You are the Character Manager. Describe ONE believable, ordinary
+    from . import prompt_craft
+    prompt = f"""{_coach_pre('character')}{prompt_craft.UGC_IMAGE_CRAFT}
+
+You are the Character Manager. Describe ONE believable, ordinary
 real person to be the consistent on-camera talent for a {vertical} {request_type} ad. Anti-slop: no
 model looks, natural skin, everyday clothes. {cm.CHARACTER_CASTING}
 Return STRICT JSON: {{"entity_desc": "one vivid sentence"}}"""
