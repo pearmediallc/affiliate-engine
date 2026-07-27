@@ -3348,7 +3348,7 @@ async def recipe_generate(req: RunRequest) -> list:
     video_urls = [u for u in (assets.get("video_urls") or []) if u]
     audio_urls = [u for u in (assets.get("audio_urls") or []) if u]
     aspect_ratio = assets.get("aspect_ratio") or "9:16"
-    resolution = assets.get("resolution") or "480p"   # DEFAULT 480p (cheaper/faster); explicit override wins
+    resolution = assets.get("resolution") or "720p"   # DEFAULT 720p — 480p read as plastic/AI; explicit override wins
     generate_audio = assets.get("generate_audio", True)
     seconds = int(assets.get("seconds") or (16 if engine == "veo-extend" else 15))
     if not prompt:
@@ -3379,6 +3379,13 @@ async def recipe_generate(req: RunRequest) -> list:
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
                 prompt = f"{prompt}. {refined}"
+            # HOOK FIX: the spoken lines must come from the team's HOOK-optimized script (hook in the
+            # first sentence), NOT the raw user prompt. Previously _vo_script stayed = prompt on the
+            # t2v lane, so the writer's rewrite drove only the visuals while the character spoke the
+            # unhooked raw text. Use plan["script"] when the office produced one.
+            _pscript = (plan.get("script") or "").strip()
+            if _pscript:
+                _vo_script = _pscript
             # FIX A: drive avatar-lipsync off the PLAN'S ROUTE regardless of the explicit engine. CL
             # sends engine="seedance", so the engine-gated block below never fires — but a talking-head
             # plan (route=avatar_lipsync) must still run the FUNDED lip-sync recipe (TTS+LatentSync — no
@@ -3560,20 +3567,29 @@ async def recipe_generate(req: RunRequest) -> list:
         # a fixed seconds/15 that repeats. Non-talking (broll) keeps the seconds-based split.
         from ..services import realism_prompt_engine as _rpe
         _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=28) if is_talk else []
+        _per_list = None
         if _vo_chunks:
-            n_clips = max(1, min(len(_vo_chunks), 6))
-            per = max(6, min(15, _math.ceil((seconds or 15 * n_clips) / n_clips)))
+            # Size clips off the SCRIPT, not the requested `seconds`: render EVERY chunk (so the whole
+            # script gets spoken — the old min(...,6) cap silently dropped the tail and cut the ad
+            # short), and give each clip enough seconds for its own words (~2.5 words/sec + 1s breathing
+            # room), clamped to the model's ~15s/clip cap. 8-clip safety ceiling against a runaway split.
+            n_clips = max(1, min(len(_vo_chunks), 8))
+            def _clip_secs(_txt):
+                _w = len((_txt or "").split())
+                return max(6, min(15, _math.ceil(_w / 2.5) + 1))
+            _per_list = [_clip_secs(c) for c in _vo_chunks[:n_clips]]
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         try:
           for ci in range(n_clips):
+            per_ci = _per_list[ci] if _per_list else per   # this clip's own duration (script-sized)
             await _abort_if_cancelled(req, f"seedance clip {ci+1}/{n_clips}")
-            act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per}s · {aspect_ratio}")
+            act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per_ci}s · {aspect_ratio}")
             imgs = list(image_urls or [])
             cprompt = prompt
             if ci > 0 and clip_paths:
                 _pd = await asyncio.to_thread(_ffprobe_duration, clip_paths[-1])
-                cont = _frame_to_public_url(clip_paths[-1], max(0.5, (_pd or per) - 0.4))   # last frame → seamless continuation
+                cont = _frame_to_public_url(clip_paths[-1], max(0.5, (_pd or per_ci) - 0.4))   # last frame → seamless continuation
                 if cont:
                     imgs = [cont] + imgs
                 cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
@@ -3596,7 +3612,7 @@ async def recipe_generate(req: RunRequest) -> list:
                 return await _generate_t2v_clip(
                     prompt=bt.get("prompt"),
                     image_urls=_imgs, video_urls=prepped_vids, audio_urls=audio_urls,
-                    seconds=per, resolution=resolution, aspect_ratio=aspect_ratio,
+                    seconds=per_ci, resolution=resolution, aspect_ratio=aspect_ratio,
                     generate_audio=generate_audio, first=_first, produced=produced)
 
             cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
@@ -3652,6 +3668,42 @@ async def recipe_generate(req: RunRequest) -> list:
                 _audio_state = "none"
                 logger.warning(f"[generate] audio requested but provider {produced.get('provider')} "
                                f"shipped SILENT video and no narratable script — delivering without audio")
+        # ── FINISH PASS — captions (explicit user choice) + consumer-camera grade — ONE encode ──────
+        # Captions: the t2v lane historically shipped clean footage (NO_TEXT). When the request asks
+        # for captions, align the spoken script against the REAL output audio (whisper) and burn ASS —
+        # same path the avatar-lipsync lane uses. Grade: a subtle sensor-grain + slightly faded
+        # contrast/saturation so the render reads as a real phone capture, not a clean AI plate (the
+        # single biggest "looks AI-generated" lever after the prompt). Both fold into one ffmpeg pass.
+        _caps_burned = False
+        _vf_parts = []
+        _want_caps = bool(assets.get("captions", True)) and _audio_state != "none"
+        if _want_caps:
+            try:
+                from ..services import captions as cap
+                _cap_audio = os.path.join(work, "capaudio.wav")
+                await asyncio.to_thread(_ffmpeg, ["-i", out_path, "-vn", "-ac", "1", "-ar", "16000", "-y", _cap_audio], 120)
+                _cwords, _cmethod = await asyncio.to_thread(lambda: cap.align(_cap_audio, _vo_script or prompt))
+                if _cwords:
+                    _cw, _ch = await asyncio.to_thread(_video_dims, out_path)
+                    _ass = cap.build_ass(_cwords, os.path.join(work, f"cap_{req.request_id[:8]}.ass"),
+                                         play_w=_cw or W2, play_h=_ch or H2)
+                    if _ass and os.path.exists(_ass):
+                        _vf_parts.append(f"ass={_ass}"); _caps_burned = True
+                        logger.info(f"[generate] captions: {len(_cwords)} words aligned ({_cmethod})")
+            except Exception as _ce:
+                logger.warning(f"[generate] caption burn skipped: {_ce}")
+        _style = str(assets.get("style") or "realistic").lower()
+        if _style not in ("cinematic", "animated", "clean"):
+            _vf_parts.append("noise=alls=6:allf=t+u,eq=contrast=0.98:saturation=0.95:gamma=1.01")
+        if _vf_parts:
+            try:
+                _fin = os.path.join(work, "finish.mp4")
+                await asyncio.to_thread(_ffmpeg,
+                    ["-i", out_path, "-vf", ",".join(_vf_parts), "-c:v", "libx264", "-preset", "veryfast",
+                     "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-y", _fin], 900)
+                import shutil as _shf; _shf.move(_fin, out_path)
+            except Exception as _fe:
+                logger.warning(f"[generate] finish pass skipped: {_fe}")
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
@@ -3669,7 +3721,7 @@ async def recipe_generate(req: RunRequest) -> list:
             _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
             _rr = _KIE_RATE.get(str(resolution).lower(), _KIE_RATE["720p"])
             _persec = _rr[0] if _with_input else _rr[1]
-        _vid_sec = len(clip_paths) * per
+        _vid_sec = sum(_per_list[:len(clip_paths)]) if _per_list else len(clip_paths) * per
         _track_cost(req.request_id, "video", _prov, model=f"seedance-{resolution}",
                     units=_vid_sec, unit_type="sec", cost_usd=round(_persec * _vid_sec, 4),
                     note=("with-input" if _with_input else "text→video")
@@ -3680,8 +3732,9 @@ async def recipe_generate(req: RunRequest) -> list:
         if audio_urls: refs.append(f"{len(audio_urls)} audio")
         _prov_note = "" if _prov == "kie-seedance" else f" · via {_prov} (fallback — Kie unavailable)"
         return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
-                 "whats_changed": (f"Seedance 2.0 · {len(clip_paths)}×{per}s (~{len(clip_paths)*per}s) · {aspect_ratio} · {resolution}"
-                    f"{' · refs: ' + ', '.join(refs) if refs else ''}"
+                 "whats_changed": (f"Seedance 2.0 · {len(clip_paths)} clip(s) · ~{_vid_sec}s · {aspect_ratio} · {resolution}"
+                    + (" · captions" if _caps_burned else "")
+                    + f"{' · refs: ' + ', '.join(refs) if refs else ''}"
                     # HONEST audio label — reflects the ACTUAL output, not the request flag.
                     + ({"native": " · audio", "tts": " · voiceover (TTS — Kie down, narrated the script)",
                         "none": " · ⚠ no audio (silent fallback — top up Kie for narrated video)"}.get(_audio_state, "")
