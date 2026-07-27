@@ -649,8 +649,18 @@ Attribute EACH problem to the responsible role, choosing from:
 Return STRICT JSON: {{"realism": <0-10>, "lipsync": <0-10>, "captions": <0-10>,
   "overall": <0-10>, "issues": ["short concrete defect"], "fault_personas": ["character", ...]}}"""
     out = await _gemini_json(prompt, temperature=0.2, frames=frame_paths)
-    if not out:
-        return {"overall": 10, "realism": 10, "lipsync": 10, "captions": 10, "issues": [], "fault_personas": []}
+    if not out or not frame_paths:
+        # FAIL CLOSED. This used to return 10/10 "flawless" whenever vision was unavailable — so a
+        # down/unfunded Gemini silently rubber-stamped EVERY clip and defects shipped labeled perfect.
+        # "We could not check" is NOT "it is good": mark it UNVERIFIED so it is never counted as a
+        # pass, is recorded honestly, and surfaces for human review. Does not block delivery (the
+        # generation still returns) — but the quality bar no longer lies.
+        return {"overall": None, "realism": None, "lipsync": None, "captions": None,
+                "verified": False,
+                "issues": ["UNVERIFIED — vision QA unavailable (no frames or vision call failed); "
+                           "this clip was NOT graded"],
+                "fault_personas": []}
+    out["verified"] = True
     out["fault_personas"] = [p for p in (out.get("fault_personas") or []) if p in _FAULT_PERSONAS]
     return out
 
@@ -685,7 +695,20 @@ def coach_from_eval(beat: dict, ev: dict, job_id: Optional[str] = None) -> None:
 
 
 def eval_passed(ev: dict) -> bool:
-    return float(ev.get("overall", 10)) >= EVAL_PASS_THRESHOLD
+    """A clip PASSES only if it was actually graded AND cleared the bar. An UNVERIFIED eval
+    (vision unavailable → overall=None) is NOT a pass — it must never be rubber-stamped."""
+    ov = ev.get("overall")
+    if ov is None:
+        return False
+    try:
+        return float(ov) >= EVAL_PASS_THRESHOLD
+    except (TypeError, ValueError):
+        return False
+
+
+def eval_unverified(ev: dict) -> bool:
+    """True when QA could not actually inspect the clip (vs. inspected-and-failed)."""
+    return ev.get("verified") is False or ev.get("overall") is None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

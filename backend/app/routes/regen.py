@@ -2731,6 +2731,99 @@ async def recipe_special(req: RunRequest) -> list:
                               else f"Could not map to a recipe. Parsed: {req.directive.get('recipe_steps')}"}]
 
 
+def _record_qc(request_id: str, beat: dict, ev: dict, unverified: bool = False,
+               stage: str = "clip") -> None:
+    """PERSIST every critic verdict to creative_decisions so the loop has a REAL scored history.
+    Previously evaluate_clip's score was used for in-flight retries and then THROWN AWAY — nothing
+    was written, so /learn/decisions returned [] and nothing accumulated across runs. Append-only,
+    best-effort: a logging failure must never break a generation."""
+    try:
+        from ..models.creative_team import CreativeDecision
+        from ..database import SessionLocal
+        issues = [str(i) for i in (ev.get("issues") or [])][:6]
+        reasons = {"stage": stage, "beat": beat.get("i"), "shot_type": beat.get("shot_type"),
+                   "overall": ev.get("overall"), "realism": ev.get("realism"),
+                   "lipsync": ev.get("lipsync"), "captions": ev.get("captions"),
+                   "verified": not unverified, "issues": issues,
+                   "fault_personas": ev.get("fault_personas") or []}
+        db = SessionLocal()
+        try:
+            db.add(CreativeDecision(
+                request_id=request_id,
+                qc_passed=(False if unverified else bool(_team_eval_passed(ev))),
+                qc_reasons=json.dumps(reasons)[:4000],
+                blamed_brains=json.dumps(ev.get("fault_personas") or [])[:1000],
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"[critic] could not persist QC verdict: {e}")
+
+
+async def _final_video_qa(request_id: str, out_path: str, script: str, work: str) -> dict:
+    """HOLISTIC QA on the FINAL assembled video — the only stage that sees what the user receives.
+
+    The clip-level critic grades each clip in isolation BEFORE stitching and BEFORE any post pass,
+    so it is structurally blind to exactly the defects that shipped: (a) clip 2 repeating clip 1's
+    lines (each clip looks fine alone), (b) an incomplete script (tail never spoken), and
+    (c) artifacts introduced after grading. This transcribes the FINAL audio and vision-checks the
+    FINAL frames. Best-effort: never blocks delivery, but always records an honest verdict."""
+    issues, dup_ratio, spoken = [], 0.0, ""
+    try:
+        from ..services import captions as cap
+        _wav = os.path.join(work, "finalqa.wav")
+        await asyncio.to_thread(_ffmpeg, ["-i", out_path, "-vn", "-ac", "1", "-ar", "16000", "-y", _wav], 120)
+        words, _m = await asyncio.to_thread(lambda: cap.align(_wav, script or ""))
+        spoken = " ".join([str(w.get("word") or w.get("text") or "") for w in (words or [])]).strip()
+        if spoken:
+            # DUPLICATION: does the opening line reappear later? (the "same video twice" defect)
+            _toks = spoken.lower().split()
+            if len(_toks) >= 16:
+                _head = " ".join(_toks[:8])
+                if spoken.lower().count(_head) > 1:
+                    issues.append(f"DUPLICATE SPEECH — the opening line is spoken "
+                                  f"{spoken.lower().count(_head)}× (clips repeat instead of advancing)")
+            # COMPLETENESS: did the tail of the script actually get said?
+            _s = (script or "").lower().split()
+            if len(_s) >= 12:
+                _tail = " ".join(_s[-6:])
+                import difflib as _dl
+                if not _dl.SequenceMatcher(None, _tail, spoken.lower()[-160:]).ratio() > 0.35 \
+                        and _tail.split()[-1] not in spoken.lower():
+                    issues.append("INCOMPLETE — the end of the script (CTA) was never spoken")
+    except Exception as e:
+        logger.warning(f"[final-qa] transcript check skipped: {e}")
+    # VISION on the final frames (catches post-stitch artifacts: blown-out eyes, morphing, warping)
+    ev = {}
+    try:
+        from ..services import creative_team as team
+        _dur = await asyncio.to_thread(_ffprobe_duration, out_path)
+        _ts = [t for t in (1.0, (_dur or 12) / 2.0, max(1.0, (_dur or 12) - 1.5))]
+        _frames = await asyncio.to_thread(_extract_frames, out_path, _ts, work)
+        if _frames:
+            ev = await team.evaluate_clip(_frames, {"i": "final", "shot_type": "talking_head"}) or {}
+            issues += [str(i) for i in (ev.get("issues") or [])]
+    except Exception as e:
+        logger.warning(f"[final-qa] vision check skipped: {e}")
+    verdict = {**ev, "issues": issues, "final_qa": True}
+    _record_qc(request_id, {"i": "final"}, verdict,
+               unverified=(ev.get("overall") is None and not spoken), stage="final_video")
+    if issues:
+        logger.warning(f"[final-qa] request {request_id} FINAL defects: {issues}")
+    else:
+        logger.info(f"[final-qa] request {request_id} clean")
+    return verdict
+
+
+def _team_eval_passed(ev: dict) -> bool:
+    try:
+        from ..services import creative_team as _t
+        return _t.eval_passed(ev)
+    except Exception:
+        return False
+
+
 async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -> Optional[str]:
     """Generate ONE beat, then run the eval self-learning loop: vision-QA the result, and if it
     scores below the bar, coach the faulted persona(s) + fold the correction into the beat prompt
@@ -2751,9 +2844,20 @@ async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -
         ts = act.start("critic", job_id, f"visual QA beat {beat.get('i')}")
         ev = await team.evaluate_clip(frames, beat)
         ok = team.eval_passed(ev)
-        act.finish("critic", job_id, ts, ok=True, revised=(not ok),
-                   detail=f"beat {beat.get('i')} scored {ev.get('overall')}/10",
-                   helpfulness=float(ev.get("overall", 10)) / 10.0)
+        _unver = team.eval_unverified(ev)
+        _ovr = ev.get("overall")
+        act.finish("critic", job_id, ts, ok=(not _unver), revised=(not ok and not _unver),
+                   detail=(f"beat {beat.get('i')} UNVERIFIED — vision QA unavailable (NOT graded)"
+                           if _unver else f"beat {beat.get('i')} scored {_ovr}/10"),
+                   helpfulness=(None if _unver else float(_ovr) / 10.0))
+        # Record EVERY evaluation (pass, fail, or unverified) so there is a real scored history.
+        _record_qc(job_id, beat, ev, unverified=_unver)
+        if _unver:
+            # Vision is down — retrying cannot improve a score we cannot read, and burning paid
+            # retries here is pure waste. Ship the clip but it stays flagged UNVERIFIED (never a pass).
+            logger.warning(f"[critic] beat {beat.get('i')} UNVERIFIED (vision QA unavailable) — "
+                           f"delivering ungraded; flagged for human review")
+            return clip
         if ok:
             for p in ("prompt", "character", "shots"):
                 act.reward(p, job_id=job_id)
@@ -3730,6 +3834,13 @@ async def recipe_generate(req: RunRequest) -> list:
                 import shutil as _shf; _shf.move(_fin, out_path)
             except Exception as _fe:
                 logger.warning(f"[generate] finish pass skipped: {_fe}")
+        # FINAL-VIDEO QA — the only check that sees the assembled deliverable (duplicate speech,
+        # unfinished script, post-stitch artifacts). Recorded to creative_decisions either way.
+        _final_qa = {}
+        try:
+            _final_qa = await _final_video_qa(req.request_id, out_path, _vo_script or prompt, work)
+        except Exception as _qe:
+            logger.warning(f"[generate] final QA skipped: {_qe}")
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
@@ -3766,7 +3877,12 @@ async def recipe_generate(req: RunRequest) -> list:
                         "none": " · ⚠ no audio (silent fallback — top up Kie for narrated video)"}.get(_audio_state, "")
                        if generate_audio else "")
                     + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "")
-                    + _prov_note + ".")}]
+                    + _prov_note + "."
+                    # HONEST QA label — never ship a known-defective video looking clean.
+                    + (" ⚠ QA: " + "; ".join((_final_qa.get("issues") or [])[:2])
+                       if (_final_qa.get("issues")) else "")),
+                 "qc_issues": (_final_qa.get("issues") or []),
+                 "qc_verified": (_final_qa.get("overall") is not None)}]
     finally:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
