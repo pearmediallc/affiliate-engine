@@ -46,6 +46,12 @@ _REQUIRED_COLUMNS = [
     ("vertical_knowledge", "promoted", "BOOLEAN DEFAULT FALSE"),
     ("vertical_knowledge", "promotion_metrics", "TEXT"),
     # Creative learning loop — per-brain choices + attribution on creative_decisions
+    # The human verdict/reason the learning loop reads AND that SQLAlchemy names on every INSERT.
+    # These were missing in prod, so EVERY creative_decisions insert failed with UndefinedColumn --
+    # silently, inside a broad except -- which is why /learn/decisions returned [] for every job and
+    # the learning loop recorded nothing at all.
+    ("creative_decisions", "human_verdict", "VARCHAR"),
+    ("creative_decisions", "human_reason", "TEXT"),
     ("creative_decisions", "script_mode", "VARCHAR"),
     ("creative_decisions", "caption_method", "VARCHAR"),
     ("creative_decisions", "caption_removal_method", "VARCHAR"),
