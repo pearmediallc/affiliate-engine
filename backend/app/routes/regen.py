@@ -1158,6 +1158,50 @@ async def parse_intent(payload: dict, _auth: bool = Depends(require_service_key)
     return {"success": True, "intent": await _parse_intent_text((payload.get("command") or "").strip())}
 
 
+@router.post("/interpret-workorder")
+async def interpret_workorder(payload: dict, _auth: bool = Depends(require_service_key)):
+    """LLM work-order interpreter: read the FULL essence of a file request (description + canvas brief
+    + attachment names + vertical) and return an executable per-variation plan — so a 7-state ask
+    fans out one state PER variation instead of collapsing to the first. Robust to mixed briefs the
+    regex can't parse ('S2-S3-S4 for CO,GA,MN with garage-man variation'). Returns {} on LLM failure
+    so the caller falls back to the regex parser (never breaks intake)."""
+    text = (payload.get("text") or "").strip()
+    vertical = (payload.get("vertical") or "").strip()
+    attachments = payload.get("attachments") or []       # list of filenames / labels (optional)
+    if not text and not attachments:
+        return {"success": True, "plan": {}}
+    ask = (
+        "You interpret an internal ad-creative WORK ORDER into an executable plan. Read the brief + any "
+        "attachment names and output STRICT JSON only.\n\n"
+        f"VERTICAL: {vertical or 'unknown'}\n"
+        f"ATTACHMENTS: {json.dumps(attachments)[:600]}\n"
+        f"WORK ORDER: \"\"\"{text[:2000]}\"\"\"\n\n"
+        "Extract:\n"
+        "- video_type: UGC | B-Roll | MAP | Avatar | Image (best fit)\n"
+        "- script_ref: the script code if named (e.g. 'S3'), else null\n"
+        "- character: {gender: male|female|null, age: under35|35-44|45-55|55plus|null, new: true if the "
+        "brief says NEW/fresh avatar}\n"
+        "- axis: what the variations differ by — state | script | character | hook | format\n"
+        "- variations: an ARRAY, ONE object per creative the brief asks for. If it lists N states "
+        "(e.g. CA, IL, NJ...), make ONE variation PER state in that exact order. Each: "
+        "{state: <2-letter or null>, script_ref: <code or null>, note: <short>}\n"
+        "- count: variations.length\n\n"
+        'Return ONLY: {"video_type":"...","script_ref":"...","character":{...},"axis":"...",'
+        '"count":N,"variations":[{"state":"CA","script_ref":"S3","note":"..."}, ...]}'
+    )
+    try:
+        out = await _gemini_json(ask)
+        plan = out if isinstance(out, dict) else {}
+        vs = plan.get("variations")
+        if not isinstance(vs, list) or not vs:
+            return {"success": True, "plan": {}}
+        plan["count"] = len(vs)
+        return {"success": True, "plan": plan}
+    except Exception as e:
+        logger.warning(f"interpret_workorder failed: {e}")
+        return {"success": True, "plan": {}}
+
+
 @router.post("/learn/roi")
 async def learn_roi(payload: dict, _auth: bool = Depends(require_service_key)):
     """Close the loop: stitch platform ROI onto the decisions for a delivered creative.
