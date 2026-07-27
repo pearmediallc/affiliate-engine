@@ -9,6 +9,7 @@ Provider routing:
 Replicate is no longer the primary path. HIGGSFIELD_API_KEY or KIE_API_KEY required.
 """
 import os
+import json
 import uuid
 import time
 import logging
@@ -270,28 +271,57 @@ def _fal_submit_ep(video_url: str, audio_url: str, ep_key: str = "kling") -> str
                       json={"video_url": video_url, "audio_url": audio_url}, timeout=30)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"fal {ep_key} {r.status_code}: {r.text[:200]}")
-    rid = (r.json() or {}).get("request_id")
+    try:
+        sub = r.json() or {}
+    except Exception:
+        raise RuntimeError(f"fal {ep_key} non-JSON response: {r.text[:200]}")
+    rid = sub.get("request_id")
     if not rid:
         raise RuntimeError(f"fal {ep_key} no request_id: {r.text[:160]}")
+    # CRITICAL: multi-segment slugs (fal-ai/kling-video/lipsync/audio-to-video) CANNOT have their
+    # status URL rebuilt from the base path — fal collapses them to the app prefix and the rebuilt
+    # URL 404s/HTMLs, surfacing as "Expecting value: line 1 column 1". Carry fal's OWN status_url /
+    # response_url through the job id so polling always hits the right queue. (Same bug already
+    # fixed once in fal_video.py — do not rebuild fal queue URLs by hand.)
+    su, ru = sub.get("status_url"), sub.get("response_url")
     logger.info(f"lipsync submitted via fal:{ep_key} (~${FAL_LIPSYNC_PER_MIN.get(ep_key, 0):.2f}/min)")
+    if su and ru:
+        return json.dumps({"id": rid, "status_url": su, "response_url": ru})
     return rid
 
 
 def _fal_status_ep(rid: str, ep_key: str = "kling"):
     key = settings.fal_key
-    slug = FAL_LIPSYNC_ENDPOINTS.get(ep_key) or FAL_LIPSYNC_ENDPOINTS["kling"]
-    base = f"https://queue.fal.run/{slug}"
     h = {"Authorization": f"Key {key}"}
-    s = requests.get(f"{base}/requests/{rid}/status", headers=h, timeout=30).json()
+    # Prefer fal's OWN urls (carried from submit) — never rebuild them for multi-segment slugs.
+    status_url = response_url = None
+    if isinstance(rid, str) and rid.startswith("{"):
+        try:
+            _j = json.loads(rid)
+            rid, status_url, response_url = _j.get("id"), _j.get("status_url"), _j.get("response_url")
+        except Exception:
+            pass
+    if not status_url:
+        slug = FAL_LIPSYNC_ENDPOINTS.get(ep_key) or FAL_LIPSYNC_ENDPOINTS["kling"]
+        base = f"https://queue.fal.run/{slug}"
+        status_url, response_url = f"{base}/requests/{rid}/status", f"{base}/requests/{rid}"
+    _r = requests.get(status_url, headers=h, timeout=30)
+    try:
+        s = _r.json()
+    except Exception:
+        raise RuntimeError(f"fal {ep_key} status non-JSON ({_r.status_code}): {_r.text[:160]}")
     st = (s.get("status") or "").upper()
     if st == "COMPLETED":
-        res = requests.get(f"{base}/requests/{rid}", headers=h, timeout=30).json()
-        out = (res.get("video") or {}).get("url")
+        res = requests.get(response_url, headers=h, timeout=30).json()
+        # endpoints differ: veed → {"video":{"url"}}, kling/sync → sometimes {"video_url"} / {"output"}
+        out = ((res.get("video") or {}).get("url") if isinstance(res.get("video"), dict) else None) \
+              or res.get("video_url") or res.get("url") \
+              or ((res.get("output") or {}).get("url") if isinstance(res.get("output"), dict) else None)
         if not out:
-            raise RuntimeError(f"fal completed without video url: {res}")
+            raise RuntimeError(f"fal {ep_key} completed without video url: {str(res)[:200]}")
         return ("done", out)
     if st in ("FAILED", "ERROR"):
-        raise RuntimeError(f"fal {st}: {s}")
+        raise RuntimeError(f"fal {ep_key} {st}: {str(s)[:200]}")
     return ("processing", None)
 
 
