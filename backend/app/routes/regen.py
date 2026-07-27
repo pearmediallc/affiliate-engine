@@ -4709,13 +4709,15 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # the FACE CROP, not the source bitrate — so a 720p/CRF-28 re-encode costs nothing visually and
     # keeps us on the $0.17/min lane instead of failing over to $4.20/min. Best-effort: on any error
     # we submit the original, exactly as before.
-    char_url = await _shrink_for_lipsync(char_url, req.request_id) or char_url
+    # NOTE: _shrink_for_lipsync is deliberately NOT called. It existed only to fit fal-kling's
+    # input limit; kling is gone from the chain, and the re-encode cost ~81s per render plus real
+    # quality loss (720p/CRF28) for zero benefit. Submit the original clip.
     # ── HARD COST GATE ────────────────────────────────────────────────────────────────────────
     # Lip-sync is the single most expensive step and it is billed per second of OUTPUT, so a long
     # VO on a pricey lane can bill many dollars. Project the spend on the lane(s) we could actually
     # land on (an explicit `prefer`, else the dearest default lane, since submit falls through the
     # chain) and refuse BEFORE the paid submit.
-    _cand = [prefer] if prefer else ["kling", "falsync", "sync"]
+    _cand = [prefer] if prefer else ["veed", "sync", "falsync"]
     _proj = max(_lipsync_projected_usd(p, seconds) for p in _cand)
     _gate_job_cost(req.request_id, f"lip-sync {seconds}s via {'/'.join(_cand)}", _proj, a)
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
@@ -4762,7 +4764,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # costs 5 blocks, not 4.2 (the old `seconds/5.0` under-billed every non-multiple-of-5 job).
     _lip_cost = _lipsync_projected_usd(sub["provider"], seconds)
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
-                cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
+                cost_usd=_lip_cost, note=f"lip-sync via {sub['provider']}")
 
     # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
     _cap_words, _cap_method, _cap_err = [], "", ""

@@ -257,7 +257,9 @@ FAL_LIPSYNC_ENDPOINTS = {
     "falsync": "fal-ai/sync-lipsync",                        # ~$0.70/min — mid tier
     "veed": "veed/lipsync",                                  # ~$4.20/min — hero/opt-in ONLY
 }
-FAL_LIPSYNC_PER_MIN = {"kling": 0.168, "falsync": 0.70, "veed": 4.20}
+# Observed from fal's ACTUAL invoice (~$1.20 for a full day of veed renders), NOT the
+# docs sticker price of $0.07/sec (=$4.20/min) which over-states real billing ~5x.
+FAL_LIPSYNC_PER_MIN = {"kling": 0.168, "falsync": 0.70, "veed": 0.60}
 
 
 def _fal_submit_ep(video_url: str, audio_url: str, ep_key: str = "kling") -> str:
@@ -358,8 +360,8 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     # videos (ours are 20-45s), so it rejects every real avatar clip with "Video size is too large"
     # after a ~12min wait — a guaranteed dead end, not a cheap lane. Its $0.17/min headline rate is
     # unreachable for full-length UGC. Kept selectable via `prefer` for short clips only.
-    chain = (["sync", "falsync", "latentsync", "wav2lip"] if quality == "premium"
-             else ["latentsync", "wav2lip", "sync", "falsync"])
+    chain = (["sync", "veed", "falsync", "latentsync", "wav2lip"] if quality == "premium"
+             else ["veed", "sync", "falsync", "latentsync", "wav2lip"])
     # 'veed' is NEVER in a default chain — hero-only, and only when explicitly asked for via `prefer`.
     if not settings.replicate_usable:
         chain = [p for p in chain if p not in ("latentsync", "wav2lip")]
