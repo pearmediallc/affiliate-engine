@@ -15,6 +15,7 @@ Recipes are ordered chains over the engine's EXISTING separate features
 import os
 import re
 import json
+import math
 import base64
 import time
 import logging
@@ -38,6 +39,45 @@ router = APIRouter()
 
 GEMINI_MODEL = "gemini-2.5-flash"
 CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
+
+# HARD COST CEILING for a single job's paid render. Projected (never actual-after-the-fact) spend is
+# computed BEFORE any paid submit; over the ceiling we refuse instead of burning credits.
+MAX_JOB_USD = float(os.getenv("MAX_JOB_USD", "1.50"))
+
+
+def _lipsync_projected_usd(provider: str, seconds: float) -> float:
+    """Projected lip-sync spend for `seconds` of output on `provider`, at the verified 2026 rates."""
+    s = max(0.0, float(seconds or 0))
+    return {
+        "kling": round(math.ceil(s / 5.0) * 0.014, 4),   # billed in whole 5s blocks
+        "falsync": round(s / 60.0 * 0.70, 4),
+        "sync": round(s / 60.0 * 0.70, 4),
+        "veed": round(s * 0.07, 4),
+        "fal": round(s * 0.07, 4),                        # legacy rows = veed
+        "latentsync": 0.088, "wav2lip": 0.03,
+    }.get(provider, round(s * 0.07, 4))                   # unknown endpoint → price at the dearest lane
+
+
+# Kie Seedance OFFICIAL per-second rates by resolution → (with-input, text-only). ONE source of truth
+# for both the pre-flight cost gate and the post-render cost record.
+_KIE_RATE_PER_SEC = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205),
+                     "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
+
+
+def _t2v_projected_usd(resolution: str, with_input: bool, seconds: float) -> float:
+    """Projected Kie-Seedance spend for `seconds` of text-to-video at `resolution`."""
+    _rr = _KIE_RATE_PER_SEC.get(str(resolution).lower(), _KIE_RATE_PER_SEC["720p"])
+    return round((_rr[0] if with_input else _rr[1]) * max(0.0, float(seconds or 0)), 4)
+
+
+def _gate_job_cost(request_id: str, what: str, projected_usd: float) -> None:
+    """Log the projection and REFUSE the job if it would exceed MAX_JOB_USD. Always logs."""
+    logger.info(f"[cost-gate] {request_id} {what}: projected ${projected_usd:.4f} "
+                f"(ceiling ${MAX_JOB_USD:.2f})")
+    if projected_usd > MAX_JOB_USD:
+        raise RuntimeError(
+            f"cost gate: {what} would cost ~${projected_usd:.2f}, over the ${MAX_JOB_USD:.2f} "
+            f"per-job ceiling (raise MAX_JOB_USD to allow it)")
 
 # The current regen request_id, so low-level Gemini helpers can attribute their token spend to the
 # right job WITHOUT threading request_id through every call site. Set at each recipe's entry.
@@ -2825,6 +2865,14 @@ async def _final_video_qa(request_id: str, out_path: str, script: str, work: str
                 if not _dl.SequenceMatcher(None, _tail, spoken.lower()[-160:]).ratio() > 0.35 \
                         and _tail.split()[-1] not in spoken.lower():
                     issues.append("INCOMPLETE — the end of the script (CTA) was never spoken")
+            # SCRIPT FIDELITY: does the video speak the script it was GIVEN at all? Completeness only
+            # checks the tail, so a video that speaks a totally different script still passed.
+            if _s:
+                import difflib as _dl2
+                _ratio = _dl2.SequenceMatcher(None, _s, _toks).ratio()
+                if _ratio < 0.55:
+                    issues.append("SCRIPT MISMATCH - the video does not speak the script it was "
+                                  f"given (similarity {_ratio:.0%})")
     except Exception as e:
         logger.warning(f"[final-qa] transcript check skipped: {e}")
     # VISION on the final frames (catches post-stitch artifacts: blown-out eyes, morphing, warping)
@@ -3564,6 +3612,29 @@ async def recipe_generate(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"generate: team pass skipped ({e})")
 
+        # A spoken AD is "talking" even when the script never literally contains the word "speak" — the
+        # old keyword-only gate missed real scripts ("my home insurance bill just came in…") → they fell
+        # to the seconds-default (15s) and got crammed. Treat it as talking when: a reference video, OR a
+        # spokesperson keyword, OR the office wrote a real script, OR the spoken text is prose (>=20 words).
+        # Computed HERE (before the reroute) because the avatar-lipsync preference below depends on it.
+        _spoken = (_vo_script or "").strip()
+        is_talk = (bool(video_urls)
+                   or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc|voiceover|narrat)\b", prompt, re.I))
+                   or len(_spoken.split()) >= 20)
+
+        # TALKING-HEAD UGC PREFERS AVATAR-LIPSYNC. The plan's route=avatar_lipsync is the only signal
+        # today, and the brain often routes a plainly-talking-head UGC ask to seedance — which then
+        # renders a synthetic person whose lips don't match, at t2v prices. Widen the preference to any
+        # talking-head ask that ALSO has a castable avatar and NO reference video to imitate. Scenic /
+        # b-roll (is_talk False) and winner-reference jobs (video_urls) are untouched → still t2v, and
+        # the existing castable-avatar guard below still decides the final fall-through.
+        if not _avatar_plan and is_talk and not video_urls:
+            _cl0 = req.assets if isinstance(req.assets, dict) else {}
+            if _cl0.get("fallback_avatar_url") or _cl0.get("library_avatar_url"):
+                _avatar_plan = True
+                logger.info("[generate] talking-head UGC + castable avatar + no reference video → "
+                            "preferring funded avatar-lipsync over text-to-video")
+
         # FIX C (Finance) + FIX B (preflight): before ANY paid attempt, the Finance seat records the
         # provider/credit decision. Talking-head plan → avatar-lipsync (funded, cheaper); if every t2v
         # provider is known-down (cached) this also spares the doomed Kie attempt. Scenic/non-avatar
@@ -3720,10 +3791,7 @@ async def recipe_generate(req: RunRequest) -> list:
         # old keyword-only gate missed real scripts ("my home insurance bill just came in…") → they fell
         # to the seconds-default (15s) and got crammed. Treat it as talking when: a reference video, OR a
         # spokesperson keyword, OR the office wrote a real script, OR the spoken text is prose (>=20 words).
-        _spoken = (_vo_script or "").strip()
-        is_talk = (bool(video_urls)
-                   or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc|voiceover|narrat)\b", prompt, re.I))
-                   or len(_spoken.split()) >= 20)
+        # (is_talk is computed BEFORE the avatar reroute above — it also drives that decision.)
         # SPLIT the spoken script into ONE chunk per clip so each clip speaks its OWN part in sequence
         # (kills the "same opening rendered twice" bug — _attempt uses bt.prompt, so the chunk MUST go
         # into the per-clip prompt). Let the script's natural beats drive clip count + pacing instead of
@@ -3738,16 +3806,23 @@ async def recipe_generate(req: RunRequest) -> list:
             # room), clamped to the model's ~15s/clip cap. 8-clip safety ceiling against a runaway split.
             n_clips = max(1, min(len(_vo_chunks), 8))
             def _clip_secs(_txt):
+                # 2.2 words/sec is a realistic conversational UGC pace INCLUDING pauses. The old 2.5
+                # was a read-aloud pace, so every clip was sized short and the delivery came back
+                # rushed / the tail clipped.
                 _w = len((_txt or "").split())
-                return max(6, min(15, _math.ceil(_w / 2.5) + 1))
+                return max(6, min(15, _math.ceil(_w / 2.2) + 1))
             _per_list = [_clip_secs(c) for c in _vo_chunks[:n_clips]]
             # DURATION PRIORITY: Auto (no explicit length) → the whole script renders. An EXPLICIT length
             # is a CAP — keep only as many leading chunks as fit the budget (never cram the full script
             # into a short window; drop the tail instead, which reads far better than rushed speech).
             if not _auto_dur and seconds > 0:
+                # An explicit length is a TARGET, not a hard truncation point. Dropping a chunk the
+                # moment we crossed `seconds` under-delivered the ad (the CTA fell off a 20s request
+                # by 2s). Allow up to 25% overrun so the script finishes; only drop beyond that.
+                _budget = seconds * 1.25
                 _acc, _keep = 0, 0
                 for _s in _per_list:
-                    if _acc + _s > seconds and _keep >= 1:
+                    if _acc + _s > _budget and _keep >= 1:
                         break
                     _acc += _s; _keep += 1
                 n_clips = _keep
@@ -3756,10 +3831,20 @@ async def recipe_generate(req: RunRequest) -> list:
                 # the FULL script made the aligner diff ~200 unmatched tokens into a single word's
                 # <0.4s window — the back half of the script flashed as nonsense.
                 _vo_script = " ".join(_vo_chunks[:_keep])
-                logger.info(f"[generate] explicit {seconds}s cap → {n_clips} clip(s) (~{sum(_per_list)}s) of "
-                            f"{len(_vo_chunks)} script chunk(s)")
+                logger.info(f"[generate] explicit {seconds}s target (+25% = {_budget:.0f}s) → {n_clips} "
+                            f"clip(s) (~{sum(_per_list)}s) of {len(_vo_chunks)} script chunk(s)")
             else:
                 logger.info(f"[generate] AUTO duration → full script: {n_clips} clip(s), ~{sum(_per_list)}s")
+            logger.info(f"[generate] duration: requested "
+                        f"{'auto' if _auto_dur else str(seconds) + 's'} → planned {sum(_per_list)}s "
+                        f"across {n_clips} clip(s)")
+        # ── HARD COST GATE ────────────────────────────────────────────────────────────────────
+        # t2v bills per rendered second and we may render up to 8 clips, so a long script at a high
+        # resolution can run into many dollars. Project the whole stitch BEFORE the first paid clip.
+        _planned_sec = sum(_per_list) if _per_list else n_clips * per
+        _gate_job_cost(req.request_id,
+                       f"text-to-video {n_clips} clip(s) / {_planned_sec}s @ {resolution}",
+                       _t2v_projected_usd(resolution, bool(video_urls or image_urls), _planned_sec))
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         try:
@@ -3912,8 +3997,7 @@ async def recipe_generate(req: RunRequest) -> list:
                        else Pricing.VEO31_STANDARD_PER_SEC)
         else:
             # Kie Seedance — OFFICIAL per-second rates by resolution; with-input is cheaper.
-            _KIE_RATE = {"480p": (0.0575, 0.095), "720p": (0.125, 0.205), "1080p": (0.31, 0.51), "4k": (0.64, 1.04)}
-            _rr = _KIE_RATE.get(str(resolution).lower(), _KIE_RATE["720p"])
+            _rr = _KIE_RATE_PER_SEC.get(str(resolution).lower(), _KIE_RATE_PER_SEC["720p"])
             _persec = _rr[0] if _with_input else _rr[1]
         _vid_sec = sum(_per_list[:len(clip_paths)]) if _per_list else len(clip_paths) * per
         _track_cost(req.request_id, "video", _prov, model=f"seedance-{resolution}",
@@ -4609,6 +4693,14 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # keeps us on the $0.17/min lane instead of failing over to $4.20/min. Best-effort: on any error
     # we submit the original, exactly as before.
     char_url = await _shrink_for_lipsync(char_url, req.request_id) or char_url
+    # ── HARD COST GATE ────────────────────────────────────────────────────────────────────────
+    # Lip-sync is the single most expensive step and it is billed per second of OUTPUT, so a long
+    # VO on a pricey lane can bill many dollars. Project the spend on the lane(s) we could actually
+    # land on (an explicit `prefer`, else the dearest default lane, since submit falls through the
+    # chain) and refuse BEFORE the paid submit.
+    _cand = [prefer] if prefer else ["kling", "falsync", "sync"]
+    _proj = max(_lipsync_projected_usd(p, seconds) for p in _cand)
+    _gate_job_cost(req.request_id, f"lip-sync {seconds}s via {'/'.join(_cand)}", _proj)
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
     _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
     result = None
@@ -4638,19 +4730,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception as _pe2:
             _set_lipsync_status(req.request_id, "failed")
             raise RuntimeError(f"lip-sync failed on {_alt} after {sub.get('provider')} failed: {_pe2}") from _pe2
-    if not result:
-        raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
+    # EITHER poll loop can exhaust its 150 polls without ever seeing "done" and fall through here with
+    # result=None. Previously that raised WITHOUT marking the job failed, so the row stayed
+    # 'processing' forever — a zombie the UI waits on for good. Always fail it explicitly.
+    if result is None:
+        _set_lipsync_status(req.request_id, "failed", f"lip-sync timed out on {sub['provider']}")
+        raise RuntimeError("lip-sync timed out")
     act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
     # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
     # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
     # are per-prediction. sync.so uses a free credit → $0.
     # Per-ENDPOINT rates — fal hosts several lip-sync models spanning 25x in price for the same job.
-    _lip_cost = {"kling": round(seconds / 5.0 * 0.014, 4),   # billed in 5s blocks ≈ $0.17/min
-                 "falsync": round(seconds / 60.0 * 0.70, 4),  # ≈ $0.70/min
-                 "veed": round(seconds * 0.07, 4),            # ≈ $4.20/min — hero only
-                 "fal": round(seconds * 0.07, 4),             # legacy rows = veed
-                 "latentsync": 0.088, "wav2lip": 0.03,
-                 "sync": round(seconds / 60.0 * 0.70, 4)}.get(sub["provider"], 0.0)
+    # Same rate table as the pre-submit cost gate — kling bills in WHOLE 5s blocks, so a 21s render
+    # costs 5 blocks, not 4.2 (the old `seconds/5.0` under-billed every non-multiple-of-5 job).
+    _lip_cost = _lipsync_projected_usd(sub["provider"], seconds)
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=("1 free sync.so credit" if sub["provider"] == "sync" else ""))
 
@@ -4713,6 +4806,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"VEED captions failed, keeping base video: {e}")
     _set_lipsync_status(req.request_id, "done")
+
+    # ── FINAL-VIDEO QA (transcript fidelity + vision) — PERSISTED via _record_qc ─────────────────
+    # This lane never ran _final_video_qa, so nothing was ever written to creative_decisions for an
+    # avatar job and /learn/decisions came back []. Run the same holistic check the t2v lane runs on
+    # the delivered file. Best-effort: it must never break or block delivery.
+    try:
+        _fqwork = tempfile.mkdtemp()
+        try:
+            await _final_video_qa(req.request_id, os.path.join(UPLOAD_DIR, name), script, _fqwork)
+        finally:
+            import shutil as _sh3
+            _sh3.rmtree(_fqwork, ignore_errors=True)
+    except Exception as _fqe:
+        logger.warning(f"[avatar-lipsync] final-video QA skipped: {_fqe}")
 
     # ── POST-RENDER VISUAL QA (grade + coach, NO retry) ──────────────────────────────────────────
     # The avatar-lipsync path produced its clip but nothing ever critiqued the OUTPUT — so no persona
