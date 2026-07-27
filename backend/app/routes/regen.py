@@ -3898,7 +3898,17 @@ async def recipe_generate(req: RunRequest) -> list:
         if video_urls: refs.append(f"{len(video_urls)} video(s)")
         if audio_urls: refs.append(f"{len(audio_urls)} audio")
         _prov_note = "" if _prov == "kie-seedance" else f" · via {_prov} (fallback — Kie unavailable)"
-        return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": 0.75,
+        # QA verdicts must CHANGE something, not just be recorded. A confirmed final-video defect
+        # (duplicate speech / unspoken CTA / artifacts) drops the delivered confidence so a broken
+        # take ranks BELOW clean output everywhere confidence is used, instead of shipping as an
+        # equal peer. UNVERIFIED (QA could not run) sits between the two — never treated as clean.
+        _qa_issues = _final_qa.get("issues") or []
+        _confidence = 0.75
+        if _qa_issues:
+            _confidence = 0.25
+        elif _final_qa.get("overall") is None:
+            _confidence = 0.55
+        return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": _confidence,
                  "whats_changed": (f"Seedance 2.0 · {len(clip_paths)} clip(s) · ~{_vid_sec}s · {aspect_ratio} · {resolution}"
                     + (" · captions" if _caps_burned else "")
                     + f"{' · refs: ' + ', '.join(refs) if refs else ''}"
