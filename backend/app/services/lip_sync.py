@@ -354,8 +354,12 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     # Replicate unfunded EVERY bulk render silently took the single most expensive lane on the
     # market — one 89s ad billed $6.23. Same task on fal-kling costs ~$0.25.
     #   kling ~$0.17/min · latentsync ~$0.09/render · wav2lip ~$0.03 · falsync ~$0.70 · sync.so ~$0.70 · veed ~$4.20
-    chain = (["sync", "falsync", "kling", "latentsync", "wav2lip"] if quality == "premium"
-             else ["kling", "latentsync", "wav2lip", "falsync", "sync"])
+    # NOTE: fal-kling is NOT in any chain. Per fal's docs it accepts only 2-10 SECOND source
+    # videos (ours are 20-45s), so it rejects every real avatar clip with "Video size is too large"
+    # after a ~12min wait — a guaranteed dead end, not a cheap lane. Its $0.17/min headline rate is
+    # unreachable for full-length UGC. Kept selectable via `prefer` for short clips only.
+    chain = (["sync", "falsync", "latentsync", "wav2lip"] if quality == "premium"
+             else ["latentsync", "wav2lip", "sync", "falsync"])
     # 'veed' is NEVER in a default chain — hero-only, and only when explicitly asked for via `prefer`.
     if not settings.replicate_usable:
         chain = [p for p in chain if p not in ("latentsync", "wav2lip")]

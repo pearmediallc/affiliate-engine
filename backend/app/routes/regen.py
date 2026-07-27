@@ -2817,7 +2817,10 @@ def _record_qc(request_id: str, beat: dict, ev: dict, unverified: bool = False,
         finally:
             db.close()
     except Exception as e:
-        logger.warning(f"[critic] could not persist QC verdict: {e}")
+        # LOUD on purpose: this silently returned decisions:[] for every job, so the learning loop
+        # recorded nothing and nobody knew. Log the type + message so the next run names the cause.
+        logger.error(f"[critic] FAILED to persist QC verdict for {request_id}: "
+                     f"{type(e).__name__}: {e}", exc_info=True)
 
 
 async def _shrink_for_lipsync(char_url: str, request_id: str, max_mb: float = 18.0) -> Optional[str]:
