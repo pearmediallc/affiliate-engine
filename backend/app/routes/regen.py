@@ -2767,6 +2767,33 @@ def _record_qc(request_id: str, beat: dict, ev: dict, unverified: bool = False,
         logger.warning(f"[critic] could not persist QC verdict: {e}")
 
 
+async def _shrink_for_lipsync(char_url: str, request_id: str, max_mb: float = 18.0) -> Optional[str]:
+    """Re-encode an avatar clip small enough for the cheap lip-sync endpoints' input limits.
+    Returns a new public URL, or None to keep the original (never raises — this must not break a job)."""
+    from ..services.storage import StorageService
+    try:
+        src = await _download_to_temp(char_url, ".mp4")
+        if not src or not os.path.exists(src):
+            return None
+        if os.path.getsize(src) <= max_mb * 1024 * 1024:
+            return None                                   # already small enough — don't re-encode
+        small = os.path.join(UPLOAD_DIR, f"ls_{request_id[:8]}.mp4")
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", src, "-vf", "scale='min(720,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "28", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-y", small], 300)
+        if not os.path.exists(small):
+            return None
+        up = StorageService.upload_file(small, f"lipsrc/{os.path.basename(small)}")
+        url = (StorageService.presign_url(up) or up) if up else None
+        if url:
+            logger.info(f"[avatar-lipsync] source shrunk "
+                        f"{os.path.getsize(src)/1e6:.1f}MB → {os.path.getsize(small)/1e6:.1f}MB for the cheap lane")
+        return url
+    except Exception as e:
+        logger.warning(f"[avatar-lipsync] source shrink skipped ({e}) — submitting the original")
+        return None
+
+
 async def _final_video_qa(request_id: str, out_path: str, script: str, work: str) -> dict:
     """HOLISTIC QA on the FINAL assembled video — the only stage that sees what the user receives.
 
@@ -4576,6 +4603,12 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     prefer = a.get("lipsync_provider")   # optional override: sync | fal | latentsync | wav2lip
     quality = a.get("quality") or _ENGINE["default_quality"]   # bulk (cheapest) | premium
     name, out_path, out_url = _out_url(req, "avatar_lipsync")
+    # SHRINK THE SOURCE before lip-sync. The cheap endpoints have input-size limits (fal-kling
+    # rejected a library clip outright: "Video size is too large"), and lip-sync quality is driven by
+    # the FACE CROP, not the source bitrate — so a 720p/CRF-28 re-encode costs nothing visually and
+    # keeps us on the $0.17/min lane instead of failing over to $4.20/min. Best-effort: on any error
+    # we submit the original, exactly as before.
+    char_url = await _shrink_for_lipsync(char_url, req.request_id) or char_url
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
     _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
     result = None
@@ -4585,9 +4618,26 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             stt, res = await asyncio.to_thread(lambda: lip_sync.poll_relipsync(sub["provider"], sub["job"]))
             if stt == "done":
                 result = res; break
-    except Exception:
-        _set_lipsync_status(req.request_id, "failed")
-        raise
+    except Exception as _pe:
+        # POLL-TIME FALLBACK. The provider chain only ran at SUBMIT, so a provider that ACCEPTED the
+        # job and then failed mid-render (fal-kling: "Video size is too large") killed the whole
+        # generation instead of trying the next lane. Retry once on the next provider — the user
+        # gets a video, and we only step UP in price when the cheap lane genuinely can't do it.
+        logger.warning(f"[avatar-lipsync] {sub['provider']} failed mid-render ({_pe}) — retrying on the next lane")
+        _alt = "sync" if sub["provider"] != "sync" else "falsync"
+        try:
+            sub = await asyncio.to_thread(
+                lambda: lip_sync.submit_relipsync(char_url, audio_url, _alt, quality=quality))
+            _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url,
+                             req.callback_url, name, script)
+            for _ in range(150):
+                await asyncio.sleep(4)
+                stt, res = await asyncio.to_thread(lambda: lip_sync.poll_relipsync(sub["provider"], sub["job"]))
+                if stt == "done":
+                    result = res; break
+        except Exception as _pe2:
+            _set_lipsync_status(req.request_id, "failed")
+            raise RuntimeError(f"lip-sync failed on {_alt} after {sub.get('provider')} failed: {_pe2}") from _pe2
     if not result:
         raise RuntimeError(f"lip-sync via {sub['provider']} timed out")
     act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
