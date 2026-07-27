@@ -49,6 +49,23 @@ EVAL_PASS_THRESHOLD = float(os.getenv("EVAL_PASS_THRESHOLD", "7"))   # 0-10; bel
 MAX_BEAT_RETRIES = int(os.getenv("EVAL_MAX_RETRIES", "1"))           # extra attempts per beat
 
 
+PLACEHOLDER_RE = _re_ph = __import__("re").compile(r"\[[^\]\n]{2,60}\]")
+
+
+def scrub_placeholders(text: str) -> str:
+    """Deterministic backstop: a SPOKEN script must never contain a bracket placeholder.
+    An LLM instruction alone is not a guarantee — if "[Website/App Name]" survives, the avatar
+    literally says it. Any leftover bracket becomes a natural generic CTA phrase instead."""
+    if not text:
+        return text
+    out = PLACEHOLDER_RE.sub("the link below", text)
+    # "Go to the link below right now" reads fine; collapse the artefacts that produces.
+    out = out.replace("Go to the link below", "Click the link below")
+    out = out.replace("go to the link below", "click the link below")
+    out = out.replace("visit the link below", "click the link below")
+    return out
+
+
 def _coach_pre(persona: str) -> str:
     """Injected 'one-on-one' preamble: the corrections this persona earned on past reviews, so it
     stops repeating the mistake (the self-improvement half of the loop)."""
@@ -349,6 +366,11 @@ async def script_writer(*, offer_desc: str, vertical: str, strategy: dict,
     winning hook. Returns plain script text (spoken lines only, no stage directions)."""
     from . import vertical_dna
     _dna = vertical_dna.style_guide(vertical)
+    # A script is SPOKEN aloud — a bracket placeholder is a defect, never a template slot.
+    _dna = (_dna or "") + (
+        "\nNEVER write bracketed placeholders ([Website], [Brand], [Company], [State], [XX]). "
+        "If no brand/site was supplied, use a natural generic CTA ('tap the link below', "
+        "'click the link on this page'); if one WAS supplied, say it verbatim and naturally.")
     prompt = f"""{_coach_pre('scriptwriter')}You are the Script Writer on a direct-response creative team. Write a tight,
 natural spoken script (first-person, conversational, no stage directions, no on-screen text
 markers) for a short vertical ad.

@@ -1876,10 +1876,21 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     _brief_checklist = script_brief.checklist_text()   # the factors a superb script needs (format, audience, setting, angle, offer, geo, tone, length)
     _dna_block = (f"STYLE DNA for this vertical — any write_script / write_ad_copy MUST follow it "
                   f"(match the tone/need/structure; use real specifics; never generic):\n{_dna}\n\n") if _dna else ""
+    # NEVER emit bracket placeholders. A script is SPOKEN by a person on camera — "[Website/App Name]"
+    # gets read aloud or has to be hand-edited, and if it survives to generation the avatar literally
+    # says "bracket website app name". If the user has not given a brand/site, write a natural generic
+    # CTA instead ("tap the link below", "click the link on this page", "check your rate at the link").
+    _no_placeholder = (
+        "NEVER write bracketed placeholders of ANY kind — no [Website], [Brand], [Website/App Name], "
+        "[Company], [XX], [State]. The script is spoken aloud by a real person, so a placeholder is a "
+        "defect, not a template. If the user did NOT give a website/brand name, do NOT invent one and "
+        "do NOT leave a blank: write a natural generic call-to-action instead — e.g. 'tap the link "
+        "below', 'click the link on this page', 'check your rate using the link below'. If the user "
+        "DID give a site/brand, say it verbatim, naturally, and no more than twice.\n\n")
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
         "then output ONE strict-JSON action. Prefer acting over asking — only ask when genuinely ambiguous.\n\n"
-        + _dna_block +
+        + _no_placeholder + _dna_block +
         f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
         f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
@@ -3600,6 +3611,10 @@ async def recipe_generate(req: RunRequest) -> list:
             # t2v lane, so the writer's rewrite drove only the visuals while the character spoke the
             # unhooked raw text. Use plan["script"] when the office produced one.
             _pscript = (plan.get("script") or "").strip()
+            try:
+                _pscript = team.scrub_placeholders(_pscript)   # never speak "[Website/App Name]"
+            except Exception:
+                pass
             if _pscript:
                 _vo_script = _pscript
             # FIX A: drive avatar-lipsync off the PLAN'S ROUTE regardless of the explicit engine. CL
@@ -4422,6 +4437,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     offer_value = (a.get("offer_value") or "").strip()
     vertical = a.get("vertical") or req.context.get("vertical") or ""
     base = (a.get("script") or "").strip()
+    try:   # a SPOKEN script must never contain "[Website/App Name]" — scrub before TTS/lip-sync
+        from ..services.creative_team import scrub_placeholders as _scrub
+        base = _scrub(base)
+    except Exception:
+        pass
     brief = (a.get("brief") or req.expectation or "").strip()
 
     # ── DIVERSIFICATION AXIS (shared contract with the creative-library caller) ────────────────
