@@ -42,7 +42,8 @@ CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
 
 # HARD COST CEILING for a single job's paid render. Projected (never actual-after-the-fact) spend is
 # computed BEFORE any paid submit; over the ceiling we refuse instead of burning credits.
-MAX_JOB_USD = float(os.getenv("MAX_JOB_USD", "1.50"))
+# Above this projected spend we ASK the user before spending (never a silent refusal).
+CONFIRM_JOB_USD = float(os.getenv("CONFIRM_JOB_USD", "5.00"))
 
 
 def _lipsync_projected_usd(provider: str, seconds: float) -> float:
@@ -70,14 +71,26 @@ def _t2v_projected_usd(resolution: str, with_input: bool, seconds: float) -> flo
     return round((_rr[0] if with_input else _rr[1]) * max(0.0, float(seconds or 0)), 4)
 
 
-def _gate_job_cost(request_id: str, what: str, projected_usd: float) -> None:
-    """Log the projection and REFUSE the job if it would exceed MAX_JOB_USD. Always logs."""
-    logger.info(f"[cost-gate] {request_id} {what}: projected ${projected_usd:.4f} "
-                f"(ceiling ${MAX_JOB_USD:.2f})")
-    if projected_usd > MAX_JOB_USD:
+def _gate_job_cost(request_id: str, what: str, projected_usd: float, assets: dict = None) -> None:
+    """ALWAYS report the projected spend (log + Team Room finance feed) BEFORE any money is spent.
+    Above CONFIRM_JOB_USD, stop and ask the user instead of silently spending: the job fails fast
+    with a structured COST_CONFIRM_REQUIRED error that the UI turns into a
+    'this will cost ~$X — proceed?' prompt. Confirming re-runs with cost_confirmed=true.
+    Nothing is refused outright — the user decides. Applies to EVERY paid lane (t2v, lip-sync,
+    voice-only) since every caller routes through here."""
+    logger.info(f"[cost] {request_id} {what}: projected ~${projected_usd:.4f}")
+    try:
+        from ..services import creative_team_activity as _act
+        _ts = _act.start("finance", request_id, "projecting spend")
+        _act.finish("finance", request_id, _ts,
+                    detail=f"projected ~${projected_usd:.2f} · {what}")
+    except Exception:
+        pass   # reporting must never affect the job
+    if projected_usd > CONFIRM_JOB_USD and not (assets or {}).get("cost_confirmed"):
         raise RuntimeError(
-            f"cost gate: {what} would cost ~${projected_usd:.2f}, over the ${MAX_JOB_USD:.2f} "
-            f"per-job ceiling (raise MAX_JOB_USD to allow it)")
+            f"COST_CONFIRM_REQUIRED|{projected_usd:.2f}|{what} — this generation is projected to "
+            f"cost about ${projected_usd:.2f}, over the ${CONFIRM_JOB_USD:.2f} confirmation "
+            f"threshold. Nothing has been spent. Confirm to go ahead.")
 
 # The current regen request_id, so low-level Gemini helpers can attribute their token spend to the
 # right job WITHOUT threading request_id through every call site. Set at each recipe's entry.
@@ -3844,7 +3857,8 @@ async def recipe_generate(req: RunRequest) -> list:
         _planned_sec = sum(_per_list) if _per_list else n_clips * per
         _gate_job_cost(req.request_id,
                        f"text-to-video {n_clips} clip(s) / {_planned_sec}s @ {resolution}",
-                       _t2v_projected_usd(resolution, bool(video_urls or image_urls), _planned_sec))
+                       _t2v_projected_usd(resolution, bool(video_urls or image_urls), _planned_sec),
+                       assets)
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         try:
@@ -4700,7 +4714,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # chain) and refuse BEFORE the paid submit.
     _cand = [prefer] if prefer else ["kling", "falsync", "sync"]
     _proj = max(_lipsync_projected_usd(p, seconds) for p in _cand)
-    _gate_job_cost(req.request_id, f"lip-sync {seconds}s via {'/'.join(_cand)}", _proj)
+    _gate_job_cost(req.request_id, f"lip-sync {seconds}s via {'/'.join(_cand)}", _proj, a)
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
     _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
     result = None
