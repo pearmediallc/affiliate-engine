@@ -3718,9 +3718,9 @@ async def recipe_generate(req: RunRequest) -> list:
                         logger.info(f"[generate] captions: {len(_cwords)} words aligned ({_cmethod})")
             except Exception as _ce:
                 logger.warning(f"[generate] caption burn skipped: {_ce}")
-        _style = str(assets.get("style") or "realistic").lower()
-        if _style not in ("cinematic", "animated", "clean"):
-            _vf_parts.append("noise=alls=6:allf=t+u,eq=contrast=0.98:saturation=0.95:gamma=1.01")
+        # NOTE: a post ffmpeg grain/noise "realism" grade was tried here and REMOVED — a temporal noise
+        # filter on AI faces at 480p caused shimmering / "lasered" eyes and a cartoon look. Realism must
+        # come from the PROMPT (REALISM_LAYER), never a destructive post-filter. Captions-only pass now.
         if _vf_parts:
             try:
                 _fin = os.path.join(work, "finish.mp4")

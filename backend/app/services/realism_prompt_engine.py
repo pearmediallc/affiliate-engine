@@ -110,8 +110,8 @@ def build_prompt(
     if line:
         parts.append(f'They say exactly: "{line.strip()}" with matching lip movement and natural expression.')
     parts.append(prof["look"])                                        # 6) request-type aesthetic (anti-slop)
-    if request_type in ("ugc", "testimonial", "broll", "fast_cuts"):  # 6b) fuller anti-slop realism layer
-        parts.append(REALISM_LAYER)                                   #     (was defined but never wired in)
+    # NOTE: appending REALISM_LAYER here was tried and REVERTED — doubling the distortion terms on top
+    # of prof["look"] pushed the model to over-distort (warped/animated faces). prof["look"] alone.
     if ref["exemplars"]:                                              # 7) reference patterns for this type
         parts.append("Follow these proven patterns: " + " ".join(ref["exemplars"]))
     if audio and prof.get("audio"):                                  # 8) audio guidance
