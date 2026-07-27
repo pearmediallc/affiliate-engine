@@ -3350,7 +3350,11 @@ async def recipe_generate(req: RunRequest) -> list:
     aspect_ratio = assets.get("aspect_ratio") or "9:16"
     resolution = assets.get("resolution") or "480p"   # DEFAULT 480p (cheaper/faster); explicit override wins
     generate_audio = assets.get("generate_audio", True)
-    seconds = int(assets.get("seconds") or (16 if engine == "veo-extend" else 15))
+    # AUTO duration: when the caller didn't pick a specific length, the SCRIPT drives runtime (a 40s
+    # script renders ~40s, not a crammed 15s). An explicit number is honored as a cap below.
+    _dur_raw = assets.get("seconds")
+    _auto_dur = not _dur_raw or str(_dur_raw).lower() == "auto"
+    seconds = int(_dur_raw) if (not _auto_dur) else (16 if engine == "veo-extend" else 15)
     if not prompt:
         raise RuntimeError("generate: prompt required")
 
@@ -3560,7 +3564,14 @@ async def recipe_generate(req: RunRequest) -> list:
         per = max(4, min(15, _math.ceil(seconds / n_clips)))
         act.set_expected_sec(req.request_id, 180 * n_clips)
         W2, H2 = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
-        is_talk = bool(video_urls) or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc)\b", prompt, re.I))
+        # A spoken AD is "talking" even when the script never literally contains the word "speak" — the
+        # old keyword-only gate missed real scripts ("my home insurance bill just came in…") → they fell
+        # to the seconds-default (15s) and got crammed. Treat it as talking when: a reference video, OR a
+        # spokesperson keyword, OR the office wrote a real script, OR the spoken text is prose (>=20 words).
+        _spoken = (_vo_script or "").strip()
+        is_talk = (bool(video_urls)
+                   or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc|voiceover|narrat)\b", prompt, re.I))
+                   or len(_spoken.split()) >= 20)
         # SPLIT the spoken script into ONE chunk per clip so each clip speaks its OWN part in sequence
         # (kills the "same opening rendered twice" bug — _attempt uses bt.prompt, so the chunk MUST go
         # into the per-clip prompt). Let the script's natural beats drive clip count + pacing instead of
@@ -3578,6 +3589,21 @@ async def recipe_generate(req: RunRequest) -> list:
                 _w = len((_txt or "").split())
                 return max(6, min(15, _math.ceil(_w / 2.5) + 1))
             _per_list = [_clip_secs(c) for c in _vo_chunks[:n_clips]]
+            # DURATION PRIORITY: Auto (no explicit length) → the whole script renders. An EXPLICIT length
+            # is a CAP — keep only as many leading chunks as fit the budget (never cram the full script
+            # into a short window; drop the tail instead, which reads far better than rushed speech).
+            if not _auto_dur and seconds > 0:
+                _acc, _keep = 0, 0
+                for _s in _per_list:
+                    if _acc + _s > seconds and _keep >= 1:
+                        break
+                    _acc += _s; _keep += 1
+                n_clips = _keep
+                _per_list = _per_list[:_keep]
+                logger.info(f"[generate] explicit {seconds}s cap → {n_clips} clip(s) (~{sum(_per_list)}s) of "
+                            f"{len(_vo_chunks)} script chunk(s)")
+            else:
+                logger.info(f"[generate] AUTO duration → full script: {n_clips} clip(s), ~{sum(_per_list)}s")
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         try:
