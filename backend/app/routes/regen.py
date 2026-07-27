@@ -3554,6 +3554,15 @@ async def recipe_generate(req: RunRequest) -> list:
         act.set_expected_sec(req.request_id, 180 * n_clips)
         W2, H2 = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
         is_talk = bool(video_urls) or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc)\b", prompt, re.I))
+        # SPLIT the spoken script into ONE chunk per clip so each clip speaks its OWN part in sequence
+        # (kills the "same opening rendered twice" bug — _attempt uses bt.prompt, so the chunk MUST go
+        # into the per-clip prompt). Let the script's natural beats drive clip count + pacing instead of
+        # a fixed seconds/15 that repeats. Non-talking (broll) keeps the seconds-based split.
+        from ..services import realism_prompt_engine as _rpe
+        _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=28) if is_talk else []
+        if _vo_chunks:
+            n_clips = max(1, min(len(_vo_chunks), 6))
+            per = max(6, min(15, _math.ceil((seconds or 15 * n_clips) / n_clips)))
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         try:
@@ -3569,9 +3578,17 @@ async def recipe_generate(req: RunRequest) -> list:
                     imgs = [cont] + imgs
                 cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
                            "wardrobe, setting and lighting; one continuous action, match-cut.")[:1900]
+            # THIS clip speaks ONLY its own chunk of the script, in sequence — never restart or repeat
+            # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
+            _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
+            if _chunk:
+                _hookrule = (" The person is ALREADY speaking from the very first frame — no silent "
+                             "lead-in, no dead air in the opening." if ci == 0 else "")
+                cprompt = (cprompt + f' SPOKEN LINE FOR THIS CLIP — say ONLY this, word for word, and do '
+                           f'NOT repeat any earlier line: "{_chunk}".' + _hookrule)[:6000]
             # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
-            beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": ""}
+            beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": _chunk}
 
             # Provider fallback: Kie-Seedance → fal-seedance → fal-kling → fal-wan. A credits/quota/5xx
             # error on one advances to the next; _AllVideoProvidersDown only if every configured one is down.
