@@ -246,6 +246,55 @@ def _fal_submit(video_url: str, audio_url: str) -> str:
     return rid
 
 
+# fal hosts SEVERAL lip-sync models at wildly different prices for the same job:
+#   kling  $0.014 / 5s block  ≈ $0.17/min   ← bulk workhorse
+#   sync-1.9-beta            ≈ $0.70/min
+#   veed/lipsync  $0.07/sec  ≈ $4.20/min    ← what we were silently defaulting to ($6.23 for one ad)
+# Same audio→video task, 25x price spread. Endpoint choice IS the cost model.
+FAL_LIPSYNC_ENDPOINTS = {
+    "kling": "fal-ai/kling-video/lipsync/audio-to-video",   # ~$0.17/min — default
+    "falsync": "fal-ai/sync-lipsync",                        # ~$0.70/min — mid tier
+    "veed": "veed/lipsync",                                  # ~$4.20/min — hero/opt-in ONLY
+}
+FAL_LIPSYNC_PER_MIN = {"kling": 0.168, "falsync": 0.70, "veed": 4.20}
+
+
+def _fal_submit_ep(video_url: str, audio_url: str, ep_key: str = "kling") -> str:
+    """Submit to a SPECIFIC fal lip-sync endpoint (price varies 25x across them)."""
+    key = settings.fal_key
+    if not key:
+        raise RuntimeError("no fal key")
+    slug = FAL_LIPSYNC_ENDPOINTS.get(ep_key) or FAL_LIPSYNC_ENDPOINTS["kling"]
+    r = requests.post(f"https://queue.fal.run/{slug}",
+                      headers={"Authorization": f"Key {key}", "Content-Type": "application/json"},
+                      json={"video_url": video_url, "audio_url": audio_url}, timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"fal {ep_key} {r.status_code}: {r.text[:200]}")
+    rid = (r.json() or {}).get("request_id")
+    if not rid:
+        raise RuntimeError(f"fal {ep_key} no request_id: {r.text[:160]}")
+    logger.info(f"lipsync submitted via fal:{ep_key} (~${FAL_LIPSYNC_PER_MIN.get(ep_key, 0):.2f}/min)")
+    return rid
+
+
+def _fal_status_ep(rid: str, ep_key: str = "kling"):
+    key = settings.fal_key
+    slug = FAL_LIPSYNC_ENDPOINTS.get(ep_key) or FAL_LIPSYNC_ENDPOINTS["kling"]
+    base = f"https://queue.fal.run/{slug}"
+    h = {"Authorization": f"Key {key}"}
+    s = requests.get(f"{base}/requests/{rid}/status", headers=h, timeout=30).json()
+    st = (s.get("status") or "").upper()
+    if st == "COMPLETED":
+        res = requests.get(f"{base}/requests/{rid}", headers=h, timeout=30).json()
+        out = (res.get("video") or {}).get("url")
+        if not out:
+            raise RuntimeError(f"fal completed without video url: {res}")
+        return ("done", out)
+    if st in ("FAILED", "ERROR"):
+        raise RuntimeError(f"fal {st}: {s}")
+    return ("processing", None)
+
+
 def _fal_status(rid: str):
     key = settings.fal_key
     base = "https://queue.fal.run/veed/lipsync"
@@ -271,8 +320,13 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     # premium: sync.so (best) → fal → Replicate
     # Replicate lanes are dropped entirely unless the account is funded (REPLICATE_ENABLED) —
     # an unfunded token 402s on every render, which just burns time and falls through anyway.
-    chain = (["sync", "fal", "latentsync", "wav2lip"] if quality == "premium"
-             else ["latentsync", "wav2lip", "fal", "sync"])
+    # COST-ORDERED. 'fal' used to mean veed/lipsync (~$4.20/min) and sat ahead of sync.so, so with
+    # Replicate unfunded EVERY bulk render silently took the single most expensive lane on the
+    # market — one 89s ad billed $6.23. Same task on fal-kling costs ~$0.25.
+    #   kling ~$0.17/min · latentsync ~$0.09/render · wav2lip ~$0.03 · falsync ~$0.70 · sync.so ~$0.70 · veed ~$4.20
+    chain = (["sync", "falsync", "kling", "latentsync", "wav2lip"] if quality == "premium"
+             else ["kling", "latentsync", "wav2lip", "falsync", "sync"])
+    # 'veed' is NEVER in a default chain — hero-only, and only when explicitly asked for via `prefer`.
     if not settings.replicate_usable:
         chain = [p for p in chain if p not in ("latentsync", "wav2lip")]
     order, seen, errors = [], set(), []
@@ -283,8 +337,11 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
         try:
             if p == "sync":
                 job = _sync_so_submit(video_url, audio_url)
-            elif p == "fal":
-                job = _fal_submit(video_url, audio_url)
+            elif p in ("kling", "falsync", "veed"):
+                job = _fal_submit_ep(video_url, audio_url, p)
+            elif p == "fal":       # legacy alias — keep working, but on the CHEAP endpoint now
+                p = "kling"
+                job = _fal_submit_ep(video_url, audio_url, "kling")
             elif p in ("latentsync", "wav2lip"):
                 if not settings.replicate_usable:
                     raise RuntimeError("Replicate not enabled (unfunded account) — using fal/sync.so instead")
@@ -303,7 +360,9 @@ def poll_relipsync(provider: str, job: str):
     """One status poll. Returns ('processing', None) | ('done', {video_url|local_path}). Raises on failure."""
     if provider == "sync":
         st, url = _sync_so_status(job); return (st, {"video_url": url} if url else None)
-    if provider == "fal":
+    if provider in ("kling", "falsync", "veed"):
+        st, url = _fal_status_ep(job, provider); return (st, {"video_url": url} if url else None)
+    if provider == "fal":   # legacy rows persisted before the endpoint split → veed queue
         st, url = _fal_status(job); return (st, {"video_url": url} if url else None)
     if provider in ("latentsync", "wav2lip"):
         r = _check_replicate(job)
