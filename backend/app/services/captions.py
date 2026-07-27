@@ -274,7 +274,10 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
     cta_fs  = int(76 * k)
     outline = max(2, int(8 * k))     # thick black stroke = readable on any background
     shadow  = max(1, int(3 * k))
-    marginv = int(430 * k)           # lower third, clear of the play/scrub controls
+    # Park captions NEAR THE BOTTOM (~11% of frame height), not at a "lower third" 22% up.
+    # 430*k sat 22% up the frame — fine for a wide shot, but lip-sync/UGC output is a face-filling
+    # CLOSE-UP, so 22% up landed on the chin/mouth and covered the character's face.
+    marginv = max(40, int(play_h * 0.11))
     side    = int(90 * k)
     # How many CHARACTERS actually fit on one line? Text overflowed the frame because the font was
     # sized off the HEIGHT while the line runs off the WIDTH. Arial bold averages ~0.55em/char.
