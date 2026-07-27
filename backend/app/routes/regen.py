@@ -314,8 +314,14 @@ async def _detect_caption_boxes(frame_paths: list) -> list:
             'as fractions of the frame. Pad each box ~4%. Return {"boxes":[]} if there is no overlay text.')
         return [b for b in (r.get("boxes") or []) if all(k in b for k in ("x", "y", "w", "h"))]
     except Exception as e:
-        logger.warning(f"caption-box detect failed: {e}")
-        return []
+        # FAIL SAFE, not fail open. Returning [] on an ERROR meant "this clip has no burned-in
+        # captions", so a library clip's ORIGINAL captions survived underneath the new ones — two
+        # contradicting caption tracks on screen. A detector ERROR is not evidence of a clean clip:
+        # mask the bottom third (where burned captions almost always sit) so ours is the only text.
+        # NOTE: a genuine {"boxes":[]} response still returns [] above — this is the error path only.
+        logger.error(f"caption-box detect FAILED ({e}) — masking the bottom third as a safety net "
+                     f"(cannot confirm the clip is caption-free)")
+        return [{"x": 0.0, "y": 0.66, "w": 1.0, "h": 0.30}]
 
 
 async def _asset_is_relevant(frame_paths: list, offer_desc: str) -> bool:
@@ -3486,7 +3492,18 @@ async def recipe_generate(req: RunRequest) -> list:
                 run_critic=True)
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
-                prompt = f"{prompt}. {refined}"
+                # VISUAL vs SPOKEN separation. Keeping the whole ad script inside the VISUAL prompt
+                # made Seedance literally STAGE the ad copy — that is where the wrong/exaggerated
+                # facial expressions and off-model characters came from. When the office produced a
+                # real visual direction AND the words are carried separately (per-clip SPOKEN LINE),
+                # the visual prompt is the beat direction ONLY. Fall back to the old concat when
+                # there is no spoken script to carry the words (b-roll/scenic), so nothing regresses.
+                if len((_vo_script or "").split()) >= 20:
+                    prompt = refined
+                    logger.info("[generate] visual prompt = team beat direction; the script is spoken "
+                                "per-clip (not staged as visual instructions)")
+                else:
+                    prompt = f"{prompt}. {refined}"
             # HOOK FIX: the spoken lines must come from the team's HOOK-optimized script (hook in the
             # first sentence), NOT the raw user prompt. Previously _vo_script stayed = prompt on the
             # t2v lane, so the writer's rewrite drove only the visuals while the character spoke the
@@ -3591,7 +3608,11 @@ async def recipe_generate(req: RunRequest) -> list:
             else:
                 logger.info("[generate] plan → avatar_lipsync but no castable avatar — keeping text-to-video")
 
-        prompt = (prompt + HOOK + NO_TEXT)[:1900]
+        # Slice the BODY, then append the directives — never the other way round. Concatenating
+        # first and slicing after silently cut HOOK and NO_TEXT off whenever the script was long,
+        # so the model was never told "no on-screen text" (→ gibberish AI text burned in the frame,
+        # colliding with our own captions) nor "already speaking from frame 1" (→ silent opening).
+        prompt = prompt[:max(200, 1900 - len(HOOK) - len(NO_TEXT))] + HOOK + NO_TEXT
 
         if engine in ("veo-extend", "veo", "veo3-google"):
           # Veo (Google) can 401/402/429/5xx or time out. On any non-cancellation failure,
@@ -3704,6 +3725,10 @@ async def recipe_generate(req: RunRequest) -> list:
                     _acc += _s; _keep += 1
                 n_clips = _keep
                 _per_list = _per_list[:_keep]
+                # Captions/TTS must describe ONLY what actually got rendered. Leaving _vo_script as
+                # the FULL script made the aligner diff ~200 unmatched tokens into a single word's
+                # <0.4s window — the back half of the script flashed as nonsense.
+                _vo_script = " ".join(_vo_chunks[:_keep])
                 logger.info(f"[generate] explicit {seconds}s cap → {n_clips} clip(s) (~{sum(_per_list)}s) of "
                             f"{len(_vo_chunks)} script chunk(s)")
             else:
@@ -3812,7 +3837,12 @@ async def recipe_generate(req: RunRequest) -> list:
                 from ..services import captions as cap
                 _cap_audio = os.path.join(work, "capaudio.wav")
                 await asyncio.to_thread(_ffmpeg, ["-i", out_path, "-vn", "-ac", "1", "-ar", "16000", "-y", _cap_audio], 120)
-                _cwords, _cmethod = await asyncio.to_thread(lambda: cap.align(_cap_audio, _vo_script or prompt))
+                # When the provider generated its OWN speech (native audio), it never says our words
+                # verbatim — forcing our script onto it made the aligner produce nonsense. Pass an
+                # empty text so captions come from the REAL transcript. Only our own TTS (which does
+                # speak the script) is aligned against the script text.
+                _cap_text = (_vo_script or prompt) if _audio_state == "tts" else ""
+                _cwords, _cmethod = await asyncio.to_thread(lambda: cap.align(_cap_audio, _cap_text))
                 if _cwords:
                     _cw, _ch = await asyncio.to_thread(_video_dims, out_path)
                     _ass = cap.build_ass(_cwords, os.path.join(work, f"cap_{req.request_id[:8]}.ass"),
@@ -3873,7 +3903,12 @@ async def recipe_generate(req: RunRequest) -> list:
                     + (" · captions" if _caps_burned else "")
                     + f"{' · refs: ' + ', '.join(refs) if refs else ''}"
                     # HONEST audio label — reflects the ACTUAL output, not the request flag.
-                    + ({"native": " · audio", "tts": " · voiceover (TTS — Kie down, narrated the script)",
+                    + ({"native": " · audio",
+                        # TTS over a SILENT provider's footage = a voice on a face that isn't moving.
+                        # Say so plainly instead of calling it "voiceover" and hiding the defect.
+                        "tts": (" · ⚠ voiceover dubbed over non-speaking footage (silent provider — "
+                                "lips will NOT match; top up Kie for real speech)" if is_talk
+                                else " · voiceover (TTS — narrated the script)"),
                         "none": " · ⚠ no audio (silent fallback — top up Kie for narrated video)"}.get(_audio_state, "")
                        if generate_audio else "")
                     + (" · stitched with frame-continuity" if len(clip_paths) > 1 else "")
