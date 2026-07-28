@@ -3748,9 +3748,18 @@ async def recipe_generate(req: RunRequest) -> list:
                 # scriptwriter output), NOT the raw scene-description prompt (which the avatar would
                 # otherwise read aloud). Fallback chain: written ad script → concatenated talking-head
                 # beat lines → raw prompt (last resort). Never empty.
+                # …EXCEPT when the user supplied the script themselves. A Studio script the user
+                # read and approved is verbatim intent, not a brief — the office rewriting it is a
+                # defect, not an improvement. This is why an approved CAR-insurance script came out
+                # of the avatar's mouth as a HOME-insurance story with a neighbour and a state that
+                # nobody wrote: the vertical DNA rewrite always outranked the user's own words.
                 _spoken_script = ""
+                _user_script = (assets.get("script") or "").strip()
+                if str(assets.get("script_mode") or "").lower() == "verbatim" and _user_script:
+                    _spoken_script = _user_script
+                    logger.info("[generate] user-supplied verbatim script — NOT using the office rewrite")
                 try:
-                    _spoken_script = (plan.get("script") or "").strip()
+                    _spoken_script = _spoken_script or (plan.get("script") or "").strip()
                     if not _spoken_script:
                         _lines = [str(b.get("line") or "").strip()
                                   for b in (plan.get("beats") or [])
