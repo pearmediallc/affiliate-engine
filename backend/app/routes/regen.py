@@ -2833,6 +2833,24 @@ def _record_qc(request_id: str, beat: dict, ev: dict, unverified: bool = False,
         logger.error(f"[critic] FAILED to persist QC verdict for {request_id}: "
                      f"{type(e).__name__}: {e}", exc_info=True)
 
+    # CLOSE THE LOOP. Writing the verdict to creative_decisions only builds a history nothing reads;
+    # the lessons table is the one store that actually reaches the next generation's prompt
+    # (lessons_for_prompt / learned_engine_avoid). So a FAILED verdict becomes a lesson right here —
+    # that is the difference between recording mistakes and not repeating them. Separate try: a QC
+    # persist failure must not stop the learning write, and vice versa.
+    try:
+        if unverified or not _team_eval_passed(ev):
+            from ..services import creative_learning as learn
+            for issue in [str(i) for i in (ev.get("issues") or [])][:3]:
+                if not issue.strip():
+                    continue
+                learn.record_lesson(
+                    "clip", trigger=f"{stage} QA failed ({beat.get('shot_type') or 'clip'})",
+                    reason=issue[:500], rule=f"Avoid: {issue[:400]}",
+                    job_id=request_id)
+    except Exception as e:
+        logger.warning(f"[critic] lesson write failed for {request_id}: {e}")
+
 
 async def _shrink_for_lipsync(char_url: str, request_id: str, max_mb: float = 18.0) -> Optional[str]:
     """Re-encode an avatar clip small enough for the cheap lip-sync endpoints' input limits.
@@ -3587,7 +3605,11 @@ async def recipe_generate(req: RunRequest) -> list:
             vertical = req.context.get("vertical", "") if isinstance(req.context, dict) else ""
             plan = await team.run_creative_team(
                 offer_desc=prompt, job_id=req.request_id, vertical=vertical,
-                request_type=("broll" if (video_urls or image_urls) else "ugc"),
+                # RESPECT what was asked for. This used to be derived purely from whether reference
+                # media was attached, so a Studio request that explicitly said "broll" always came
+                # out "ugc" and the b-roll lane was unreachable.
+                request_type=(str(assets.get("request_type") or "").strip().lower()
+                              or ("broll" if (video_urls or image_urls) else "ugc")),
                 model=engine, loser_transcript=prompt,
                 loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
                 has_winner_video=bool(video_urls), n_reference_images=len(image_urls),
@@ -3715,9 +3737,15 @@ async def recipe_generate(req: RunRequest) -> list:
                     logger.warning(f"[generate] written-script lookup failed: {_e}")
                     _spoken_script = ""
                 _spoken_script = _spoken_script or (assets.get("prompt") or prompt)
+                # CARRY THE CAST THROUGH. Rebuilding assets without gender/age_band made
+                # pick_voice raise UnknownGenderError → the whole avatar lane silently fell back
+                # to synthetic t2v (which is exactly why characters looked AI-generated).
+                # House default when the caller sends nothing: woman.
                 req.assets = {**(req.assets or {}),
                               "character_video_url": _cast_url,
                               "script": _spoken_script,
+                              "gender": (assets.get("gender") or "female"),
+                              "age_band": assets.get("age_band"),
                               "seconds": int(seconds), "vertical": _vert}
                 logger.info(f"[generate] plan → avatar_lipsync; running funded lip-sync on {_cast_url}")
                 try:
@@ -3932,7 +3960,12 @@ async def recipe_generate(req: RunRequest) -> list:
         if len(clip_paths) == 1:
             import shutil; shutil.copy(clip_paths[0], out_path)
         else:
-            # normalize every clip to uniform W:H:fps + aac, then concat (perfect frames + audio)
+            # normalize every clip to uniform W:H:fps + aac, then concat (perfect frames + audio).
+            # NO UPSCALING: we render 480p on purpose, so concat at the clips' OWN native size.
+            # Scaling 480p up to 1080x1920 only faked a resolution number and softened the image.
+            _nw, _nh = await asyncio.to_thread(_ffprobe_dims, clip_paths[0])
+            if _nw and _nh:
+                W2, H2 = int(_nw) - (int(_nw) % 2), int(_nh) - (int(_nh) % 2)
             norm = []
             for i, cp in enumerate(clip_paths):
                 npath = os.path.join(work, f"sd{i}.mp4")

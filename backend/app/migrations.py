@@ -52,6 +52,9 @@ _REQUIRED_COLUMNS = [
     # the learning loop recorded nothing at all.
     ("creative_decisions", "human_verdict", "VARCHAR"),
     ("creative_decisions", "human_reason", "TEXT"),
+    # Same failure, missed in the earlier fix: verdict_at is on the model but was never migrated,
+    # so it alone kept killing every INSERT. THIS is why creative_decisions still had 0 rows.
+    ("creative_decisions", "verdict_at", "TIMESTAMP"),
     ("creative_decisions", "script_mode", "VARCHAR"),
     ("creative_decisions", "caption_method", "VARCHAR"),
     ("creative_decisions", "caption_removal_method", "VARCHAR"),
@@ -60,6 +63,27 @@ _REQUIRED_COLUMNS = [
     ("creative_decisions", "variation_axis", "VARCHAR"),
     # Admin-approval gate — engine reads a governed rule ONLY when an admin approved it (active).
     ("creative_brain_rules", "active", "BOOLEAN DEFAULT FALSE"),
+    # FULL PARITY with app/models/creative_team.py::CreativeDecision. SQLAlchemy names EVERY mapped
+    # column on INSERT, so a single un-migrated column kills 100% of QA writes (that is what happened
+    # twice: human_verdict/human_reason, then verdict_at). These are all no-ops where the column
+    # already exists; listing them means the next added column can only ever be missed once.
+    ("creative_decisions", "creative_ref", "VARCHAR"),
+    ("creative_decisions", "vertical", "VARCHAR"),
+    ("creative_decisions", "character_key", "VARCHAR"),
+    ("creative_decisions", "character_gender", "VARCHAR"),
+    ("creative_decisions", "character_age", "VARCHAR"),
+    ("creative_decisions", "voice_id", "VARCHAR"),
+    ("creative_decisions", "voice_provider", "VARCHAR"),
+    ("creative_decisions", "voice_cloned", "BOOLEAN"),
+    ("creative_decisions", "lipsync_provider", "VARCHAR"),
+    ("creative_decisions", "video_model", "VARCHAR"),
+    ("creative_decisions", "script_ref", "TEXT"),
+    ("creative_decisions", "captions", "BOOLEAN"),
+    ("creative_decisions", "qc_passed", "BOOLEAN"),
+    ("creative_decisions", "qc_reasons", "TEXT"),
+    ("creative_decisions", "cost_usd", "DOUBLE PRECISION"),
+    ("creative_decisions", "roi", "DOUBLE PRECISION"),
+    ("creative_decisions", "roi_updated_at", "TIMESTAMP"),
 ]
 
 
