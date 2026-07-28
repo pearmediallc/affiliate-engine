@@ -355,6 +355,125 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
     return out_ass_path
 
 
+_KINETIC_STOP = {
+    "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "is",
+    "are", "was", "were", "be", "been", "am", "i", "you", "it", "this", "that", "my", "your",
+    "no", "now", "so", "we", "he", "she", "they", "them", "me", "us", "our", "if", "then",
+    "than", "as", "by", "from", "not", "do", "did", "get", "got", "can", "will", "just",
+}
+
+
+def _ekey(raw: str) -> str:
+    """Normalize a token for emphasis matching: lowercase, letters+digits only ('$51' -> '51')."""
+    return re.sub(r"[^a-z0-9]", "", (raw or "").lower())
+
+
+def _has_number(raw: str) -> bool:
+    return ("$" in (raw or "")) or any(c.isdigit() for c in (raw or ""))
+
+
+def _auto_emphasis(words: list) -> set:
+    """Pick words to BOX: every token with a digit/'$', plus the single longest non-stopword per
+    short phrase (phrases split on sentence/clause punctuation)."""
+    emp, phrase = set(), []
+
+    def _flush(ph):
+        best, best_len = None, 0
+        for raw in ph:
+            if _has_number(raw):
+                emp.add(_ekey(raw)); continue
+            k = _ekey(raw)
+            if not k or k.isdigit() or k in _KINETIC_STOP or len(k) < 4:
+                continue
+            if len(k) > best_len:
+                best, best_len = k, len(k)
+        if best:
+            emp.add(best)
+
+    for w in words:
+        raw = str(w.get("word") or "")
+        phrase.append(raw)
+        if re.search(r"[.!?,;:]", raw):
+            _flush(phrase); phrase = []
+    if phrase:
+        _flush(phrase)
+    return emp
+
+
+def build_kinetic_ass(words: list, out_ass_path: str, play_w: int = 1080, play_h: int = 1920,
+                      emphasis=None) -> str | None:
+    """KINETIC captions for b-roll VO: bold white uppercase, 1-2 words on screen at a time, each
+    timed to its own word (from `align`). EMPHASIS words (numbers/'$' and one keyword per phrase)
+    render as white text on a RED opaque box (BorderStyle=3). Same 11%-from-bottom placement as
+    build_ass, centered. Additive — never touches build_ass. Returns the .ass path, or None on any
+    failure. `emphasis` is a set/list of lowercased words to box; None → auto-pick."""
+    if not words:
+        return None
+    try:
+        emp = ({_ekey(x) for x in emphasis} if emphasis is not None else _auto_emphasis(words))
+
+        def _is_emph(raw: str) -> bool:
+            return _has_number(raw) or (_ekey(raw) in emp)
+
+        # scale everything off the real frame height (1920 is our reference design), like build_ass
+        k = max(0.35, play_h / 1920.0)
+        fs      = int(104 * k)                  # 1-2 words → a touch bigger than build_ass
+        outline = max(2, int(9 * k))            # thick black stroke = readable on any footage
+        shadow  = max(1, int(3 * k))
+        marginv = max(40, int(play_h * 0.11))   # same lower band as build_ass
+        side    = int(90 * k)
+        pad     = max(8, int(14 * k))           # red-box padding (Outline value in BorderStyle 3)
+        header = (
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 0\n"
+            "ScaledBorderAndShadow: yes\n\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n"
+            # plain word: white text, fat black outline, bottom-centre
+            f"Style: Kdef,Arial,{fs},&H00FFFFFF,&H00000000,&H00000000,-1,0,1,{outline},{shadow},2,{side},{side},{marginv}\n"
+            # emphasis word: white text on a RED opaque box. BorderStyle=3 → the box FILL is the
+            # OutlineColour (same convention build_ass's Cta button relies on); red in ASS BGR = &H000000FF.
+            f"Style: Kbox,Arial,{fs},&H00FFFFFF,&H000000FF,&H000000FF,-1,0,3,{pad},0,2,{side},{side},{marginv}\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            % (play_w, play_h)
+        )
+        # chunk: an emphasis word stands ALONE (so the box wraps only it); plain words pair up (<=2)
+        chunks, i = [], 0
+        while i < len(words):
+            raw = str(words[i].get("word") or "")
+            if _is_emph(raw):
+                chunks.append(([words[i]], "Kbox")); i += 1
+            else:
+                grp = [words[i]]; i += 1
+                if i < len(words) and not _is_emph(str(words[i].get("word") or "")):
+                    grp.append(words[i]); i += 1
+                chunks.append((grp, "Kdef"))
+        lines = []
+        for n, (grp, style) in enumerate(chunks):
+            start = float(grp[0].get("start") or 0)
+            end = float(grp[-1].get("end") or 0)
+            if end <= start:
+                end = start + 0.4
+            nxt = float(chunks[n + 1][0][0].get("start") or 0) if n + 1 < len(chunks) else None
+            if nxt is not None:                       # continuous: hold to the next word (capped)
+                end = max(end, min(nxt, start + 1.2))
+                end = min(end, nxt)
+            else:
+                end = max(end, start + 0.5)
+            if end - start < 0.18:                    # too quick to read → give it a beat
+                end = start + 0.18
+            text = re.sub(r"\s+", " ", " ".join(str(w.get("word") or "") for w in grp)).strip().upper()
+            if not text:
+                continue
+            lines.append(f"Dialogue: 0,{_fmt(start)},{_fmt(end)},{style},,0,0,0,,{text}")
+        with open(out_ass_path, "w") as f:
+            f.write(header + "\n".join(lines) + "\n")
+        return out_ass_path
+    except Exception as e:
+        logger.warning(f"build_kinetic_ass failed: {e}")
+        return None
+
+
 def _srt_ts(t: float) -> str:
     t = max(0.0, float(t)); h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60); ms = int((t - int(t)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"

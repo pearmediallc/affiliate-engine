@@ -2694,6 +2694,126 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         queries = (d.get("queries") or []) + ["lifestyle", "city"]
         caption = (d.get("caption") or " ".join(transcript.split()[:6]) or "WATCH THIS")
         offer_desc = (caption + " — " + transcript[:220]).strip()
+
+        # ── UGC-BROLL: real b-roll montage + first-person VOICEOVER + kinetic captions ─────────
+        # The reference format (S2-TX-UGC-BROLL): scenic lifestyle/property footage (NO face-to-cam,
+        # NO lip-sync) under a first-person VO, with bold word-by-word captions that box the numbers/
+        # keywords. Taken whenever there's a real spoken script (assets.script, honoring allow_rewrite,
+        # else the source transcript). Best-effort: any gap (no footage / synth / align) falls through
+        # to the simple stock-clip behavior below — never a hard fail.
+        _assets = req.assets if isinstance(req.assets, dict) else {}
+        script = _verbatim_user_script(_assets) or (transcript or "").strip()
+        if len((script or "").split()) >= 6:
+            try:
+                from ..services import voice_studio as vs
+                from ..services import captions as cap
+                intent = {"vertical": (req.context.get("vertical") or ""),
+                          "scene": (_assets.get("scene") or ""),
+                          "gender": (req.context.get("gender") or ""),
+                          "age_band": (req.context.get("age_band") or "")}
+                # (b) full-script expressive VO — length of the ad = length of this VO
+                vo = os.path.join(work, f"vo_{req.request_id[:8]}.mp3")
+                await asyncio.to_thread(lambda: vs.synthesize(
+                    script, out_path=vo,
+                    style="first-person UGC testimonial, natural, conversational, upbeat, talking to "
+                          "camera, never flat or monotone"))
+                T = await asyncio.to_thread(_audio_seconds, vo) if os.path.exists(vo) else 0.0
+                if T <= 0:
+                    raise RuntimeError("VO synthesis produced no audio")
+                # (c) gather footage — tagged library b-roll FIRST, then top up with stock.
+                # RELEVANCE: library b-roll is already vertical-filtered by _cast_library_broll, but
+                # STOCK is keyword-matched and can drift off-topic (the classic "leaf-blower on a
+                # weight-loss ad"). Vision-gate every stock clip against the offer before it enters the
+                # montage, so the b-roll is actually about what the script is selling.
+                srcs = []
+                for u in await _cast_library_broll(intent, limit=8):
+                    try:
+                        srcs.append(await _download_to_temp(u, ".mp4"))
+                    except Exception as de:
+                        logger.warning(f"[broll] library clip download failed: {de}")
+                needed = max(1, int(T // 4) + 1)
+                qi = 0
+                while len(srcs) < needed and qi < len(queries):
+                    c = await asyncio.to_thread(StockFootageService.get_broll, queries[qi], "portrait", 30)
+                    qi += 1
+                    if not (c and c.get("local_path") and c["local_path"] not in srcs):
+                        continue
+                    # on-offer relevance gate (fails open on error) — keep b-roll on-topic
+                    try:
+                        _rf = await asyncio.to_thread(_extract_frames, c["local_path"], [0.5, 1.5], work)
+                        if not await _asset_is_relevant(_rf, offer_desc):
+                            logger.info(f"[broll] stock clip rejected as off-offer for query '{queries[qi-1]}'")
+                            continue
+                    except Exception as _re:
+                        logger.warning(f"[broll] stock relevance check errored (allowing): {_re}")
+                    srcs.append(c["local_path"])
+                # (d) montage: scale/crop each clip to 1080x1920, ~4s silent cuts, until total >= T
+                TW, TH, SEG = 1080, 1920, 4.0
+                seg_paths, total, idx, guard = [], 0.0, 0, 0
+                while total < T and srcs and guard < 200:
+                    src = srcs[idx % len(srcs)]
+                    pass_no = idx // len(srcs); idx += 1; guard += 1
+                    sd = await asyncio.to_thread(_ffprobe_duration, src)
+                    if sd <= 0.4:
+                        continue
+                    off = min(pass_no * SEG, max(0.0, sd - 1.0))     # different window on re-use
+                    take = min(SEG, sd - off)
+                    if take < 1.0:
+                        off, take = 0.0, min(SEG, sd)
+                    seg = os.path.join(work, f"seg_{len(seg_paths):03d}.mp4")
+                    try:
+                        await asyncio.to_thread(_ffmpeg,
+                            ["-ss", f"{off:.2f}", "-i", src, "-t", f"{take:.2f}", "-an",
+                             "-vf", f"scale={TW}:{TH}:force_original_aspect_ratio=increase,"
+                                    f"crop={TW}:{TH},fps=30,setpts=PTS-STARTPTS",
+                             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                             "-pix_fmt", "yuv420p", "-threads", "2", seg], 300)
+                    except Exception as se:
+                        logger.warning(f"[broll] segment build failed: {se}"); continue
+                    seg_paths.append(seg); total += take
+                if seg_paths:
+                    # concat the montage and hard-trim to EXACTLY the VO length
+                    listf = os.path.join(work, "broll_concat.txt")
+                    with open(listf, "w") as f:
+                        for s in seg_paths:
+                            f.write("file '%s'\n" % s.replace("'", "'\\''"))
+                    montage = os.path.join(work, "montage.mp4")
+                    await asyncio.to_thread(_ffmpeg,
+                        ["-f", "concat", "-safe", "0", "-i", listf, "-t", f"{T:.2f}", "-an",
+                         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                         "-pix_fmt", "yuv420p", "-threads", "2", montage], 600)
+                    # (e) mux the VO as the ONLY audio (b-roll clips are muted)
+                    muxed = os.path.join(work, "broll_muxed.mp4")
+                    await asyncio.to_thread(_ffmpeg,
+                        ["-i", montage, "-i", vo, "-map", "0:v:0", "-map", "1:a:0",
+                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", muxed], 300)
+                    # (f) kinetic word-by-word captions burned over the montage
+                    name, out_path, url = _out_url(req, "broll")
+                    ass = None
+                    try:
+                        words, _m = await asyncio.to_thread(lambda: cap.align(vo, script))
+                        if words:
+                            ass = cap.build_kinetic_ass(
+                                words, os.path.join(work, f"kin_{req.request_id[:8]}.ass"),
+                                play_w=TW, play_h=TH)
+                    except Exception as ae:
+                        logger.warning(f"[broll] kinetic captions skipped: {ae}")
+                    if ass and os.path.exists(ass):
+                        await asyncio.to_thread(_ffmpeg,
+                            ["-i", muxed, "-vf", f"ass={ass}", "-c:v", "libx264", "-preset", "veryfast",
+                             "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", out_path], 600)
+                    else:
+                        import shutil; shutil.move(muxed, out_path)
+                    _ae_persist(out_path, name)
+                    return [{"recipe": label, "video_url": url, "confidence": 0.62,
+                             "whats_changed": (f'{label}: UGC b-roll montage ({len(seg_paths)} clips) with a '
+                                f'first-person voiceover + kinetic word-by-word captions. Length = VO ({T:.0f}s).')}]
+                logger.info("[broll] UGC-BROLL found no footage — falling back to simple stock b-roll")
+            except Cancelled:
+                raise
+            except Exception as ue:
+                logger.warning(f"[broll] UGC-BROLL path failed ({ue}) — falling back to simple stock b-roll")
+
         clip = None
         from ..services import winner_library
         _lw = winner_library.fetch_winners(req.context.get("vertical", ""), limit=1)
@@ -3516,6 +3636,60 @@ async def _cast_library_avatar(intent: dict):
             best_lip_s, best_lip = s, t
     return ((best_lip.get("url") if best_lip else None), best_lip,
             (best_any.get("url") if best_any else None), best_any)
+
+
+async def _cast_library_broll(intent: dict, limit: int = 8) -> list:
+    """Scan the tagged asset library for scenic B-ROLL clips matching the parsed intent. Mirrors
+    _cast_library_avatar's DB scan but collects clips tagged usable_as/kind == 'broll' with a url.
+    Ranked by vertical match (strong), then scene, preferring LOW face_score (b-roll should be
+    scenic, not a face). Read-only, never raises. Returns up to `limit` clip URLs, best first."""
+    want_scene = (intent.get("scene") or "").lower()
+    want_vert = (intent.get("vertical") or "").lower()
+    try:
+        from ..database import SessionLocal
+        from ..models.asset_tag import AssetTag
+        db = SessionLocal()
+        try:
+            rows = db.query(AssetTag).all()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"[broll] library scan failed: {e}")
+        return []
+
+    scored = []
+    for row in rows:
+        try:
+            t = json.loads(row.tags_json)
+        except Exception:
+            continue
+        url = t.get("url")
+        if not url:
+            continue
+        if (t.get("usable_as") or "").lower() != "broll" and (t.get("kind") or "").lower() != "broll":
+            continue
+        _cv = (t.get("vertical") or "").lower()
+        s = 0.0
+        _same_vert = bool(want_vert and _cv == want_vert)
+        if _same_vert:
+            s += 6                                   # STRONGLY prefer same-vertical footage
+        if want_scene and want_scene in (t.get("scene") or "").lower():
+            s += 2
+        s -= 1.5 * float(t.get("face_score") or 0)   # b-roll is scenic → LOW face_score wins
+        scored.append((s, url, _cv, _same_vert))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # RELEVANCE FILTER: when we know the vertical AND we have clips tagged for it, return ONLY those —
+    # never pad a home-insurance ad with off-vertical footage (e.g. an auto clip) just to fill time.
+    # If NOTHING matches the vertical, fall back to generic-tagged clips (untagged vertical), and only
+    # then to the full ranked set — so it still produces something when the library has no exact match.
+    if want_vert:
+        _match = [(s, u) for s, u, cv, sv in scored if sv]
+        if _match:
+            return [u for _, u in _match[:max(1, int(limit))]]
+        _generic = [(s, u) for s, u, cv, sv in scored if not cv]
+        if _generic:
+            return [u for _, u in _generic[:max(1, int(limit))]]
+    return [u for _, u, _cv, _sv in scored[:max(1, int(limit))]]
 
 
 async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_ratio: str,
