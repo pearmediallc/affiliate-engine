@@ -1900,9 +1900,15 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "2) write_ad_copy — user wants ad copy / primary text / captions:\n"
         '   {"action":"write_ad_copy","count":N,"ad_copies":[{"title":"...","text":"..."}]}  Cap N at 5.\n'
         "3) make_video — user wants to make/generate a video/creative/clip:\n"
-        '   {"action":"make_video","source":"last_script|last_ad_copy|none","prompt":"...","seconds":15}\n'
+        '   {"action":"make_video","source":"last_script|last_ad_copy|none","prompt":"...","seconds":15,'
+        '"request_type":"ugc|broll","gender":"female|male","age_band":"under35|45-55|55plus"}\n'
         "   If the user references a prior script (e.g. \"make a video from that script\"), set source=\"last_script\" "
         "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
+        "   CARRY THE BRIEF. request_type/gender/age_band are the format + casting the user asked for "
+        "   ANYWHERE in this conversation (including the brief you interviewed them for) — 'b-roll' or "
+        "   'no talking head' => request_type=broll, otherwise ugc; a stated person ('woman', 'under 35') "
+        "   sets gender/age_band. These used to be dropped here, so every request generated as UGC with "
+        "   no cast. Omit a field ONLY when the conversation truly never indicated it.\n"
         "4) make_image — user wants a still image/poster/photo:\n"
         '   {"action":"make_image","prompt":"..."}\n'
         "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
@@ -1933,8 +1939,17 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             src = str(out.get("source") or "none").lower()
             if src not in ("last_script", "last_ad_copy", "none"):
                 src = "none"
+            # CARRY THE BRIEF THROUGH. This dict used to whitelist prompt+seconds only, so the
+            # format and casting the user asked for were parsed by the model and then dropped
+            # right here — which is why every Studio job generated as UGC with no cast.
+            _rt = str(out.get("request_type") or "").lower()
+            _gd = str(out.get("gender") or "").lower()
+            _ab = str(out.get("age_band") or "").lower()
             return {"action": "make_video", "source": src,
-                    "prompt": (out.get("prompt") or message).strip(), "seconds": int(out.get("seconds") or 15)}
+                    "prompt": (out.get("prompt") or message).strip(), "seconds": int(out.get("seconds") or 15),
+                    "request_type": _rt if _rt in ("ugc", "broll") else None,
+                    "gender": _gd if _gd in ("female", "male") else None,
+                    "age_band": _ab if _ab in ("under35", "45-55", "55plus") else None}
         if action == "make_image":
             return {"action": "make_image", "prompt": (out.get("prompt") or message).strip()}
         return {"action": "reply", "text": (out.get("text") or "Tell me what you'd like to make.").strip()}
@@ -3681,7 +3696,15 @@ async def recipe_generate(req: RunRequest) -> list:
         # talking-head ask that ALSO has a castable avatar and NO reference video to imitate. Scenic /
         # b-roll (is_talk False) and winner-reference jobs (video_urls) are untouched → still t2v, and
         # the existing castable-avatar guard below still decides the final fall-through.
-        if not _avatar_plan and is_talk and not video_urls:
+        # An EXPLICIT b-roll ask outranks both signals below. is_talk is only a heuristic
+        # (len(script) >= 20 words), and every ad script — including a b-roll VOICEOVER script —
+        # clears that bar, so this gate used to hijack every b-roll request into a talking head no
+        # matter what the user asked for. request_type is a stated intent, not a guess: it wins.
+        _asked_broll = str(assets.get("request_type") or "").lower() == "broll"
+        if _asked_broll and _avatar_plan:
+            _avatar_plan = False
+            logger.info("[generate] request_type=broll → overriding talking-head plan, staying t2v")
+        if not _avatar_plan and is_talk and not video_urls and not _asked_broll:
             _cl0 = req.assets if isinstance(req.assets, dict) else {}
             if _cl0.get("fallback_avatar_url") or _cl0.get("library_avatar_url"):
                 _avatar_plan = True
