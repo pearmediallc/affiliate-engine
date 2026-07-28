@@ -3547,6 +3547,8 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
             req.assets = {**(req.assets or {}),
                           "character_video_url": avatar_url,
                           "script": prompt,
+                          # propagate verbatim so the fallback lip-sync honors allow_rewrite:false too
+                          **({"script_mode": "verbatim"} if not _rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}) else {}),
                           "seconds": int(seconds),
                           "vertical": _vert}
             logger.warning(f"[generate] all t2v providers down — re-routing to avatar-lipsync on "
@@ -3851,6 +3853,10 @@ async def recipe_generate(req: RunRequest) -> list:
                               "script": _spoken_script,
                               "gender": (assets.get("gender") or "female"),
                               "age_band": assets.get("age_band"),
+                              # PROPAGATE the verbatim decision so recipe_avatar_lipsync (which reads
+                              # script_mode) honors an allow_rewrite:false that arrived flag-only.
+                              **({"script_mode": "verbatim"} if not _rewrite_allowed(assets) else {}),
+                              "allow_rewrite": _rewrite_allowed(assets),
                               "seconds": int(seconds), "vertical": _vert}
                 logger.info(f"[generate] plan → avatar_lipsync; running funded lip-sync on {_cast_url}")
                 try:
@@ -4661,7 +4667,11 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 _sdb.close()
         except Exception:
             pass
-    verbatim = bool(base) and _script_mode_pin == "verbatim"
+    # HONOR THE REWRITE TOGGLE (not just script_mode). This lane runs its OWN writer (strategize_
+    # and_write + critic) and does NOT go through run_creative_team, so the office short-circuit
+    # never protects it. A job carrying allow_rewrite:false must be verbatim even if the caller
+    # didn't ALSO set script_mode="verbatim" — otherwise the avatar rewrites the user's script.
+    verbatim = bool(base) and (_script_mode_pin == "verbatim" or not _rewrite_allowed(a))
     # SCRIPT axis: ask the writer for the index-th DISTINCT script (a different hook AND angle). Only
     # applies when we're actually writing — a verbatim user script can't be rewritten, so the script
     # axis degrades to varying the HOOK only (handled after the script is finalized, below).
