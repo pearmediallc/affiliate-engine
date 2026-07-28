@@ -12,6 +12,8 @@ Set ELEVENLABS_API_KEY to enable. Until then, is_configured() is False and calle
 fall back (e.g. to Gemini TTS) or skip voiced rewrites — no key is hard-coded here.
 """
 import logging
+from typing import Optional
+
 import httpx
 
 from ..config import settings
@@ -58,14 +60,25 @@ class ElevenLabsService:
         return voice_id
 
     @staticmethod
-    def tts(voice_id: str, text: str, out_path: str) -> str:
-        """Synthesize `text` in the given voice -> write mp3 to out_path."""
+    def tts(voice_id: str, text: str, out_path: str, delivery: Optional[str] = None) -> str:
+        """Synthesize `text` in the given voice -> write mp3 to out_path.
+
+        `delivery` is the emotion/pacing direction. A non-empty direction makes the read EXPRESSIVE:
+        voice_settings.style is raised above 0 and stability lowered, so the voice ACTS instead of
+        reading flat. SSML <break .../> tags in `text` are passed through untouched — eleven_
+        multilingual_v2 honors them natively — so budgeted pauses land where the caller put them."""
         if not ElevenLabsService.is_configured():
             raise RuntimeError("ELEVENLABS_API_KEY not configured")
+        expressive = bool((delivery or "").strip())
         body = {
             "text": text,
             "model_id": _TTS_MODEL,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.0, "speed": VOICE_SPEED},
+            "voice_settings": {
+                "stability": 0.35 if expressive else 0.5,   # lower = more emotive/varied
+                "similarity_boost": 0.8,
+                "style": 0.45 if expressive else 0.0,        # >0 = expressive delivery (was always flat)
+                "speed": VOICE_SPEED,
+            },
         }
         with httpx.stream("POST", f"{_BASE}/text-to-speech/{voice_id}",
                           headers=ElevenLabsService._headers(json_ct=True),

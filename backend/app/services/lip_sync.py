@@ -360,9 +360,15 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     # videos (ours are 20-45s), so it rejects every real avatar clip with "Video size is too large"
     # after a ~12min wait — a guaranteed dead end, not a cheap lane. Its $0.17/min headline rate is
     # unreachable for full-length UGC. Kept selectable via `prefer` for short clips only.
-    chain = (["sync", "veed", "falsync", "latentsync", "wav2lip"] if quality == "premium"
-             else ["veed", "sync", "falsync", "latentsync", "wav2lip"])
-    # 'veed' is NEVER in a default chain — hero-only, and only when explicitly asked for via `prefer`.
+    # FINAL ORDER — 'veed' is DELIBERATELY absent from every default chain (it is the priciest lane,
+    # ~$4.20/min, and hero-only, reachable solely via an explicit prefer="veed"). sync.so blends the
+    # mouth/jaw seam best AND runs on a free credit, so it LEADS both chains; then the cheaper fal
+    # (falsync) and Replicate (latentsync/wav2lip) lanes. This fixes the old contradiction where the
+    # comment said "veed is NEVER default" yet veed sat FIRST — so every bulk render silently took the
+    # single most expensive lane on the market.
+    #   premium & bulk: sync.so → falsync → latentsync → wav2lip
+    chain = (["sync", "falsync", "latentsync", "wav2lip"] if quality == "premium"
+             else ["sync", "falsync", "latentsync", "wav2lip"])
     if not settings.replicate_usable:
         chain = [p for p in chain if p not in ("latentsync", "wav2lip")]
     order, seen, errors = [], set(), []

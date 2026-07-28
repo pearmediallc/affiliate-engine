@@ -3122,6 +3122,7 @@ async def recipe_full_ad(req: RunRequest) -> list:
                 model=b.get("model") or "seedance-2", action=b.get("action", "talks to camera"),
                 request_type=b.get("request_type", "ugc"), entity_desc=entity_desc,
                 environment=b.get("environment", ""), line=line, vertical=vertical,
+                emotion=b.get("emotion", ""), gesture=b.get("gesture", ""),
                 n_reference_images=1 if anchor_url else 0)
             beat_model = b.get("model") or MultiProviderVideoService.route_capability("reference_to_video", req.model)
 
@@ -3226,7 +3227,10 @@ async def recipe_from_assets(req: RunRequest) -> list:
             img = image_urls[i % len(image_urls)]      # cycle images across beats
             line = b.get("line", "")
             b["prompt"] = b.get("prompt") or rpe.build_prompt(
-                model=i2v_model, action="the scene comes alive with subtle natural motion",
+                model=i2v_model,
+                # use the beat's REAL directed action (so walking/entering actually renders); only
+                # fall back to a neutral motion when the director gave this beat none.
+                action=(b.get("action") or "the scene comes alive with subtle natural motion"),
                 request_type="broll", environment="the scene in the provided image",
                 vertical=vertical, n_reference_images=1)
 
@@ -3620,7 +3624,10 @@ async def _mux_tts_voiceover(req: "RunRequest", video_path: str, vo_script: str,
             return False
         from ..services import voice_studio as vs
         vo = os.path.join(work, f"vo_{req.request_id[:8]}.mp3")
-        res = await asyncio.to_thread(lambda: vs.synthesize(vo_script, out_path=vo))
+        # pass a delivery direction so the recovery VO is expressive, not the flat default read.
+        res = await asyncio.to_thread(lambda: vs.synthesize(
+            vo_script, out_path=vo,
+            style="natural, expressive, conversational, talking to camera, never flat or monotone"))
         if not (res and os.path.exists(vo)):
             return False
         _track_cost(req.request_id, "voice", res.get("provider") or "openai", model=str(res.get("voice")),
@@ -4361,6 +4368,79 @@ def _trim_to_sentence(script: str, target_sec: float, wps: float = 2.6) -> str:
     return " ".join(out).strip() or script
 
 
+# Tone words that signal a NON-NEUTRAL emotional delivery → lead with an expressive real voice
+# provider (over the clone) for that synthesis. Neutral registers keep the clone for timbre.
+_EMOTIONAL_TONES = ("excited", "energetic", "urgent", "passionate", "emotional", "upbeat", "bold",
+                    "dramatic", "hopeful", "relief", "frustrat", "angry", "worried", "anxious",
+                    "sad", "joyful", "happy", "surprised", "serious", "empath")
+
+
+def _insert_break_pauses(script: str, older: bool = False) -> str:
+    """Insert budgeted SSML <break> pauses BETWEEN sentences so the read breathes — without adding
+    a single word. Older characters get a slightly longer beat. ElevenLabs honors these tags
+    natively; other providers strip them (the sentence's own period still gives a natural pause).
+    The LENGTH GUARDRAIL at the call site re-tightens so the added pauses never lengthen the video."""
+    br = 0.3 if older else 0.2
+    sents = [s for s in re.split(r"(?<=[.!?])\s+", (script or "").strip()) if s]
+    if len(sents) <= 1:
+        return script or ""
+    return f' <break time="{br}s"/> '.join(sents)
+
+
+def _avg_rgb(path: str) -> Optional[tuple]:
+    """Average (R,G,B) 0-255 of a clip — a few sampled frames each downscaled to 1x1. Used to tone-
+    match the lip-synced output back to the original character clip. Returns None on any probe failure."""
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+             "-vf", "fps=2,scale=1:1,format=rgb24", "-frames:v", "6", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=60)
+        data = p.stdout or b""
+        n = len(data) // 3
+        if n < 1:
+            return None
+        rs = sum(data[i * 3] for i in range(n)) / n
+        gs = sum(data[i * 3 + 1] for i in range(n)) / n
+        bs = sum(data[i * 3 + 2] for i in range(n)) / n
+        return (rs, gs, bs)
+    except Exception:
+        return None
+
+
+async def _color_match_to_reference(synced_path: str, ref_url: str, request_id: str) -> Optional[str]:
+    """POST-SYNC tone match. Lip-sync repaints the mouth region, whose tone can drift from the rest
+    of the face/body and leave a visible seam. Pull mean-color stats from the ORIGINAL character clip
+    and nudge the synced output's overall tone back toward it with a light per-channel gain + tiny
+    brightness correction (colorchannelmixer + eq — NO grain, NO resolution change). Best-effort:
+    returns a new path on success, else None so the caller keeps the un-matched clip (never breaks)."""
+    try:
+        ref_local = ref_url
+        if isinstance(ref_url, str) and ref_url.startswith("http"):
+            ref_local = await _download_to_temp(ref_url, ".mp4")
+        rmean = await asyncio.to_thread(_avg_rgb, ref_local)
+        smean = await asyncio.to_thread(_avg_rgb, synced_path)
+        if not (rmean and smean):
+            return None
+        # per-channel gain toward the reference, CLAMPED to ±10% so a seam-fix never grades the clip
+        gains = [max(0.9, min(1.1, (r / s) if s > 1 else 1.0)) for r, s in zip(rmean, smean)]
+        rl = 0.299 * rmean[0] + 0.587 * rmean[1] + 0.114 * rmean[2]
+        sl = 0.299 * smean[0] + 0.587 * smean[1] + 0.114 * smean[2]
+        bri = max(-0.06, min(0.06, (rl - sl) / 255.0))     # small, clamped brightness nudge
+        # skip when nothing meaningfully differs (avoid a pointless re-encode)
+        if all(abs(g - 1.0) < 0.01 for g in gains) and abs(bri) < 0.004:
+            return None
+        vf = (f"colorchannelmixer=rr={gains[0]:.3f}:gg={gains[1]:.3f}:bb={gains[2]:.3f},"
+              f"eq=brightness={bri:.3f}")
+        out = synced_path.rsplit(".", 1)[0] + "_cm.mp4"
+        await asyncio.to_thread(_ffmpeg, ["-i", synced_path, "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "copy", out], 300)
+        return out if os.path.exists(out) else None
+    except Exception as e:
+        logger.warning(f"[avatar-lipsync] color match failed for {request_id}: {e}")
+        return None
+
+
 async def _cover_audio_with_footage(char_url: str, need_sec: float, request_id: str) -> str:
     """Guarantee the base clip is at least as long as the voice-over.
 
@@ -4788,22 +4868,47 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             _set_lipsync_status(req.request_id, "failed", str(_ve)[:250])
             raise RuntimeError(str(_ve))
     out_audio = os.path.join(UPLOAD_DIR, f"vo_{req.request_id[:8]}.mp3")
-    # TELL the model who is speaking. Casting a "55plus" voice is not enough on its own — the
+    # TELL the model who is speaking AND how. Casting a "55plus" voice is not enough on its own — the
     # delivery has to be directed too, or a 70-year-old woman on screen is read by a bright
-    # 30-something. Gemini/OpenAI both steer delivery from plain English.
+    # 30-something. Gemini/OpenAI/ElevenLabs all steer delivery from plain English, so we add an
+    # expressive per-line pacing note (never flat/monotone).
     _style = ", ".join(x for x in [
         vs.age_style(a.get("age_band"), a.get("gender")),
         (a.get("tone") or "warm"),
-        "conversational, talking to camera",
+        "conversational, talking to camera, expressive with natural pauses between sentences, never flat or monotone",
     ] if x)
+    # BUDGETED PAUSES (no new words): short SSML <break>s between sentences so the read breathes;
+    # older characters pause a touch longer. Kept OUT of `script` so captions still align on the words.
+    _older = (a.get("age_band") in ("55plus", "45-55"))
+    _tts_text = _insert_break_pauses(script, older=_older)
+    # When the register is non-neutral, lead with an expressive real voice over the clone (clone stays
+    # as fallback for timbre). Neutral tone → unchanged (clone/cast voice leads).
+    _emotional_delivery = any(w in (a.get("tone") or "").lower() for w in _EMOTIONAL_TONES)
     voice_res = await asyncio.to_thread(lambda: vs.synthesize(
-        script, voice_id=("fal-clone:character" if sample_url else voice_id),
+        _tts_text, voice_id=("fal-clone:character" if sample_url else voice_id),
         sample_url=sample_url, out_path=out_audio, style=_style,
-        fallback_voice_id=voice_id,
+        fallback_voice_id=voice_id, prefer_expressive=_emotional_delivery,
         # what the character actually SAYS in the reference clip — improves clone fidelity
         ref_text=(a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
+    # ── LENGTH GUARDRAIL (never lengthen the video) ─────────────────────────────────────────────
+    # The added pauses + expressive read can push the narration past the requested target. KEEP every
+    # word and pause, but nudge delivery SPEED (atempo, cap 1.15x) so it fits — the speed dial absorbs
+    # the pauses. atempo only ever speeds UP, so the video is never made longer than the natural read.
+    _target_sec = float(seconds)
+    _nar_sec = await asyncio.to_thread(_audio_seconds, out_audio)
+    if _target_sec > 0 and _nar_sec > _target_sec:
+        _sf = min(1.15, _nar_sec / _target_sec)
+        if _sf > 1.001:
+            _fitp = out_audio.rsplit(".", 1)[0] + "_sf.mp3"
+            try:
+                await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={_sf:.3f}", _fitp], 120)
+                out_audio = _fitp
+                logger.info(f"[avatar-lipsync] narration {_nar_sec:.1f}s > target {_target_sec:.0f}s "
+                            f"→ atempo {_sf:.3f}x to fit (no lengthening)")
+            except Exception as _sfe:
+                logger.warning(f"[avatar-lipsync] speed-fit skipped: {_sfe}")
     # ── DURATION POLICY ───────────────────────────────────────────────────────────────────────
     # NEVER cram the script into the asked-for seconds. The old code sped the VO up by as much as
     # 1.35x to squeeze under sync.so's old 20s free cap — that is exactly what made the delivery
@@ -4930,6 +5035,19 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         _set_lipsync_status(req.request_id, "failed", f"lip-sync timed out on {sub['provider']}")
         raise RuntimeError("lip-sync timed out")
     act.finish("shots", req.request_id, t2, detail=f"lip-sync via {sub['provider']}")
+
+    # ── POST-SYNC TONE-SEAM MATCH ───────────────────────────────────────────────────────────────
+    # The synced clip's repainted mouth region can drift in tone from the rest of the face/body,
+    # leaving a visible seam. Nudge the whole frame back toward the ORIGINAL character clip's color
+    # (best-effort; NO grain, NO resolution change). On ANY failure keep the un-matched video.
+    try:
+        _synced_local = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
+        _matched = await _color_match_to_reference(_synced_local, char_url, req.request_id)
+        if _matched:
+            result = {"local_path": _matched}   # downstream re-encodes from the tone-matched master
+    except Exception as _cme:
+        logger.warning(f"[avatar-lipsync] post-sync tone match skipped: {_cme}")
+
     # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
     # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
     # are per-prediction. sync.so uses a free credit → $0.

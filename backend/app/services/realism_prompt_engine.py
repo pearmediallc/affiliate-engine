@@ -76,6 +76,64 @@ def _mentions(model: str, n_images: int, has_video: bool) -> str:
     return out
 
 
+# ── Emotion → PHYSICAL, on-camera cue ─────────────────────────────────────────
+# The Director writes an abstract emotion per beat (e.g. "frustration"). Handed to a video model as
+# the bare adjective it reads FLAT; handed the full ad copy it reads STAGED/exaggerated. So we render
+# the FEELING as a visible face/body direction (brows, jaw, mouth, shoulders) instead.
+_EMOTION_CUES = {
+    "frustrat":   "brows drawn together, jaw tight, tense mouth",
+    "anger":      "brows lowered and pulled in, jaw set, lips pressed",
+    "angry":      "brows lowered and pulled in, jaw set, lips pressed",
+    "worr":       "brows raised and knitted, faint forehead tension, uneasy mouth",
+    "anxi":       "brows raised and knitted, faint forehead tension, uneasy mouth",
+    "stress":     "brows knitted, tight jaw, pressed lips",
+    "fear":       "widened eyes, raised brows, breath held",
+    "scared":     "widened eyes, raised brows, breath held",
+    "sad":        "inner brows lifted, downturned mouth, heavy eyes",
+    "relief":     "shoulders drop, soft exhale, easing smile",
+    "reliev":     "shoulders drop, soft exhale, easing smile",
+    "happy":      "genuine crow's-feet smile, lifted cheeks, bright eyes",
+    "happ":       "genuine crow's-feet smile, lifted cheeks, bright eyes",
+    "joy":        "genuine crow's-feet smile, lifted cheeks, bright eyes",
+    "excit":      "wide bright eyes, animated open smile, lively brows",
+    "surpris":    "raised brows, widened eyes, parted lips",
+    "confiden":   "steady level gaze, relaxed set jaw, slight assured smile",
+    "hope":       "soft lifted brows, gentle forward lean, warming smile",
+    "sincere":    "soft steady eye contact, relaxed brow, gentle honest mouth",
+    "warm":       "soft eyes, easy natural smile, relaxed face",
+    "calm":       "relaxed brow, even gaze, unhurried soft mouth",
+    "relaxed":    "relaxed brow, even gaze, unhurried soft mouth",
+    "serious":    "level focused gaze, settled brow, composed mouth",
+    "empath":     "softened brows, understanding eyes, gentle mouth",
+    "reassur":    "soft eyes, calm nod, gentle steady smile",
+}
+_NEUTRAL_CUE = "relaxed natural expression, soft steady eye contact"
+# intensity words in the emotion string scale how much tension/wrinkling shows, so lines that don't
+# call for it stay relaxed (no permanent "angry" wrinkles on a calm sentence).
+_STRONG_WORDS = ("very", "intense", "strong", "deep", "extreme", "overwhelm",
+                 "furious", "terrified", "ecstatic", "desperate", "raw")
+_MILD_WORDS = ("slight", "mild", "faint", "subtle", "gentle", "soft", "little", "hint")
+
+
+def _emotion_cue(emotion: str = "", gesture: str = "") -> str:
+    """Render a beat's abstract emotion as a VISIBLE, physical on-camera direction (brows/jaw/mouth/
+    shoulders) plus any directed gesture. Never emits the bare adjective (reads flat) or the ad copy
+    (reads staged). Intensity words scale added tension/wrinkles so it only shows when the line calls
+    for it. Empty emotion → a neutral relaxed cue."""
+    e = (emotion or "").strip().lower()
+    cue = _NEUTRAL_CUE
+    if e:
+        cue = next((v for k, v in _EMOTION_CUES.items() if k in e), None) or _NEUTRAL_CUE
+    if e and any(w in e for w in _STRONG_WORDS):
+        cue += ", visible muscle tension and fine expression lines"
+    elif e and any(w in e for w in _MILD_WORDS):
+        cue += ", understated and barely-there"
+    g = (gesture or "").strip()
+    if g:
+        cue += f"; {g}"
+    return cue
+
+
 def build_prompt(
     *,
     model: str,
@@ -86,6 +144,8 @@ def build_prompt(
     camera: Optional[str] = None,      # override; else the request-type profile's camera
     lighting: Optional[str] = None,    # override; else the profile's lighting
     line: Optional[str] = None,        # exact spoken line (for lip-sync)
+    emotion: str = "",                 # the beat's abstract emotion (rendered as a physical face cue)
+    gesture: str = "",                 # one natural directed gesture for the beat
     vertical: str = "",
     n_reference_images: int = 0,
     has_reference_video: bool = False,
@@ -108,7 +168,8 @@ def build_prompt(
     parts.append(f"Lighting: {lit}.")                                 # 4) lighting
     parts.append(f"Action (one continuous motion, no cuts): {action.strip()}.")   # 5) one action
     if line:
-        parts.append(f'They say exactly: "{line.strip()}" with matching lip movement and natural expression.')
+        parts.append(f'They say exactly: "{line.strip()}" with matching lip movement, '
+                     f'{_emotion_cue(emotion, gesture)}.')
     parts.append(prof["look"])                                        # 6) request-type aesthetic (anti-slop)
     # NOTE: appending REALISM_LAYER here was tried and REVERTED — doubling the distortion terms on top
     # of prof["look"] pushed the model to over-distort (warped/animated faces). prof["look"] alone.

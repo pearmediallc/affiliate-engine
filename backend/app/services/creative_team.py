@@ -475,6 +475,7 @@ async def director(*, script: str, request_type: str, vertical: str) -> list:
 You are the Director on a creative team. For each spoken beat below, direct the
 performance for a realistic vertical ad. ONE continuous physical action per beat (never sequence
 two actions). Emotions and gestures must feel candid, not staged.
+When the line or scene implies locomotion (walking, entering, leaving, sitting down), the `action` MUST name that movement so the render matches it.
 
 REQUEST TYPE: {request_type}   VERTICAL: {vertical}
 BEATS (in order):
@@ -589,6 +590,8 @@ def prompt_writer(*, beats: list, entity_desc: str, vertical: str,
             entity_desc=entity_desc if b.get("shot_type") == "talking_head" else "",
             environment=b.get("environment", ""),
             line=b.get("line") if b.get("shot_type") == "talking_head" else None,
+            emotion=b.get("emotion", ""),
+            gesture=b.get("gesture", ""),
             vertical=vertical,
             n_reference_images=n_reference_images,
             has_reference_video=has_reference_video,

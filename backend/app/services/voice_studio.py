@@ -189,11 +189,21 @@ def age_style(age_band: str | None, gender: str | None = None) -> str:
     it to — Gemini/OpenAI steer delivery from plain English, so we always tell them who's talking."""
     who = "woman" if (gender or "female") == "female" else "man"
     return {
-        "55plus":  f"an elderly {who} in her seventies, warm and unhurried, softer and a little frail"
-                   if who == "woman" else
-                   f"an elderly man in his seventies, warm and unhurried, weathered",
-        "45-55":   f"a mature {who} in her fifties, grounded and trustworthy"
-                   if who == "woman" else f"a mature man in his fifties, grounded and trustworthy",
+        # Older reads must be EXPRESSIVE, not flat: explicit pauses between clauses + gentle rising/
+        # falling intonation + slight slowness, and NEVER a monotone/flat instruction (that was the
+        # old "warm and unhurried" collapsing into a drone).
+        "55plus":  (f"an elderly {who} in her seventies: expressive and warm, taking natural pauses "
+                    f"between clauses, gentle rising and falling intonation, a little slow and soft "
+                    f"but never flat or monotone"
+                    if who == "woman" else
+                    f"an elderly man in his seventies: expressive and warm, taking natural pauses "
+                    f"between clauses, gentle rising and falling intonation, a little slow and "
+                    f"weathered but never flat or monotone"),
+        "45-55":   (f"a mature {who} in her fifties: grounded and trustworthy, unhurried with natural "
+                    f"pauses between clauses and gentle intonation, never flat or monotone"
+                    if who == "woman" else
+                    f"a mature man in his fifties: grounded and trustworthy, unhurried with natural "
+                    f"pauses between clauses and gentle intonation, never flat or monotone"),
         "35-44":   f"a {who} in her late thirties, natural and conversational"
                    if who == "woman" else f"a man in his late thirties, natural and conversational",
         "under35": f"a young {who} in her late twenties, casual and upbeat"
@@ -433,18 +443,20 @@ def _syn_chatterbox(text: str, out_path: str, *, voice_name: Optional[str] = Non
     return {"provider": "chatterbox", "voice": "cloned", "cost_usd": 0.002}
 
 
-def _syn_elevenlabs(text: str, voice_id: str, out_path: str) -> dict:
+def _syn_elevenlabs(text: str, voice_id: str, out_path: str, style: Optional[str] = None) -> dict:
     from .elevenlabs_service import ElevenLabsService
     if not ElevenLabsService.is_configured():
         raise RuntimeError("no elevenlabs key")
-    ElevenLabsService.tts(voice_id, text, out_path)
+    # pass the delivery direction through — EL raises voice_settings.style + lowers stability on it
+    # so the read is expressive, not flat.
+    ElevenLabsService.tts(voice_id, text, out_path, delivery=style)
     return {"provider": "elevenlabs", "voice": voice_id, "cost_usd": len(text) / 1000 * 0.05}
 
 
 def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[str] = None,
                style: Optional[str] = None, sample_url: Optional[str] = None,
                cloned: Optional[list] = None, fallback_voice_id: Optional[str] = None,
-               ref_text: Optional[str] = None) -> dict:
+               ref_text: Optional[str] = None, prefer_expressive: bool = False) -> dict:
     """
     Synthesize `text` in the chosen voice, cheapest-first with automatic fallback.
     - voice_id like 'kokoro:af_sarah' / 'openai:nova' / 'deepgram:aura-2-hera-en'
@@ -509,6 +521,14 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
     # and skip any provider whose key isn't configured.
     avail = available_providers()
     order = ([provider] if provider else []) + ([fb["provider"]] if fb else []) + FALLBACK_ORDER
+    # When the line's emotion is non-neutral, LEAD with a real EXPRESSIVE provider (OpenAI
+    # gpt-4o-mini-tts / Gemini / ElevenLabs) over the voice-clone — the clone stays in the chain as
+    # fallback for timbre/neutral lines. Only reorders when such a provider is actually available, so
+    # the existing fallback chain is never broken.
+    if prefer_expressive:
+        _expr = [p for p in ("openai", "gemini", "elevenlabs") if p in avail]
+        if _expr:
+            order = _expr + order
     order = [p for i, p in enumerate(order) if p in avail and p not in order[:i]]
     errors = []
     for prov in order:
@@ -530,7 +550,7 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
                 ev = _native_for("elevenlabs") or ((_eleven_voices() or [{}])[0].get("id", ":").split(":", 1)[-1])
                 if not ev:
                     raise RuntimeError("no ElevenLabs voice available to this account")
-                res = _syn_elevenlabs(text, ev, out_path)
+                res = _syn_elevenlabs(text, ev, out_path, style)
             else:
                 continue
             res["path"] = out_path
@@ -539,7 +559,9 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
             if res["fallback"]:
                 # Say EXACTLY what happened — a silent swap is how "I picked Sarah and got Nova"
                 # goes unnoticed. errors[0] is why the chosen provider refused.
-                res["fallback_reason"] = (errors[0] if errors else f"{provider} unavailable")[:160]
+                res["fallback_reason"] = (errors[0] if errors else (
+                    "preferred an expressive provider for the emotional delivery" if prefer_expressive
+                    else f"{provider} unavailable"))[:160]
                 logger.warning(f"voice_studio: requested {voice_id} ({provider}) → USED {prov}:{res.get('voice')} "
                                f"— reason: {res['fallback_reason']}")
             return res

@@ -91,7 +91,7 @@ class SpeechGeneratorService:
             # Try OpenAI TTS first (primary)
             if settings.openai_api_key:
                 logger.info(f"Attempting OpenAI TTS with voice: {voice}")
-                return await self._generate_with_openai_tts(text, voice, language, output_format)
+                return await self._generate_with_openai_tts(text, voice, language, output_format, style)
         except Exception as openai_e:
             logger.warning(f"OpenAI TTS failed: {str(openai_e)}, trying Google Cloud TTS")
 
@@ -102,7 +102,8 @@ class SpeechGeneratorService:
 
         raise Exception("No TTS provider available - configure OpenAI or Google Cloud API keys")
 
-    async def _generate_with_openai_tts(self, text: str, voice: str, language: str, output_format: str) -> dict:
+    async def _generate_with_openai_tts(self, text: str, voice: str, language: str, output_format: str,
+                                        style: Optional[str] = None) -> dict:
         """Generate speech using OpenAI TTS API"""
         # Map our voices to OpenAI voices
         voice_map = {
@@ -125,16 +126,29 @@ class SpeechGeneratorService:
             "Authorization": f"Bearer {settings.openai_api_key}",
             "Content-Type": "application/json",
         }
+        # gpt-4o-mini-tts is the expressive, steerable model — `instructions` carry the delivery
+        # direction (emotion + pacing). Keep tts-1-hd as the fallback if the new model errors on this key.
+        model = "gpt-4o-mini-tts"
         payload = {
-            "model": "tts-1-hd",  # High definition TTS
+            "model": model,
             "input": text,
             "voice": openai_voice,
             "response_format": "mp3",
         }
+        if style:
+            payload["instructions"] = (
+                f"Speak in a {style} tone, natural and human, expressive not flat, "
+                f"with natural pauses between sentences.")
 
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code != 200:
-            raise Exception(f"OpenAI TTS API error: {response.text}")
+            # new model may be unavailable on some keys → fall back to tts-1-hd
+            model = "tts-1-hd"
+            payload["model"] = model
+            payload.pop("instructions", None)
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                raise Exception(f"OpenAI TTS API error: {response.text}")
 
         audio_data = response.content
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
@@ -146,7 +160,7 @@ class SpeechGeneratorService:
         logger.info(f"Speech generated successfully with OpenAI TTS ({len(audio_data)} bytes)")
 
         char_count = len(text or "")
-        cost_usd = Pricing.tts(char_count, "tts-1-hd")
+        cost_usd = Pricing.tts(char_count, model)
 
         return {
             "audio_base64": audio_base64,
@@ -156,7 +170,7 @@ class SpeechGeneratorService:
             "voice": voice,
             "language": language,
             "format": "mp3",
-            "model": "tts-1-hd",
+            "model": model,
             "provider": "openai",
             "char_count": char_count,
             "cost_usd": cost_usd,
