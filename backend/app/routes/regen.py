@@ -3754,10 +3754,17 @@ async def recipe_generate(req: RunRequest) -> list:
                 # of the avatar's mouth as a HOME-insurance story with a neighbour and a state that
                 # nobody wrote: the vertical DNA rewrite always outranked the user's own words.
                 _spoken_script = ""
+                # UNIVERSAL RULE (every path — Studio, Avatar Studio, loser regeneration, API):
+                # if a script was PROVIDED, the office never rewrites it. Verbatim is the DEFAULT
+                # whenever assets.script exists; only an explicit rewrite/modify mode opts out. Not
+                # keyed on a per-caller flag on purpose — a new caller that forgets the flag must
+                # still get the user's words, because forgetting it silently ships a rewrite.
                 _user_script = (assets.get("script") or "").strip()
-                if str(assets.get("script_mode") or "").lower() == "verbatim" and _user_script:
+                _smode = str(assets.get("script_mode") or "").lower()
+                if _user_script and _smode not in ("rewrite", "modify"):
                     _spoken_script = _user_script
-                    logger.info("[generate] user-supplied verbatim script — NOT using the office rewrite")
+                    logger.info("[generate] script provided by caller — speaking it VERBATIM, "
+                                "office rewrite not used")
                 try:
                     _spoken_script = _spoken_script or (plan.get("script") or "").strip()
                     if not _spoken_script:
