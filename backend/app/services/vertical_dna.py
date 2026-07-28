@@ -16,8 +16,8 @@ Add a new vertical's NEED by distilling its scripts; the craft layer already cov
 CRAFT_DNA = """SCRIPT CRAFT (how our proven scripts convert — apply to EVERY script, any vertical):
 TONE: Conversational, authentic, peer-to-peer. Open on a personal anecdote of frustration or surprise. Empowering + lightly urgent — "don't make my mistake / you're not alone." Never corporate, stiff, or salesy.
 STRUCTURE (beats): 1) personal/relatable hook (a short story) -> 2) name the problem plainly -> 3) the simple fix / offer mechanism -> 4) show it's fast + easy -> 5) concrete proof (REAL numbers, a specific result) -> 6) direct CTA -> 7) reassurance (removes the obvious objection).
-SPECIFICITY (this is what makes it convert — never be vague): use REAL, concrete specifics relevant to the vertical — real dollar amounts/results, quantified time ("two minutes", "20 seconds"), real places/names, life or seasonal triggers, and relatable archetypes ("my dad", "my neighbor Linda"). Vague = dead.
-HOOK PATTERNS (pick one; vary across variations): personal story; direct question to the viewer; shared frustration; neighbor / social-proof reveal; targeted "this is for you if..." statement.
+SPECIFICITY (this is what makes it convert — never be vague): be concrete, but ONLY with specifics the user actually gave (their offer, their numbers, their story). NEVER FABRICATE: do not invent a person's name, a city/state, a company, or a dollar amount the user did not provide — invented specifics are false claims, not craft. When the user gave no number or name, stay truthful and generic ("save on your rate", "in a couple of minutes", "a friend told me") rather than making one up. Quantified time is fine when generic ("two minutes"). Vague waffle is dead; so is fabrication.
+HOOK PATTERNS (pick one; vary across variations): personal story; direct question to the viewer; shared frustration; social-proof reveal (do NOT name a specific person unless the user provided one — use "a friend"/"someone I know"); targeted "this is for you if..." statement.
 CTA: direct + imperative; restate the speed and the benefit; end on reassurance (no obligation / no catch).
 AVOID (kills conversion): vague claims with no numbers; corporate jargon; making it sound slow or complicated; a generic impersonal ad voice; listing product features instead of the viewer's benefit; ignoring the obvious objection."""
 
@@ -27,7 +27,7 @@ VERTICAL_NEED = {
 PAIN: Homeowners feel overcharged and powerless as rates climb every year and loyalty goes unrewarded.
 DESIRE: financial relief + peace of mind with the SAME coverage.
 MECHANISM: a quick online comparison — enter zip, compare quotes, find a lower rate.
-SIGNATURE SPECIFICS: real dollar swings ("$289/mo down to $62/mo"); "same / comparable coverage"; "your zip code"; seasonal/life triggers ("after hail season", "mortgage went up", "fixed income", "a neighbor mentioned it"); homeowner archetypes ("my dad in San Antonio").""",
+SIGNATURE LANGUAGE (phrasing patterns — NOT facts to invent): "same / comparable coverage"; "your zip code"; the idea of a dollar swing WITHOUT inventing a specific figure the user didn't give (say "a lower rate" / "hundreds less" only if truthful); seasonal/life triggers ("after hail season", "mortgage went up", "fixed income"); a social-proof reveal ("a friend mentioned it") — never a named or located person the user didn't provide.""",
 }
 
 
@@ -45,6 +45,6 @@ def style_guide(vertical: str) -> str:
         return CRAFT_DNA + "\n" + need
     if key and key != "general":
         return (CRAFT_DNA + f"\nVERTICAL: {vertical}. Apply the craft above to THIS vertical — open on "
-                f"its core pain, state its offer/mechanism plainly, and use real specifics that fit "
-                f"{vertical} (real numbers, places, and relatable people for this audience).")
+                f"its core pain, state its offer/mechanism plainly. Use specifics that fit {vertical} "
+                f"ONLY when the user provided them; never invent numbers, names, or places.")
     return CRAFT_DNA

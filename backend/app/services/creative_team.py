@@ -825,6 +825,8 @@ async def run_creative_team(
     n_reference_images: int = 0,
     has_reference_video: bool = False,
     run_critic: bool = True,
+    user_script: str = "",
+    allow_rewrite: bool = True,
 ) -> dict:
     """Run the full team (led by the Creative Director) and return an executable CreativePlan:
     {plan, strategy, script, entity_desc, beats:[...], critique}. Every step reports live to the
@@ -854,16 +856,31 @@ async def run_creative_team(
         raise
 
     # 1+2) Strategist + Script Writer share ONE round-trip (merged), reported as both personas.
-    ts_s = act.start("strategist", job_id, "diagnosing loser vs winner")
-    ts_w = act.start("scriptwriter", job_id, "writing the script")
-    strategy, script = await strategize_and_write(
-        offer_desc=offer_desc, vertical=vertical, request_type=request_type,
-        loser_transcript=loser_transcript, loser_metrics=loser_metrics,
-        winner_hook=winner_hook, winner_transcript=winner_transcript)
-    act.finish("strategist", job_id, ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
-               helpfulness=1.0 if strategy.get("fix") else 0.5)
-    act.finish("scriptwriter", job_id, ts_w, ok=True, detail="script written",
-               helpfulness=min(1.0, len((script or "").split()) / 60))
+    # VERBATIM SHORT-CIRCUIT (single source of truth for EVERY lane). When the user supplied a
+    # script AND rewrite is not allowed, the office does NOT write a new script — it speaks the
+    # user's exact words. This is the ONE place every consumer reads (plan["script"] + beat lines),
+    # so fixing it here corrects t2v, full_ad, from_assets and both avatar lanes at once instead of
+    # per-lane patches. Default allow_rewrite=True keeps the existing improve-the-hook behavior.
+    _uscript = (user_script or "").strip()
+    if _uscript and not allow_rewrite:
+        ts_s = act.start("strategist", job_id, "honoring the user's script (no rewrite)")
+        strategy = {"diagnosis": "user supplied a final script; rewrite disabled",
+                    "fix": "speak the user's script verbatim", "verbatim": True}
+        script = _uscript
+        act.finish("strategist", job_id, ts_s, ok=True, detail="verbatim — user's script kept", helpfulness=1.0)
+        act.finish("scriptwriter", job_id, act.start("scriptwriter", job_id, "using the user's script verbatim"),
+                   ok=True, detail="verbatim (no rewrite)", helpfulness=1.0)
+    else:
+        ts_s = act.start("strategist", job_id, "diagnosing loser vs winner")
+        ts_w = act.start("scriptwriter", job_id, "writing the script")
+        strategy, script = await strategize_and_write(
+            offer_desc=offer_desc, vertical=vertical, request_type=request_type,
+            loser_transcript=loser_transcript, loser_metrics=loser_metrics,
+            winner_hook=winner_hook, winner_transcript=winner_transcript)
+        act.finish("strategist", job_id, ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
+                   helpfulness=1.0 if strategy.get("fix") else 0.5)
+        act.finish("scriptwriter", job_id, ts_w, ok=True, detail="script written",
+                   helpfulness=min(1.0, len((script or "").split()) / 60))
 
     # 3+4) Director (needs the script) and Character Manager (independent) run CONCURRENTLY.
     beats, character = await asyncio.gather(

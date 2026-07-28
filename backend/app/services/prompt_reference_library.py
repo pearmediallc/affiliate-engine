@@ -120,6 +120,15 @@ _ALIAS = {
     "animated": "animated", "animation": "animated", "cartoon": "animated",
     "testimonial": "testimonial", "review": "testimonial",
     "fast cuts": "fast_cuts", "viral": "fast_cuts",
+    # EXPLICIT entries for every remaining file-request type, so none SILENTLY collapses to the
+    # "ugc" default and becomes a talking head by accident (that trap is why "UGC + B-Roll" got no
+    # b-roll at all). "ugc + b-roll" is UGC-led with scenic inserts → keep it ugc-styled, but it is
+    # now a DELIBERATE mapping, not a fall-through.
+    "ugc + b-roll": "ugc", "ugc + broll": "ugc", "ugc+b-roll": "ugc", "ugc + b roll": "ugc",
+    "avatar lipsync": "ugc", "avatar lip-sync": "ugc",
+    "create from assets": "broll", "generate video": "ugc",
+    "reclean": "ugc", "reclean/minor mod": "ugc",
+    "stock": "broll", "image + vo": "image", "image+voiceover": "image",
 }
 
 MODEL_RULES = {
@@ -146,7 +155,19 @@ EXEMPLARS = [
 def _norm(request_type: str) -> str:
     rt = (request_type or "ugc").strip().lower()
     rt = _ALIAS.get(rt, rt)
-    return rt if rt in STYLE_PROFILES else "ugc"
+    if rt in STYLE_PROFILES:
+        return rt
+    # A request type we don't recognize collapses to "ugc" (talking head). That default is safe but
+    # it used to happen SILENTLY — a b-roll intent phrased in a way the alias table missed produced
+    # a talking head with no trace. Log it so a missing alias is greppable, not invisible.
+    try:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[prompt-ref] unknown request_type %r → defaulting to 'ugc' (talking head); "
+            "add an alias if this should be b-roll/scenic", request_type)
+    except Exception:
+        pass
+    return "ugc"
 
 
 def _model_family(model: str) -> str:

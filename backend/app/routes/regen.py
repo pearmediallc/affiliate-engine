@@ -2698,8 +2698,18 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         from ..services import winner_library
         _lw = winner_library.fetch_winners(req.context.get("vertical", ""), limit=1)
 
-        # ── PRIMARY: winner-clone (conversion-first) ──────────────────────────
-        if _lw:
+        # TRUE B-ROLL = NO on-camera person. The winner-clone branch below recreates a proven
+        # winning ad — but our winners are TALKING-HEAD competitor ads, so cloning one reproduces a
+        # talking head, which is exactly what a "b-roll" request must NOT be. So winner-clone is now
+        # OPT-IN (assets.allow_winner_clone) and the DEFAULT is real scenic footage (stock → AI
+        # scene, no face). This is the fix for "I asked for b-roll and got a talking head."
+        _allow_winner_clone = bool((req.assets or {}).get("allow_winner_clone")) if isinstance(req.assets, dict) else False
+        if _lw and not _allow_winner_clone:
+            logger.info("[broll] winner-clone would reproduce a talking head — skipping it; "
+                        "producing true scenic b-roll (no on-camera person)")
+
+        # ── PRIMARY: winner-clone (conversion-first) — OPT-IN ONLY ────────────
+        if _lw and _allow_winner_clone:
             ref_imgs = await _select_references(orig, work, offer_desc)
             winner_clip = await _prep_winner_clip(_lw[0]["url"], work)   # None if too long/failed
             if winner_clip:
@@ -3010,6 +3020,37 @@ async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -
     return clip                                  # bounded: return the last (best-effort) attempt
 
 
+def _rewrite_allowed(assets: dict) -> bool:
+    """Whether the creative office may REWRITE the caller's script (improve the hook). Default True
+    (the 'Improve my hook' toggle ships ON). Turned OFF explicitly via allow_rewrite=false OR the
+    legacy script_mode='verbatim'. One decision, read identically by every lane."""
+    if not isinstance(assets, dict):
+        return True
+    if "allow_rewrite" in assets:
+        return bool(assets.get("allow_rewrite"))
+    sm = str(assets.get("script_mode") or "").lower()
+    if sm == "verbatim":
+        return False
+    if sm in ("rewrite", "modify"):
+        return True
+    return True
+
+
+def _verbatim_user_script(assets: dict) -> str:
+    """The caller's OWN words to speak verbatim, or '' to let the office write. An explicit `script`
+    field always wins; when rewrite is disabled the `prompt` itself IS the user's script (some lanes
+    send the approved script only as the prompt). When rewrite is allowed we return '' so the office
+    writes normally (now WITHOUT the fabrication clauses removed from vertical_dna)."""
+    if not isinstance(assets, dict):
+        return ""
+    s = (assets.get("script") or "").strip()
+    if s:
+        return s
+    if not _rewrite_allowed(assets):
+        return (assets.get("prompt") or "").strip()
+    return ""
+
+
 async def recipe_full_ad(req: RunRequest) -> list:
     """Regeneration Composer — a full-length (~30-45s) UGC ad, composed the way editors do:
       script (enhanced loser + winner's hook angle) -> split into ONE-ACTION clips ->
@@ -3062,7 +3103,9 @@ async def recipe_full_ad(req: RunRequest) -> list:
             loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
             entity_desc=entity_desc,
             has_real_character=bool(anchor_url), has_winner_video=bool(lw),
-            n_reference_images=1 if anchor_url else 0)
+            n_reference_images=1 if anchor_url else 0,
+            user_script=_verbatim_user_script(req.assets if isinstance(req.assets, dict) else {}),
+            allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}))
         beats = (plan.get("beats") or [])[:4]   # cap 4 clips (~48s) to bound cost/time
         script = plan.get("script", transcript)
         if not beats:
@@ -3163,7 +3206,10 @@ async def recipe_from_assets(req: RunRequest) -> list:
             request_type=(req.variation_type if req.variation_type in ("broll", "Broll") else "broll"),
             model=req.model or "seedance-2", loser_transcript=script,
             loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
-            has_real_character=False, has_winner_video=False, n_reference_images=1)
+            has_real_character=False, has_winner_video=False, n_reference_images=1,
+            # from_assets ALWAYS has a user-provided script — honor it verbatim unless rewrite is on.
+            user_script=script,
+            allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}))
         beats = plan.get("beats") or []
         if not beats:
             beats = [{"i": i, "line": s, "prompt": "", "request_type": "broll"}
@@ -3319,7 +3365,8 @@ def _t2v_available() -> list:
 
 
 async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seconds, resolution,
-                             aspect_ratio, generate_audio, first, produced) -> Optional[str]:
+                             aspect_ratio, generate_audio, first, produced,
+                             is_continuation: bool = False) -> Optional[str]:
     """Render ONE text-to-video clip, trying each configured provider in order. On a
     credits/quota/billing/5xx (or any) error from one provider, log the reason and advance to the
     next. Returns a local mp4 path (recording the winning provider in `produced['provider']`), or
@@ -3347,6 +3394,20 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
         _order += [p for p in _base if p not in _order]
     else:
         _order = _base
+    # EDITOR-STYLE TRUE CONTINUATION. For a continuation clip (ci>0) the caller passes the PREVIOUS
+    # clip's real last frame as image_urls[0]. Only the fal lanes do genuine image-to-video — they
+    # take that frame as the LITERAL FIRST FRAME of this clip (so shot N+1 begins exactly where shot
+    # N ended, the way an editor cuts on a matching frame). Kie-Seedance has no first-frame input
+    # here; it only @-mentions the frame as a soft identity hint and RE-SYNTHESIZES a fresh person,
+    # which is the whole reason the seam looked "generated and patched". So for continuation clips we
+    # prefer the first-frame-capable fal lanes; Kie stays as a fallback if fal is down.
+    if is_continuation and (image_urls or [None])[0]:
+        _ff = [p for p in _order if p.startswith("fal-")]
+        _rest = [p for p in _order if not p.startswith("fal-")]
+        if _ff:
+            _order = _ff + _rest
+            logger.info("[generate] continuation clip → first-frame image-to-video (fal) so it "
+                        "continues from the previous clip's last frame, not a re-synthesized lookalike")
     for prov in _order:
         try:
             if prov == "kie-seedance":
@@ -3628,6 +3689,12 @@ async def recipe_generate(req: RunRequest) -> list:
                 model=engine, loser_transcript=prompt,
                 loser_metrics=(req.context.get("metrics") if isinstance(req.context, dict) else None),
                 has_winner_video=bool(video_urls), n_reference_images=len(image_urls),
+                # VERBATIM: if the caller supplied a script and did NOT allow a rewrite, the office
+                # speaks it word-for-word. This is what makes the t2v lane (the one that spoke a
+                # rewritten script with no CTA) finally honor the user's words — same signal the
+                # avatar reroute already used, now applied at the office so ALL lanes agree.
+                user_script=_verbatim_user_script(assets),
+                allow_rewrite=_rewrite_allowed(assets),
                 run_critic=True)
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
@@ -3759,9 +3826,8 @@ async def recipe_generate(req: RunRequest) -> list:
                 # whenever assets.script exists; only an explicit rewrite/modify mode opts out. Not
                 # keyed on a per-caller flag on purpose — a new caller that forgets the flag must
                 # still get the user's words, because forgetting it silently ships a rewrite.
-                _user_script = (assets.get("script") or "").strip()
-                _smode = str(assets.get("script_mode") or "").lower()
-                if _user_script and _smode not in ("rewrite", "modify"):
+                _user_script = _verbatim_user_script(assets)
+                if _user_script and not _rewrite_allowed(assets):
                     _spoken_script = _user_script
                     logger.info("[generate] script provided by caller — speaking it VERBATIM, "
                                 "office rewrite not used")
@@ -3955,7 +4021,9 @@ async def recipe_generate(req: RunRequest) -> list:
             cprompt = prompt
             if ci > 0 and clip_paths:
                 _pd = await asyncio.to_thread(_ffprobe_duration, clip_paths[-1])
-                cont = _frame_to_public_url(clip_paths[-1], max(0.5, (_pd or per_ci) - 0.4))   # last frame → seamless continuation
+                # Grab the ACTUAL final frame (as late as the decoder allows) so it can be handed to
+                # the next clip as its literal first frame — true editor-style continuation.
+                cont = _frame_to_public_url(clip_paths[-1], max(0.1, (_pd or per_ci) - 0.05))
                 if cont:
                     imgs = [cont] + imgs
                 cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
@@ -3974,12 +4042,13 @@ async def recipe_generate(req: RunRequest) -> list:
 
             # Provider fallback: Kie-Seedance → fal-seedance → fal-kling → fal-wan. A credits/quota/5xx
             # error on one advances to the next; _AllVideoProvidersDown only if every configured one is down.
-            async def _attempt(bt, _imgs=imgs, _first=(ci == 0)):
+            async def _attempt(bt, _imgs=imgs, _first=(ci == 0), _cont=(ci > 0)):
                 return await _generate_t2v_clip(
                     prompt=bt.get("prompt"),
                     image_urls=_imgs, video_urls=prepped_vids, audio_urls=audio_urls,
                     seconds=per_ci, resolution=resolution, aspect_ratio=aspect_ratio,
-                    generate_audio=generate_audio, first=_first, produced=produced)
+                    generate_audio=generate_audio, first=_first, produced=produced,
+                    is_continuation=_cont)
 
             cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
             if cp and os.path.exists(cp):
@@ -4002,6 +4071,9 @@ async def recipe_generate(req: RunRequest) -> list:
             # normalize every clip to uniform W:H:fps + aac, then concat (perfect frames + audio).
             # NO UPSCALING: we render 480p on purpose, so concat at the clips' OWN native size.
             # Scaling 480p up to 1080x1920 only faked a resolution number and softened the image.
+            # HARD CUT is correct here: continuation clips start on the previous clip's real last
+            # frame (true first-frame i2v), so the boundary frames already match — a crossfade would
+            # only blur a seam that no longer exists.
             _nw, _nh = await asyncio.to_thread(_ffprobe_dims, clip_paths[0])
             if _nw and _nh:
                 W2, H2 = int(_nw) - (int(_nw) % 2), int(_nh) - (int(_nh) % 2)
