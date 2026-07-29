@@ -526,6 +526,37 @@ async def _transcribe_file(path: str) -> str:
         try: os.remove(apath)
         except OSError: pass
 
+async def _audio_matches_script(audio_path: str, script: str):
+    """Clone-QA: transcribe synthesized audio and compare to the intended script. Returns (ok, reason).
+    Garbled when token overlap is low (< 0.65) OR a dollar amount / number in the script did not survive
+    in the audio. Best-effort — any error returns (True, ...) so the caller keeps the original audio."""
+    try:
+        heard = (await _transcribe_file(audio_path) or "").lower()
+        want = (script or "").lower()
+        if not heard or not want:
+            return True, "qa: empty transcript"
+        _tok = lambda s: [w for w in re.findall(r"[a-z0-9$%.]+", s) if any(c.isalnum() for c in w)]
+        wt = _tok(want)
+        ht = set(_tok(heard))
+        if not wt:
+            return True, "qa: no tokens"
+        overlap = sum(1 for w in wt if w in ht) / len(wt)
+        if overlap < 0.65:
+            return False, f"low similarity {overlap:.2f}"
+        # NUMBERS/PRICES must survive. Only enforce when BOTH sides used digit form (if the model spelled
+        # a number out — "twenty nine" — there's nothing to compare, so we don't false-flag it).
+        _norm = lambda n: re.sub(r"[^0-9.]", "", n).strip(".")
+        NUMPAT = r"\$?\d[\d,]*(?:\.\d+)?%?"
+        want_nums = {x for x in (_norm(n) for n in re.findall(NUMPAT, want)) if x}
+        heard_nums = {x for x in (_norm(n) for n in re.findall(NUMPAT, heard)) if x}
+        if want_nums and heard_nums:
+            missing = [n for n in want_nums if n not in heard_nums]
+            if missing:
+                return False, f"number(s) not spoken: {missing[:3]}"
+        return True, f"ok {overlap:.2f}"
+    except Exception as e:
+        return True, f"qa error: {e}"
+
 def _ffprobe_dims(path: str):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -1946,14 +1977,17 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         '   {"action":"write_ad_copy","count":N,"ad_copies":[{"title":"...","text":"..."}]}  Cap N at 5.\n'
         "3) make_video — user wants to make/generate a video/creative/clip:\n"
         '   {"action":"make_video","source":"last_script|last_ad_copy|none","prompt":"...","seconds":15,'
-        '"request_type":"ugc|broll","gender":"female|male","age_band":"under35|45-55|55plus"}\n'
+        '"request_type":"ugc|broll","gender":"female|male","age_band":"under35|45-55|55plus",'
+        '"scene":"kitchen|porch|car|couch|office|walk|null"}\n'
         "   If the user references a prior script (e.g. \"make a video from that script\"), set source=\"last_script\" "
         "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
-        "   CARRY THE BRIEF. request_type/gender/age_band are the format + casting the user asked for "
-        "   ANYWHERE in this conversation (including the brief you interviewed them for) — 'b-roll' or "
+        "   CARRY THE BRIEF. request_type/gender/age_band/scene are the format + casting + SETTING the user "
+        "   asked for ANYWHERE in this conversation (including the brief you interviewed them for) — 'b-roll' or "
         "   'no talking head' => request_type=broll, otherwise ugc; a stated person ('woman', 'under 35') "
-        "   sets gender/age_band. These used to be dropped here, so every request generated as UGC with "
-        "   no cast. Omit a field ONLY when the conversation truly never indicated it.\n"
+        "   sets gender/age_band; a stated SETTING sets scene (kitchen/home→kitchen, porch/outdoors→porch, "
+        "   car→car, couch/living room→couch, office→office, walk-and-talk→walk). These used to be dropped "
+        "   here, so every request generated as UGC with no cast. Omit a field ONLY when the conversation "
+        "   truly never indicated it.\n"
         "4) make_image — user wants a still image/poster/photo:\n"
         '   {"action":"make_image","prompt":"..."}\n'
         "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
@@ -1999,6 +2033,7 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             _rt = str(out.get("request_type") or "").lower()
             _gd = str(out.get("gender") or "").lower()
             _ab = str(out.get("age_band") or "").lower()
+            _sc = str(out.get("scene") or "").lower()
             # DURATION FROM THE BRIEF. The user may have stated the length earlier (e.g. a brief
             # answer "24 SECONDS") rather than in this message. The router's own `seconds` is
             # unreliable (it defaults to 15 on every classify), so it must NEVER win — parse a
@@ -2008,11 +2043,36 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
                                   if (h.get("role") or "user") == "user") + " " + message
             _sm = re.search(r"(\d{1,3})\s*(?:s\b|sec|second)", _user_said, re.I)
             _stated_secs = int(_sm.group(1)) if _sm else 0
+            # CARRY EARLIER-MESSAGE TRAITS. "man, 45+, porch" is usually stated when WRITING the script,
+            # not in the "make a video" message — so if the model didn't surface a trait, deterministically
+            # recover it from the WHOLE conversation (never override a value the model DID return).
+            _low = _user_said.lower()
+            if _gd not in ("female", "male"):
+                if re.search(r"\b(man|male|guy|gentleman|men|husband|dad|father)\b", _low):
+                    _gd = "male"
+                elif re.search(r"\b(woman|female|lady|women|wife|mom|mother)\b", _low):
+                    _gd = "female"
+            if _ab not in ("under35", "45-55", "55plus"):
+                if re.search(r"\b(55\+|55 ?plus|60s|70s|senior|elderly|grandma|grandpa|retire)\b", _low):
+                    _ab = "55plus"
+                elif re.search(r"\b(45\+|45 ?plus|45-55|40s|50s|middle[- ]aged)\b", _low):
+                    _ab = "45-55"
+                elif re.search(r"\b(under ?35|20s|25-35|young)\b", _low):
+                    _ab = "under35"
+            if _sc not in ("kitchen", "porch", "car", "couch", "office", "walk"):
+                _sc = (("porch" if re.search(r"\b(porch|outdoor|outside|yard|lawn|driveway)\b", _low)
+                        else "kitchen" if re.search(r"\bkitchen\b", _low)
+                        else "car" if re.search(r"\b(car|vehicle|driving|drive)\b", _low)
+                        else "couch" if re.search(r"\b(couch|sofa|living room|living-room)\b", _low)
+                        else "office" if re.search(r"\b(office|desk)\b", _low)
+                        else "walk" if re.search(r"\b(walk|walking|walk[- ]and[- ]talk)\b", _low)
+                        else ""))
             return {"action": "make_video", "source": src,
                     "prompt": (out.get("prompt") or message).strip(), "seconds": _stated_secs,
                     "request_type": _rt if _rt in ("ugc", "broll") else None,
                     "gender": _gd if _gd in ("female", "male") else None,
-                    "age_band": _ab if _ab in ("under35", "45-55", "55plus") else None}
+                    "age_band": _ab if _ab in ("under35", "45-55", "55plus") else None,
+                    "scene": _sc if _sc in ("kitchen", "porch", "car", "couch", "office", "walk") else None}
         if action == "make_image":
             return {"action": "make_image", "prompt": (out.get("prompt") or message).strip()}
         return {"action": "reply", "text": (out.get("text") or "Tell me what you'd like to make.").strip()}
@@ -3907,6 +3967,9 @@ async def recipe_generate(req: RunRequest) -> list:
     aspect_ratio = assets.get("aspect_ratio") or "9:16"
     resolution = assets.get("resolution") or "480p"   # DEFAULT 480p (cheaper/faster); explicit override wins
     generate_audio = assets.get("generate_audio", True)
+    # USER-SELECTED GENERATION PATH: auto (default) | scratch (force text-to-video, never reuse a real
+    # clip) | avatar (prefer real-library lip-sync). Gates the avatar reroute below.
+    _gen_path = str(assets.get("gen_path") or "auto").lower()
     # AUTO duration: when the caller didn't pick a specific length, the SCRIPT drives runtime (a 40s
     # script renders ~40s, not a crammed 15s). An explicit number is honored as a cap below.
     _dur_raw = assets.get("seconds")
@@ -4027,12 +4090,17 @@ async def recipe_generate(req: RunRequest) -> list:
         if _asked_broll and _avatar_plan:
             _avatar_plan = False
             logger.info("[generate] request_type=broll → overriding talking-head plan, staying t2v")
-        if not _avatar_plan and is_talk and not video_urls and not _asked_broll:
+        if not _avatar_plan and is_talk and not video_urls and not _asked_broll and _gen_path != "scratch":
             _cl0 = req.assets if isinstance(req.assets, dict) else {}
             if _cl0.get("fallback_avatar_url") or _cl0.get("library_avatar_url"):
                 _avatar_plan = True
                 logger.info("[generate] talking-head UGC + castable avatar + no reference video → "
                             "preferring funded avatar-lipsync over text-to-video")
+        # USER FORCED SCRATCH: never reuse a real library clip — text-to-video only, no matter what the
+        # brain's plan routed. (The match-gate below still applies in 'auto'.)
+        if _avatar_plan and _gen_path == "scratch":
+            _avatar_plan = False
+            logger.info("[generate] user chose scratch → t2v (avatar-lipsync reroute disabled)")
 
         # FIX C (Finance) + FIX B (preflight): before ANY paid attempt, the Finance seat records the
         # provider/credit decision. Talking-head plan → avatar-lipsync (funded, cheaper); if every t2v
@@ -4058,7 +4126,45 @@ async def recipe_generate(req: RunRequest) -> list:
         if _avatar_plan:
             _cl = req.assets if isinstance(req.assets, dict) else {}
             _cast_url = _cl.get("fallback_avatar_url") or _cl.get("library_avatar_url")
-            if not _cast_url:
+            # MATCH-GATED REROUTE (Feature 2). In 'auto' with a stated gender, the reused clip MUST match
+            # the brief — gender at minimum, age/scene strongly preferred. Score a library cast against the
+            # brief traits from assets (not a re-parse of the prompt, which drops the requested scene); if
+            # the best castable clip is the wrong gender (or nothing casts), DO NOT reuse it — fall through
+            # to t2v scratch. 'avatar' mode skips the gate (best real match wins, even if imperfect).
+            _want_g = str(assets.get("gender") or "").lower()
+            _want_a = str(assets.get("age_band") or "").lower()
+            _want_scene = str(assets.get("scene") or "").lower()
+            if _gen_path == "auto" and _want_g:
+                try:
+                    _intent = await _parse_intent_text(prompt)
+                    for _k, _v in (("gender", _want_g), ("age_band", _want_a), ("scene", _want_scene)):
+                        if _v:
+                            _intent[_k] = _v   # brief traits are authoritative over the prompt parse
+                    _cu, _ct, _au, _at = await _cast_library_avatar(_intent)
+                except Exception as _e:
+                    logger.warning(f"[generate] auto match-cast probe failed: {_e}")
+                    _cu, _ct = None, {}
+                _ct = _ct or {}
+                _g_ok = (_ct.get("gender") or "").lower() == _want_g
+                _a_ok = bool(_want_a) and (_ct.get("age_band") or "").lower() == _want_a
+                _s_ok = bool(_want_scene) and _want_scene in (_ct.get("scene") or "").lower()
+                # HARD requirements: gender must match; when a SCENE was asked for, it must match too
+                # (a specific brief — man/45+/porch — must NOT reuse a man-in-a-CAR clip). Age is a
+                # strong preference, logged but not a hard gate (bands are fuzzy). No match → t2v scratch.
+                _match_ok = bool(_cu) and _g_ok and (_s_ok or not _want_scene)
+                if _match_ok:
+                    _cast_url = _cu   # matched pick, scored against the full brief
+                    logger.info("[generate] library clip matches brief (gender ✓"
+                                + (" age ✓" if _a_ok else "") + (" scene ✓" if _s_ok else "")
+                                + f") → avatar-lipsync on {_cu}")
+                else:
+                    logger.info(f"[generate] no library clip matches brief (gender={_want_g} "
+                                f"age={_want_a or '—'} scene={_want_scene or '—'}; best clip "
+                                f"gender={(_ct.get('gender') or '—')} scene={(_ct.get('scene') or '—')}) "
+                                f"→ t2v scratch")
+                    _cast_url = None
+            elif not _cast_url:
+                # 'avatar' mode, or 'auto' with no stated gender → today's behavior: best library talker.
                 try:
                     _cu, _ct, _au, _at = await _cast_library_avatar(await _parse_intent_text(prompt))
                     _cast_url = _cu   # only the avatar-lipsync-ready pick (never the any-clip pick)
@@ -5276,14 +5382,46 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             ref_text=(_ref_text or a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
-    # ── LENGTH GUARDRAIL (never lengthen the video) ─────────────────────────────────────────────
-    # The added pauses + expressive read can push the narration past the requested target. KEEP every
-    # word and pause, but nudge delivery SPEED (atempo, cap 1.15x) so it fits — the speed dial absorbs
-    # the pauses. atempo only ever speeds UP, so the video is never made longer than the natural read.
+    # ── CLONE AUDIO QA (Feature 3) — don't ship a garbled voice ──────────────────────────────────
+    # The f5 clone can mangle the script ("$29"→"$1.29", "porch"→"poor", "savings"→"cash") or inject a
+    # boundary artifact. Transcribe what was ACTUALLY synthesized and compare to the intended script;
+    # on a bad match RETRY once, then fall back to a CLEAN preset voice (no clone) so corrupted audio
+    # never ships. Best-effort: any error here keeps the original audio, never hard-fails.
+    _clone_garbled = False
+    if sample_url:   # only meaningful when a clone was actually used to synthesize
+        try:
+            _qa_ok, _qa_reason = await _audio_matches_script(out_audio, script)
+            if not _qa_ok:
+                logger.warning(f"[avatar-lipsync] clone audio garbled ({_qa_reason}) — re-synthesizing once")
+                _retry = await asyncio.to_thread(lambda: vs.synthesize(
+                    _tts_text, voice_id="fal-clone:character", sample_url=sample_url,
+                    out_path=out_audio, style=_style, fallback_voice_id=voice_id,
+                    prefer_expressive=_emotional_delivery,
+                    ref_text=(_ref_text or a.get("character_transcript") or None)))
+                if _retry:
+                    voice_res = _retry
+                _qa_ok2, _qa_reason2 = await _audio_matches_script(out_audio, script)
+                if not _qa_ok2:
+                    logger.warning(f"[avatar-lipsync] clone still garbled ({_qa_reason2}) — "
+                                   f"falling back to a clean preset voice (no clone)")
+                    voice_res = await asyncio.to_thread(lambda: vs.synthesize(
+                        _tts_text, voice_id=voice_id, out_path=out_audio, style=_style,
+                        fallback_voice_id=voice_id, prefer_expressive=_emotional_delivery))
+                    sample_url = None   # a PRESET voice now, not a clone → labels/manifest reflect it
+                    _clone_garbled = True
+        except Exception as _qae:
+            logger.warning(f"[avatar-lipsync] clone audio QA skipped: {_qae}")
+    # ── PACING GUARDRAIL (never RUSH the read) ──────────────────────────────────────────────────
+    # The script is now sized to the duration (word budget), so the natural read already ~fits. Only
+    # a GENTLE nudge is allowed — a hard atempo (the old 1.15x) slurs words and mangles numbers
+    # ("$29"→"$1.29"), which is what read as "garbled f5". Cap the speed-up at 1.06x so it NEVER
+    # rushes; if the read is still a little long after that, let the video match the natural voice by
+    # those couple of seconds — a natural pace beats a rushed one. f5 itself is fine; the rush was the
+    # problem.
     _target_sec = float(seconds)
     _nar_sec = await asyncio.to_thread(_audio_seconds, out_audio)
     if _target_sec > 0 and _nar_sec > _target_sec:
-        _sf = min(1.15, _nar_sec / _target_sec)
+        _sf = min(1.06, _nar_sec / _target_sec)
         if _sf > 1.001:
             _fitp = out_audio.rsplit(".", 1)[0] + "_sf.mp3"
             try:
@@ -5591,6 +5729,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                     else "elevenlabs (clone)" if (voice_res.get("provider") == "elevenlabs"
                                                   and voice_res.get("voice") == "clone")
                     else f"{voice_res.get('provider')}:{voice_res.get('voice')}")
+    if _clone_garbled:   # clone failed QA and we swapped to a clean preset — say so on the manifest
+        _voice_label = f"preset (clone garbled → fallback): {voice_res.get('provider')}:{voice_res.get('voice')}"
     _models = {"video": None, "voice": _voice_label, "voice_cloned": bool(_cloned),
                "lipsync": sub["provider"],
                "captions": ("veed" if _use_veed else ("whisper+ass" if ass_path else None)),
