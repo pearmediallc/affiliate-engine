@@ -36,7 +36,7 @@ STYLE_PROFILES = {
                  "artifacts, light sensor noise, faded colors, soft contrast. No stabilization, no "
                  "cinematic moves, no modern grade. Candid documentary realism, imperfect off-center "
                  "framing, believable unscripted body language, realistic skin texture, minimal makeup."),
-        "camera": "handheld selfie-style vertical 9:16",
+        "camera": "handheld selfie at EYE LEVEL, phone held at eye height, straight-on — NOT a high or overhead angle, not looking down; vertical 9:16",
         "lighting": "available natural light, uneven",
         "audio": "ambient/diegetic only — no music, no narration, no sound design",
     },
