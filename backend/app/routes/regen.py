@@ -4997,12 +4997,18 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # 2) VOICE — clone the character's own voice (most natural) else cast a catalog voice
     t1 = act.start("character", req.request_id, "casting the voice")
     sample_url = None
-    if a.get("clone_voice"):
+    _clone_wav = None            # LOCAL wav path — ElevenLabs clone needs a file, not a presigned URL
+    # CLONE BY DEFAULT on reused real footage: a real face lip-synced to a stock TTS voice is an
+    # eyes/ears mismatch. Clone the character's own voice unless the caller EXPLICITLY opts out.
+    _do_clone = a.get("clone_voice") is not False and bool(char_url)
+    _clone_engine = str(a.get("clone_engine") or "f5").lower()   # f5 | elevenlabs | auto
+    if _do_clone:
         try:
             raw = await _download_to_temp(char_url, ".mp4")
             wav = raw.rsplit(".", 1)[0] + ".wav"
             # F5-TTS wants a clean ~10-15s reference of the person actually speaking
             await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
+            _clone_wav = wav
             sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
             # the clone model fetches this itself — our bucket is private, so presign it
             sample_url = StorageService.presign_url(sample_url) or sample_url
@@ -5058,12 +5064,34 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     # When the register is non-neutral, lead with an expressive real voice over the clone (clone stays
     # as fallback for timbre). Neutral tone → unchanged (clone/cast voice leads).
     _emotional_delivery = any(w in (a.get("tone") or "").lower() for w in _EMOTIONAL_TONES)
-    voice_res = await asyncio.to_thread(lambda: vs.synthesize(
-        _tts_text, voice_id=("fal-clone:character" if sample_url else voice_id),
-        sample_url=sample_url, out_path=out_audio, style=_style,
-        fallback_voice_id=voice_id, prefer_expressive=_emotional_delivery,
-        # what the character actually SAYS in the reference clip — improves clone fidelity
-        ref_text=(a.get("character_transcript") or None)))
+    # CLONE ENGINE SELECT. Default f5 (fal F5-TTS via voice_studio). "elevenlabs"/"auto" render the
+    # spoken audio with an ElevenLabs INSTANT CLONE of the character's own voice — A/B against f5. EL
+    # clone needs the LOCAL wav (not the presigned sample_url); /voices/add makes a persistent voice,
+    # so we DELETE it in a finally (quota + clutter). Any failure → fall through to the f5 path → preset.
+    voice_res = None
+    if _do_clone and _clone_wav and _clone_engine in ("elevenlabs", "auto"):
+        try:
+            from ..services import elevenlabs_service as el
+            if el.ElevenLabsService.is_configured():
+                _elvid = None
+                try:
+                    _elvid = await asyncio.to_thread(
+                        el.ElevenLabsService.clone_voice, _clone_wav, f"char_{req.request_id[:8]}")
+                    await asyncio.to_thread(el.ElevenLabsService.tts, _elvid, _tts_text, out_audio, _style)
+                    voice_res = {"path": out_audio, "provider": "elevenlabs", "voice": "clone", "cost_usd": 0.0}
+                finally:
+                    if _elvid:
+                        await asyncio.to_thread(el.ElevenLabsService.delete_voice, _elvid)   # best-effort
+        except Exception as _ele:
+            logger.warning(f"[avatar-lipsync] ElevenLabs clone failed → f5/preset: {_ele}")
+            voice_res = None
+    if voice_res is None:
+        voice_res = await asyncio.to_thread(lambda: vs.synthesize(
+            _tts_text, voice_id=("fal-clone:character" if sample_url else voice_id),
+            sample_url=sample_url, out_path=out_audio, style=_style,
+            fallback_voice_id=voice_id, prefer_expressive=_emotional_delivery,
+            # what the character actually SAYS in the reference clip — improves clone fidelity
+            ref_text=(a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
     # ── LENGTH GUARDRAIL (never lengthen the video) ─────────────────────────────────────────────
@@ -5341,7 +5369,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
 
     # auto-feedback statement for THIS generation (shown per video). Report what ACTUALLY happened —
     # a clone that fell back to a preset must not still claim "cloned from character".
-    _cloned = voice_res.get("provider") in ("fal-clone", "chatterbox")
+    _cloned = (voice_res.get("provider") in ("fal-clone", "chatterbox")
+               or (voice_res.get("provider") == "elevenlabs" and voice_res.get("voice") == "clone"))
     _swapped = voice_res.get("fallback") and voice_res.get("requested")
     fb = ("Reused real library footage · "
           f"voice {voice_res.get('provider')}:{voice_res.get('voice')}"
