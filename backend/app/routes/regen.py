@@ -5080,6 +5080,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     t1 = act.start("character", req.request_id, "casting the voice")
     sample_url = None
     _clone_wav = None            # LOCAL wav path — ElevenLabs clone needs a file, not a presigned URL
+    _ref_text = None             # transcript of the reference clip → F5-TTS ref_text (kills boundary hallucination)
     # CLONE BY DEFAULT on reused real footage: a real face lip-synced to a stock TTS voice is an
     # eyes/ears mismatch. Clone the character's own voice unless the caller EXPLICITLY opts out.
     _do_clone = a.get("clone_voice") is not False and bool(char_url)
@@ -5091,6 +5092,16 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             # F5-TTS wants a clean ~10-15s reference of the person actually speaking
             await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
             _clone_wav = wav
+            # REF TEXT: tell F5-TTS exactly what the reference clip SAYS. Without it, fal auto-ASRs
+            # the reference and its errors bleed into the output as a spurious token at every sentence
+            # start ("Bing, my home insurance…"). Transcribing the sample and passing it as ref_text
+            # is the documented F5 fix — it removes the boundary hallucination. Best-effort.
+            try:
+                _rt = await _transcribe_file(wav)
+                if _rt and len(_rt.split()) >= 3:
+                    _ref_text = _rt.strip()
+            except Exception as _rte:
+                logger.warning(f"ref-text transcribe failed (f5 will ASR): {_rte}")
             sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
             # the clone model fetches this itself — our bucket is private, so presign it
             sample_url = StorageService.presign_url(sample_url) or sample_url
@@ -5181,7 +5192,7 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             sample_url=sample_url, out_path=out_audio, style=_style,
             fallback_voice_id=voice_id, prefer_expressive=_emotional_delivery,
             # what the character actually SAYS in the reference clip — improves clone fidelity
-            ref_text=(a.get("character_transcript") or None)))
+            ref_text=(_ref_text or a.get("character_transcript") or None)))
     _track_cost(req.request_id, "voice", voice_res.get("provider") or "openai", model=str(voice_res.get("voice")),
                 units=len(script), unit_type="chars", cost_usd=voice_res.get("cost_usd") or 0)
     # ── LENGTH GUARDRAIL (never lengthen the video) ─────────────────────────────────────────────
@@ -5229,6 +5240,17 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={factor:.3f}", fit], 120)
             out_audio, vo_sec = fit, await asyncio.to_thread(_audio_seconds, fit)
             fit_note = (fit_note + f"; tempo {factor:.2f}x").strip("; ")
+    # TAIL PAD: f5's remove_silence trims the trailing beat, so the clip cuts on the last phoneme and
+    # feels like the last word was chopped. Add ~0.45s of trailing silence so the ending breathes and
+    # the final word lands fully. Best-effort — never block on it.
+    try:
+        _padded = out_audio.rsplit(".", 1)[0] + "_pad.mp3"
+        await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-af", "apad=pad_dur=0.45", _padded], 120)
+        if os.path.exists(_padded):
+            out_audio = _padded
+            vo_sec = await asyncio.to_thread(_audio_seconds, out_audio)
+    except Exception as _pe:
+        logger.warning(f"[avatar-lipsync] tail pad skipped: {_pe}")
     # THIS is the real runtime — the video follows the voice, not the other way round.
     seconds = max(1, int(round(vo_sec)))
     logger.info(f"[avatar-lipsync] VO runs {vo_sec:.1f}s at natural pace → video spans {seconds}s {fit_note}")
