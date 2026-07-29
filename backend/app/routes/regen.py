@@ -5057,10 +5057,13 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         (a.get("tone") or "warm"),
         "conversational, talking to camera, expressive with natural pauses between sentences, never flat or monotone",
     ] if x)
-    # BUDGETED PAUSES (no new words): short SSML <break>s between sentences so the read breathes;
-    # older characters pause a touch longer. Kept OUT of `script` so captions still align on the words.
+    # THE SCRIPT GIVEN IS THE SCRIPT SPOKEN — verbatim, no injected markup. SSML <break> tags were
+    # being READ ALOUD by f5-tts ("break time zero point three seconds") and corrupted the delivery.
+    # f5/OpenAI/Gemini do NOT parse SSML, so the text handed to them must be the plain words only.
+    # Natural pauses come from the punctuation + the model's own prosody. Only the ElevenLabs branch
+    # (which genuinely honors SSML) may add breaths, applied inline there — never to the f5 path.
     _older = (a.get("age_band") in ("55plus", "45-55"))
-    _tts_text = _insert_break_pauses(script, older=_older)
+    _tts_text = script
     # When the register is non-neutral, lead with an expressive real voice over the clone (clone stays
     # as fallback for timbre). Neutral tone → unchanged (clone/cast voice leads).
     _emotional_delivery = any(w in (a.get("tone") or "").lower() for w in _EMOTIONAL_TONES)
@@ -5077,7 +5080,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
                 try:
                     _elvid = await asyncio.to_thread(
                         el.ElevenLabsService.clone_voice, _clone_wav, f"char_{req.request_id[:8]}")
-                    await asyncio.to_thread(el.ElevenLabsService.tts, _elvid, _tts_text, out_audio, _style)
+                    # ElevenLabs genuinely honors SSML <break>, so it MAY breathe between sentences.
+                    _el_text = _insert_break_pauses(script, older=_older)
+                    await asyncio.to_thread(el.ElevenLabsService.tts, _elvid, _el_text, out_audio, _style)
                     voice_res = {"path": out_audio, "provider": "elevenlabs", "voice": "clone", "cost_usd": 0.0}
                 finally:
                     if _elvid:
