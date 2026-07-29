@@ -1837,6 +1837,28 @@ async def creative_team_enhance(payload: dict, _auth: bool = Depends(require_ser
         return {"success": True, "text": prompt, "mode": mode, "fallback": True}
 
 
+def _fit_script_to_seconds(text: str, seconds: int) -> str:
+    """DETERMINISTIC word-budget cap for a spoken script (~2.5 words/sec, 150 wpm). If the script runs
+    over the duration's budget, TRIM it WITHOUT breaking a sentence: keep the first sentence (hook) and
+    the last (CTA), and drop whole MIDDLE sentences (nearest the CTA first) until it fits. Never cuts
+    mid-sentence, never drops the CTA. Returns the text unchanged when it already fits or can't be
+    trimmed safely (only a hook+CTA)."""
+    text = (text or "").strip()
+    if not text or not seconds or seconds <= 0:
+        return text
+    budget = round(2.5 * seconds)
+    if len(text.split()) <= budget * 1.15:            # allow a small margin before trimming
+        return text
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if len(sents) <= 2:                                # only hook + CTA — trimming would break a sentence
+        return text
+    hook, cta, middle = sents[0], sents[-1], sents[1:-1]
+    base = len(hook.split()) + len(cta.split())
+    while middle and base + sum(len(s.split()) for s in middle) > budget:
+        middle.pop()                                   # drop the middle sentence nearest the CTA
+    return " ".join([hook, *middle, cta])
+
+
 @router.post("/studio/route")
 async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)):
     """ChatGPT-style Studio router. Given the recent thread history + the new message, classify into
@@ -1887,6 +1909,17 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "do NOT leave a blank: write a natural generic call-to-action instead — e.g. 'tap the link "
         "below', 'click the link on this page', 'check your rate using the link below'. If the user "
         "DID give a site/brand, say it verbatim, naturally, and no more than twice.\n\n")
+    # HARD word budget: if the user stated a duration ANYWHERE in the conversation, compute the exact
+    # cap (2.5 words/sec) and state it as a hard limit in the write_script prompt. The deterministic
+    # trim below (_fit_script_to_seconds) enforces it regardless; this just tells the model up front.
+    _brief_secs_src = " ".join((h.get("text") or "") for h in history) + " " + message
+    _bm = re.search(r"(\d{1,3})\s*(?:s\b|sec|second)", _brief_secs_src, re.I)
+    _brief_secs = int(_bm.group(1)) if _bm else 0
+    _budget_line = (
+        f"   HARD LIMIT: the chosen duration is {_brief_secs} seconds → write NO MORE THAN "
+        f"{round(2.5 * _brief_secs)} words per script for a {_brief_secs}-second read; going over the "
+        f"budget is a defect. Keep the hook (first sentence) and the CTA (last sentence) tight.\n"
+    ) if _brief_secs > 0 else ""
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
         "then output ONE strict-JSON action. Prefer acting over asking for edits/iterations — BUT for a "
@@ -1897,10 +1930,18 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
         "1) write_script — user wants script(s)/variations/hooks for a video ad:\n"
-        '   {"action":"write_script","vertical":"<vertical>","count":N,"seconds":<15|30|45>,"scripts":[{"title":"...","text":"..."}]}\n'
+        '   {"action":"write_script","vertical":"<vertical>","count":N,"seconds":<15|20|30|45|60>,"scripts":[{"title":"...","text":"..."}]}\n'
         "   Each script.text = a complete spoken UGC ad script (the spoken lines only, no scene labels). Cap N at 5.\n"
-        "   SIZE THE SCRIPT TO THE REQUESTED LENGTH: 15s ≈ 40 words, 30s ≈ 75 words, 45s ≈ 110 words. Set "
-        "   `seconds` to the chosen duration so it carries to the video. Do not overrun the word budget.\n"
+        "   SIZE THE SCRIPT TO THE REQUESTED LENGTH (~2.5 words/second, 150 wpm): 15s ≈ 40 words, 20s ≈ 50, "
+        "   30s ≈ 75, 45s ≈ 110, 60s ≈ 150. Set `seconds` to the chosen duration so it carries to the video "
+        "   AND caps the word budget. Do not overrun the word budget.\n"
+        + _budget_line +
+        "   DIVERSITY (mandatory): each script must use a DIFFERENT hook pattern (personal story | direct "
+        "   question | shocking stat | neighbor / social-proof | 'this is for you if…') and FRESH phrasing "
+        "   — never reuse the same opening sentence or the same sentence structure as a typical home-insurance "
+        "   ad (do NOT default to 'my bill jumped again / a friend mentioned checking rates / two minutes / "
+        "   enter your zip'). Rotate the angle. If count>1, the N scripts must be materially different from "
+        "   each other — different hooks AND different wording, not minor edits.\n"
         "2) write_ad_copy — user wants ad copy / primary text / captions:\n"
         '   {"action":"write_ad_copy","count":N,"ad_copies":[{"title":"...","text":"..."}]}  Cap N at 5.\n'
         "3) make_video — user wants to make/generate a video/creative/clip:\n"
@@ -1922,7 +1963,8 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "'write an ad for X' — where the user has NOT specified the format AND the length (duration) is "
         "NOT enough to write. In that case you MUST return action 'reply' asking for the MISSING factors "
         "below as a tight NUMBERED list (with the given options) — do NOT write the script yet. ALWAYS "
-        "include the LENGTH/duration question (it drives the word count and the video's seconds). Only "
+        "include BOTH the LENGTH/duration question (it drives the word count and the video's seconds) AND "
+        "the STATE(S)/geo question (we target specific states — the user can answer 'none / nationwide'). Only "
         "skip asking and write immediately if the user EXPLICITLY says 'just write it'/'you pick'/"
         "'surprise me', OR is iterating on / editing an existing script, OR has already given format + "
         "length earlier in the conversation. Ask ONLY the factors still missing; open with one friendly "
@@ -1936,9 +1978,12 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             scripts = [s for s in (out.get("scripts") or []) if (s.get("text") or "").strip()][:5]
             if not scripts:
                 return {"action": "reply", "text": "I couldn't draft that — name the product or vertical and I'll write the scripts."}
+            _secs = int(out.get("seconds")) if str(out.get("seconds") or "").isdigit() else None
+            if _secs and _secs > 0:   # HARD cap: deterministically trim any overrun to the duration's budget
+                for s in scripts:
+                    s["text"] = _fit_script_to_seconds(s.get("text") or "", _secs)
             return {"action": "write_script", "vertical": out.get("vertical") or vertical,
-                    "count": len(scripts), "scripts": scripts,
-                    "seconds": (int(out.get("seconds")) if str(out.get("seconds") or "").isdigit() else None)}
+                    "count": len(scripts), "scripts": scripts, "seconds": _secs}
         if action == "write_ad_copy":
             copies = [c for c in (out.get("ad_copies") or []) if (c.get("text") or "").strip()][:5]
             if not copies:

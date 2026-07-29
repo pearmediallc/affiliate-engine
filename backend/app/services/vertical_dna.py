@@ -19,15 +19,17 @@ STRUCTURE (beats): 1) personal/relatable hook (a short story) -> 2) name the pro
 SPECIFICITY (this is what makes it convert — never be vague): be concrete, but ONLY with specifics the user actually gave (their offer, their numbers, their story). NEVER FABRICATE: do not invent a person's name, a city/state, a company, or a dollar amount the user did not provide — invented specifics are false claims, not craft. When the user gave no number or name, stay truthful and generic ("save on your rate", "in a couple of minutes", "a friend told me") rather than making one up. Quantified time is fine when generic ("two minutes"). Vague waffle is dead; so is fabrication.
 HOOK PATTERNS (pick one; vary across variations): personal story; direct question to the viewer; shared frustration; social-proof reveal (do NOT name a specific person unless the user provided one — use "a friend"/"someone I know"); targeted "this is for you if..." statement.
 CTA: direct + imperative; restate the speed and the benefit; end on reassurance (no obligation / no catch).
-AVOID (kills conversion): vague claims with no numbers; corporate jargon; making it sound slow or complicated; a generic impersonal ad voice; listing product features instead of the viewer's benefit; ignoring the obvious objection."""
+AVOID (kills conversion): vague claims with no numbers; corporate jargon; making it sound slow or complicated; a generic impersonal ad voice; listing product features instead of the viewer's benefit; ignoring the obvious objection.
+VARIETY (mandatory — this is a STYLE GUIDE, not a template): vary the hook, the opening line, the story, the specifics, and the sentence structure on EVERY script — never reuse a fixed opening or a canned template sentence. Two scripts for the same offer must read like they were written by different people, not minor edits of each other."""
 
 # Vertical-specific NEED/offer — distilled from that vertical's own scripts. Craft (above) is added on top.
 VERTICAL_NEED = {
-    "home insurance": """HOME-INSURANCE NEED + OFFER (layer this onto the craft):
+    "home insurance": """HOME-INSURANCE NEED + OFFER (layer this onto the craft — a STYLE GUIDE, NOT a script to copy):
 PAIN: Homeowners feel overcharged and powerless as rates climb every year and loyalty goes unrewarded.
 DESIRE: financial relief + peace of mind with the SAME coverage.
 MECHANISM: a quick online comparison — enter zip, compare quotes, find a lower rate.
-SIGNATURE LANGUAGE (phrasing patterns — NOT facts to invent): "same / comparable coverage"; "your zip code"; the idea of a dollar swing WITHOUT inventing a specific figure the user didn't give (say "a lower rate" / "hundreds less" only if truthful); seasonal/life triggers ("after hail season", "mortgage went up", "fixed income"); a social-proof reveal ("a friend mentioned it") — never a named or located person the user didn't provide.""",
+VARY EVERY TIME (critical): do NOT return the same script twice. "My bill jumped again / a friend mentioned checking rates / it took two minutes / same coverage / enter your zip" is ONE possible take — NOT THE script. Reusing that opening or sequence verbatim is the defect we are fixing. Change the hook, the story, the trigger, the specifics, and the phrasing on every script.
+ROTATE (draw from these as PATTERNS, never the same combo twice, never all at once): triggers ("after hail season", "my escrow went up", "on a fixed income", "renewal-letter sticker shock", a claim near a neighbor); proof framings ("comparable coverage", "kept my same deductible", "hundreds less" — only if truthful, never an invented figure); social proof ("a friend", "my neighbor", "someone at work") — only when truthful and never a named/located person the user didn't provide.""",
 }
 
 

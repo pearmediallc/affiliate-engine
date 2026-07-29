@@ -25,7 +25,7 @@ ANGLES = ["personal story", "direct question to the viewer", "neighbor / social 
 
 TONES = ["warm & empathetic", "urgent & direct", "bold & confident", "casual & relatable"]
 
-LENGTHS = ["15s (~40 words)", "30s (~75 words)", "45s (~110 words)"]
+LENGTHS = ["15s (~40 words)", "20s (~50 words)", "30s (~75 words)", "45s (~110 words)", "60s (~150 words)"]
 
 # The ORDERED factor checklist the flow gathers. `options=None` → an open specifics answer.
 # Structured as data so a future chips/selects UI can render it directly; today it drives the router's
@@ -36,7 +36,7 @@ FACTORS = [
     {"key": "setting",    "q": "Where's the scene set?", "options": SETTINGS},
     {"key": "angle",      "q": "Hook / angle?", "options": ANGLES},
     {"key": "offer",      "q": "The exact offer + any real numbers to feature (savings, price, result)?", "options": None},
-    {"key": "geo",        "q": "Any specific state(s) to target? (especially for MAP / geo offers)", "options": None},
+    {"key": "geo",        "q": "Which state(s) are we targeting? (answer 'none / nationwide' if it isn't geo-targeted)", "options": None},
     {"key": "tone",       "q": "Tone?", "options": TONES},
     {"key": "length",     "q": "How long?", "options": LENGTHS},
 ]
@@ -52,7 +52,8 @@ def checklist_text() -> str:
     hasn't already given, using THESE exact options, as a tight numbered list."""
     lines = ["CREATIVE BRIEF FACTORS — a superb script needs these. Ask for the ones the user hasn't "
              "already specified (use the given options; don't re-ask what they've told you); keep it a "
-             "tight numbered list:"]
+             "tight numbered list. ALWAYS ask the LENGTH and the STATE(S) even if you skip other "
+             "factors — length caps the word budget and we target specific states:"]
     for f in FACTORS:
         opts = (" — options: " + ", ".join(f["options"])) if f.get("options") else " — (open: specifics)"
         lines.append(f"• {f['q']}{opts}")
