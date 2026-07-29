@@ -1889,14 +1889,18 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         "DID give a site/brand, say it verbatim, naturally, and no more than twice.\n\n")
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
-        "then output ONE strict-JSON action. Prefer acting over asking — only ask when genuinely ambiguous.\n\n"
+        "then output ONE strict-JSON action. Prefer acting over asking for edits/iterations — BUT for a "
+        "NEW script/video request that lacks the creative brief, gathering the brief FIRST is the correct "
+        "action, not a fallback (see FOLLOW-UP BEFORE WRITING — it is MANDATORY there).\n\n"
         + _no_placeholder + _dna_block +
         f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
         f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
         "1) write_script — user wants script(s)/variations/hooks for a video ad:\n"
-        '   {"action":"write_script","vertical":"<vertical>","count":N,"scripts":[{"title":"...","text":"..."}]}\n'
+        '   {"action":"write_script","vertical":"<vertical>","count":N,"seconds":<15|30|45>,"scripts":[{"title":"...","text":"..."}]}\n'
         "   Each script.text = a complete spoken UGC ad script (the spoken lines only, no scene labels). Cap N at 5.\n"
+        "   SIZE THE SCRIPT TO THE REQUESTED LENGTH: 15s ≈ 40 words, 30s ≈ 75 words, 45s ≈ 110 words. Set "
+        "   `seconds` to the chosen duration so it carries to the video. Do not overrun the word budget.\n"
         "2) write_ad_copy — user wants ad copy / primary text / captions:\n"
         '   {"action":"write_ad_copy","count":N,"ad_copies":[{"title":"...","text":"..."}]}  Cap N at 5.\n'
         "3) make_video — user wants to make/generate a video/creative/clip:\n"
@@ -1913,12 +1917,16 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         '   {"action":"make_image","prompt":"..."}\n'
         "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
         '   {"action":"reply","text":"..."}\n\n'
-        "FOLLOW-UP BEFORE WRITING (so scripts are SUPERB, not vague): when the user asks for a "
-        "script/video but hasn't given the creative brief, use action 'reply' to ask for the MISSING "
-        "factors below as a tight NUMBERED list, using the given options — then write once you have "
-        "them. Only ask what's missing: if the user already stated a factor, or says 'just write "
-        "it'/'you pick'/'surprise me', or is iterating on an existing script, DON'T re-ask — fill "
-        "sensible defaults from the vertical and write. Open with one friendly line, then the list.\n"
+        "FOLLOW-UP BEFORE WRITING (MANDATORY — so scripts are SUPERB, not vague):\n"
+        "A bare topic/vertical request — e.g. 'need a home insurance script', 'make me a UGC video', "
+        "'write an ad for X' — where the user has NOT specified the format AND the length (duration) is "
+        "NOT enough to write. In that case you MUST return action 'reply' asking for the MISSING factors "
+        "below as a tight NUMBERED list (with the given options) — do NOT write the script yet. ALWAYS "
+        "include the LENGTH/duration question (it drives the word count and the video's seconds). Only "
+        "skip asking and write immediately if the user EXPLICITLY says 'just write it'/'you pick'/"
+        "'surprise me', OR is iterating on / editing an existing script, OR has already given format + "
+        "length earlier in the conversation. Ask ONLY the factors still missing; open with one friendly "
+        "line, then the numbered list.\n"
         + _brief_checklist + "\n"
     )
     try:
@@ -1929,7 +1937,8 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             if not scripts:
                 return {"action": "reply", "text": "I couldn't draft that — name the product or vertical and I'll write the scripts."}
             return {"action": "write_script", "vertical": out.get("vertical") or vertical,
-                    "count": len(scripts), "scripts": scripts}
+                    "count": len(scripts), "scripts": scripts,
+                    "seconds": (int(out.get("seconds")) if str(out.get("seconds") or "").isdigit() else None)}
         if action == "write_ad_copy":
             copies = [c for c in (out.get("ad_copies") or []) if (c.get("text") or "").strip()][:5]
             if not copies:
