@@ -365,6 +365,9 @@ class KieAIService:
         if reference_audio_urls:
             inp["reference_audio_urls"] = reference_audio_urls
 
+        # AUDITABILITY (the "Seedance disaster"): log the COMPLETE input dict actually sent to Kie so
+        # the exact prompt/params each generation received is visible in the logs, not a black box.
+        logger.info(f"[model-call] seedance createTask model={model} input={inp}")
         r = httpx.post(f"{_BASE}/api/v1/jobs/createTask", headers=_headers(),
                        json={"model": model, "input": inp}, timeout=30)
         r.raise_for_status()

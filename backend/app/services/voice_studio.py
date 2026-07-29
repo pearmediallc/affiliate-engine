@@ -37,9 +37,10 @@ logger = logging.getLogger(__name__)
 DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Default fallback order — keep it OFF Replicate (openai/deepgram/elevenlabs are plain HTTP);
-# Kokoro (Replicate) is last so the Replicate rate-limit/credit is reserved for lip-sync.
-FALLBACK_ORDER = ["openai", "gemini", "deepgram", "elevenlabs", "kokoro"]
+# Default fallback order — keep it OFF Replicate (openai/gemini/deepgram are plain HTTP); Kokoro
+# (Replicate) sits late so the Replicate rate-limit/credit is reserved for lip-sync, and ElevenLabs
+# is DEAD LAST — a paid last-resort only, so it never leads (the clone/preset voices win over it).
+FALLBACK_ORDER = ["openai", "gemini", "deepgram", "kokoro", "elevenlabs"]
 
 # Read pace applied at SYNTH time (not post-hoc atempo — that would desync captions, which align
 # on the final audio). 1.1x makes the DR hook punchier without tipping into chipmunk.
@@ -521,12 +522,13 @@ def synthesize(text: str, *, voice_id: Optional[str] = None, out_path: Optional[
     # and skip any provider whose key isn't configured.
     avail = available_providers()
     order = ([provider] if provider else []) + ([fb["provider"]] if fb else []) + FALLBACK_ORDER
-    # When the line's emotion is non-neutral, LEAD with a real EXPRESSIVE provider (OpenAI
-    # gpt-4o-mini-tts / Gemini / ElevenLabs) over the voice-clone — the clone stays in the chain as
-    # fallback for timbre/neutral lines. Only reorders when such a provider is actually available, so
-    # the existing fallback chain is never broken.
-    if prefer_expressive:
-        _expr = [p for p in ("openai", "gemini", "elevenlabs") if p in avail]
+    # When the line's emotion is non-neutral, LEAD with a real EXPRESSIVE preset (OpenAI
+    # gpt-4o-mini-tts / Gemini) over a generic voice — BUT ONLY when there is NO clone sample. With a
+    # clone the CLONE must lead: it is the character's OWN voice (sounds human), so a generic
+    # "expressive" preset is worse, not better. ElevenLabs is intentionally NOT in this list — we never
+    # bill it on an emotional line. Only reorders when such a provider is available (chain never broken).
+    if prefer_expressive and not sample_url:
+        _expr = [p for p in ("openai", "gemini") if p in avail]
         if _expr:
             order = _expr + order
     order = [p for i, p in enumerate(order) if p in avail and p not in order[:i]]

@@ -2713,10 +2713,10 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                           "age_band": (req.context.get("age_band") or "")}
                 # (b) full-script expressive VO — length of the ad = length of this VO
                 vo = os.path.join(work, f"vo_{req.request_id[:8]}.mp3")
-                await asyncio.to_thread(lambda: vs.synthesize(
-                    script, out_path=vo,
-                    style="first-person UGC testimonial, natural, conversational, upbeat, talking to "
-                          "camera, never flat or monotone"))
+                _bstyle = ("first-person UGC testimonial, natural, conversational, upbeat, talking to "
+                           "camera, never flat or monotone")
+                _log_model_call(req.request_id, "voice", "auto", {"text": (script or "")[:400], "style": _bstyle})
+                _bvo = await asyncio.to_thread(lambda: vs.synthesize(script, out_path=vo, style=_bstyle))
                 T = await asyncio.to_thread(_audio_seconds, vo) if os.path.exists(vo) else 0.0
                 if T <= 0:
                     raise RuntimeError("VO synthesis produced no audio")
@@ -2807,7 +2807,12 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
                     _ae_persist(out_path, name)
                     return [{"recipe": label, "video_url": url, "confidence": 0.62,
                              "whats_changed": (f'{label}: UGC b-roll montage ({len(seg_paths)} clips) with a '
-                                f'first-person voiceover + kinetic word-by-word captions. Length = VO ({T:.0f}s).')}]
+                                f'first-person voiceover + kinetic word-by-word captions. Length = VO ({T:.0f}s).'),
+                             "models": {"video": None, "voice": (_bvo.get("provider") if isinstance(_bvo, dict) else None),
+                                        "voice_cloned": False, "lipsync": None,
+                                        "captions": ("whisper+ass" if (ass and os.path.exists(ass)) else None),
+                                        "recipe": label},
+                             "model_calls": _drain_model_calls(req.request_id)}]
                 logger.info("[broll] UGC-BROLL found no footage — falling back to simple stock b-roll")
             except Cancelled:
                 raise
@@ -4060,8 +4065,12 @@ async def recipe_generate(req: RunRequest) -> list:
         # Slice the BODY, then append the directives — never the other way round. Concatenating
         # first and slicing after silently cut HOOK and NO_TEXT off whenever the script was long,
         # so the model was never told "no on-screen text" (→ gibberish AI text burned in the frame,
-        # colliding with our own captions) nor "already speaking from frame 1" (→ silent opening).
-        prompt = prompt[:max(200, 1900 - len(HOOK) - len(NO_TEXT))] + HOOK + NO_TEXT
+        # colliding with our own captions).
+        # A talking-head ad opens ALREADY speaking (the HOOK); a b-roll beat has NO face/speaker, so it
+        # must NEVER be told "already speaking from the first frame" — that contradiction is exactly
+        # what rendered a faceless clip that then failed lip-sync QA. NO_TEXT applies to both.
+        _talkhook = HOOK if is_talk else ""
+        prompt = prompt[:max(200, 1900 - len(_talkhook) - len(NO_TEXT))] + _talkhook + NO_TEXT
 
         if engine in ("veo-extend", "veo", "veo3-google"):
           # Veo (Google) can 401/402/429/5xx or time out. On any non-cancellation failure,
@@ -4219,6 +4228,15 @@ async def recipe_generate(req: RunRequest) -> list:
             # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
             _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
             if _chunk:
+                # A talking beat has a SPOKEN LINE → it MUST be a talking head: the speaker's face
+                # visible, mouth moving, talking directly to camera. A b-roll "no faces to camera"
+                # style must never leak into a talking clip — it rendered a FACELESS frame that then
+                # failed lip-sync QA ("not a talking head") and burned a retry. Strip that
+                # contradiction and state the face requirement positively (b-roll never reaches here:
+                # _vo_chunks is only built when is_talk, so _chunk is empty for a scenic beat).
+                cprompt = _strip_no_face(cprompt) + (
+                    " The speaker's face is clearly visible, talking DIRECTLY to camera with natural "
+                    "mouth movement — this is a talking head, not b-roll.")
                 _hookrule = (" The person is ALREADY speaking from the very first frame — no silent "
                              "lead-in, no dead air in the opening." if ci == 0 else "")
                 cprompt = (cprompt + f' SPOKEN LINE FOR THIS CLIP — say ONLY this, word for word, and do '
@@ -4226,6 +4244,11 @@ async def recipe_generate(req: RunRequest) -> list:
             # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
             beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": _chunk}
+            # LOG + PERSIST exactly what this t2v clip is being asked to render (prompt + params).
+            _log_model_call(req.request_id, f"video/seedance clip {ci+1}/{n_clips}", f"seedance-{resolution}",
+                            {"prompt": cprompt, "seconds": per_ci, "resolution": resolution,
+                             "aspect_ratio": aspect_ratio, "shot_type": beat["shot_type"],
+                             "images": len(imgs), "videos": len(prepped_vids), "audios": len(audio_urls)})
 
             # Provider fallback: Kie-Seedance → fal-seedance → fal-kling → fal-wan. A credits/quota/5xx
             # error on one advances to the next; _AllVideoProvidersDown only if every configured one is down.
@@ -4382,7 +4405,17 @@ async def recipe_generate(req: RunRequest) -> list:
             _confidence = 0.25
         elif _final_qa.get("overall") is None:
             _confidence = 0.55
-        return [{"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": _confidence,
+        # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend).
+        # Populated from what ACTUALLY ran (same signals as whats_changed).
+        _video_label = ("veo-3.1" if _prov == "kie-veo"
+                        else "seedance-2" if "seedance" in str(_prov) else str(_prov))
+        _voice_label = ({"native": "native (model audio)", "tts": "tts (dubbed)", "none": None}
+                        .get(_audio_state) if generate_audio else None)
+        _models = {"video": _video_label, "voice": _voice_label, "voice_cloned": False,
+                   "lipsync": None,
+                   "captions": ("whisper+ass" if _caps_burned else None),
+                   "recipe": "Generate — Seedance 2.0"}
+        _gvar = {"recipe": "Generate — Seedance 2.0", "video_url": url, "confidence": _confidence,
                  "whats_changed": (f"Seedance 2.0 · {len(clip_paths)} clip(s) · ~{_vid_sec}s · {aspect_ratio} · {resolution}"
                     + (" · captions" if _caps_burned else "")
                     + f"{' · refs: ' + ', '.join(refs) if refs else ''}"
@@ -4401,7 +4434,9 @@ async def recipe_generate(req: RunRequest) -> list:
                     + (" ⚠ QA: " + "; ".join((_final_qa.get("issues") or [])[:2])
                        if (_final_qa.get("issues")) else "")),
                  "qc_issues": (_final_qa.get("issues") or []),
-                 "qc_verified": (_final_qa.get("overall") is not None)}]
+                 "qc_verified": (_final_qa.get("overall") is not None),
+                 "models": _models, "model_calls": _drain_model_calls(req.request_id)}
+        return [_gvar]
     finally:
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
@@ -4462,6 +4497,53 @@ def _track_cost(request_id, step, provider, *, model=None, units=None, unit_type
         _fin.bill(request_id, provider, float(cost_usd or 0), note or (model or step))
     except Exception:
         pass
+
+
+# ── Per-generation MODEL-CALL LOG (the "Seedance disaster" blind spot) ────────
+# The user could not see what each model actually RECEIVED. Every external model call in the
+# generation lanes (Seedance/t2v, voice synth, lip-sync, captions) logs its FULL input here, tagged
+# with the generation's request_id, AND accumulates a per-generation list that is attached to the
+# returned variant as variant["model_calls"] so the frontend can surface it. Best-effort only.
+_MODEL_CALLS: dict = {}   # request_id → [{stage, model, input_summary}]
+
+
+def _log_model_call(request_id, stage: str, model, input_obj) -> None:
+    """LOG + PERSIST one external model call's full input. Never raises, never breaks generation."""
+    try:
+        summary = input_obj if isinstance(input_obj, str) else json.dumps(input_obj, default=str, ensure_ascii=False)
+    except Exception:
+        summary = str(input_obj)
+    summary = (summary or "")[:600]
+    try:
+        logger.info(f"[model-call] rid={request_id} stage={stage} model={model} input={summary}")
+    except Exception:
+        pass
+    try:
+        _MODEL_CALLS.setdefault(request_id, []).append(
+            {"stage": stage, "model": str(model), "input_summary": summary})
+    except Exception:
+        pass
+
+
+def _drain_model_calls(request_id) -> list:
+    """Return + clear the accumulated model-call log for this generation (best-effort)."""
+    try:
+        return list(_MODEL_CALLS.pop(request_id, []))
+    except Exception:
+        return []
+
+
+_NO_FACE_RE = re.compile(r",?\s*no faces?(?:\s+to\s+camera)?", re.I)
+
+
+def _strip_no_face(text: str) -> str:
+    """Remove any 'no faces to camera' style clause from a prompt. Used so a TALKING-HEAD clip never
+    inherits a b-roll no-face visual style — that contradiction rendered faceless clips that then
+    failed lip-sync QA. Best-effort string scrub; leaves everything else intact."""
+    try:
+        return _NO_FACE_RE.sub("", text or "")
+    except Exception:
+        return text or ""
 
 
 # ── Durable lip-sync resume (long renders survive an AE restart) ──────────────
@@ -5091,6 +5173,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             logger.warning(f"[avatar-lipsync] ElevenLabs clone failed → f5/preset: {_ele}")
             voice_res = None
     if voice_res is None:
+        _log_model_call(req.request_id, "voice", ("fal-clone:character" if sample_url else voice_id),
+                        {"text": (_tts_text or "")[:400], "voice_id": voice_id, "style": _style,
+                         "cloned": bool(sample_url), "prefer_expressive": bool(_emotional_delivery)})
         voice_res = await asyncio.to_thread(lambda: vs.synthesize(
             _tts_text, voice_id=("fal-clone:character" if sample_url else voice_id),
             sample_url=sample_url, out_path=out_audio, style=_style,
@@ -5206,6 +5291,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     _cand = [prefer] if prefer else ["veed", "sync", "falsync"]
     _proj = max(_lipsync_projected_usd(p, seconds) for p in _cand)
     _gate_job_cost(req.request_id, f"lip-sync {seconds}s via {'/'.join(_cand)}", _proj, a)
+    _log_model_call(req.request_id, "lipsync", (prefer or f"auto ({quality})"),
+                    {"video": char_url, "audio": audio_url, "prefer": prefer, "quality": quality,
+                     "seconds": seconds})
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
     _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
     result = None
@@ -5288,6 +5376,8 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     if a.get("captions"):
         try:
             from ..services import captions as cap
+            _log_model_call(req.request_id, "captions", ("veed" if _use_veed else "whisper+ass"),
+                            {"style": (_cap_style or "clean"), "script": (script or "")[:400]})
             # align() NEVER comes back empty: ElevenLabs FA → Whisper word-timestamps (real timings
             # off the actual voice, so the pace is right) → Deepgram → even-split.
             _cap_words, _cap_method = await asyncio.to_thread(lambda: cap.align(out_audio, script))
@@ -5392,10 +5482,20 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
           + (f" · variation {_vidx}/{_vtot} on the {_axis} axis" if _diversify else "")
           + (f" · ⚠ {_axis_note}" if _axis_note else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
+    # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend);
+    # populated from what ACTUALLY ran (same signals as whats_changed).
+    _voice_label = ("f5-tts (clone)" if voice_res.get("provider") == "fal-clone"
+                    else "elevenlabs (clone)" if (voice_res.get("provider") == "elevenlabs"
+                                                  and voice_res.get("voice") == "clone")
+                    else f"{voice_res.get('provider')}:{voice_res.get('voice')}")
+    _models = {"video": None, "voice": _voice_label, "voice_cloned": bool(_cloned),
+               "lipsync": sub["provider"],
+               "captions": ("veed" if _use_veed else ("whisper+ass" if ass_path else None)),
+               "recipe": "Avatar Lipsync"}
     variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": _cloned,
                     "voice_swapped": bool(_swapped), "voice_requested": voice_res.get("requested"),
                     "captions": bool(ass_path or _use_veed), "caption_method": _cap_method,
-                    "whats_changed": fb, "feedback": fb})
+                    "models": _models, "whats_changed": fb, "feedback": fb})
 
     # ── STATE: log every choice so the loop can learn from ROI later ──
     try:
@@ -5432,7 +5532,57 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
             _db.close()
     except Exception as e:
         logger.warning(f"[learn] decision log skipped: {e}")
-    return [variant]
+
+    # ── LIP-SYNC A/B (opt-in via assets.lipsync_ab) ────────────────────────────────────────────────
+    # Produce a SECOND variant lip-synced with the OTHER model on the SAME audio+video, so the two
+    # lip-sync engines can be compared side by side. Each variant is labeled with its own model (the
+    # primary's whats_changed already carries "· lip-sync <provider>"; the manifest records it too).
+    # Best-effort: any failure just leaves the single primary variant. Default (no flag) = single.
+    _variants = [variant]
+    if a.get("lipsync_ab"):
+        try:
+            _ab_alt = "sync" if sub["provider"] != "sync" else "veed"
+            _log_model_call(req.request_id, "lipsync-ab", _ab_alt,
+                            {"video": char_url, "audio": audio_url, "prefer": _ab_alt, "seconds": seconds})
+            _bsub = await asyncio.to_thread(
+                lambda: lip_sync.submit_relipsync(char_url, audio_url, _ab_alt, quality=quality))
+            _bres = None
+            for _ in range(150):   # ~10 min
+                await asyncio.sleep(4)
+                _bst, _br = await asyncio.to_thread(
+                    lambda: lip_sync.poll_relipsync(_bsub["provider"], _bsub["job"]))
+                if _bst == "done":
+                    _bres = _br
+                    break
+            if _bres:
+                _stem, _ext = (name.rsplit(".", 1) + ["mp4"])[:2]
+                _bname = f"{_stem}_ab_{_bsub['provider']}.{_ext}"
+                _bvar = await _produce_lipsync_variant(
+                    req.request_id, _bname, _bres, script,
+                    cap_words=(None if _use_veed else _cap_words), vertical=(vertical or None))
+                _bcost = _lipsync_projected_usd(_bsub["provider"], seconds)
+                _track_cost(req.request_id, "lipsync", _bsub["provider"], units=seconds, unit_type="sec",
+                            cost_usd=_bcost, note=f"lip-sync A/B via {_bsub['provider']}")
+                _bfb = (fb.replace(f"· lip-sync {sub['provider']}", f"· lip-sync {_bsub['provider']}")
+                        + " · A/B arm")[:600]
+                _bmodels = dict(_models)
+                _bmodels["lipsync"] = _bsub["provider"]
+                _bvar.update({"voice": voice_res.get("provider"), "voice_id": voice_id,
+                              "cloned": _cloned, "caption_method": _cap_method,
+                              "captions": bool(_bvar.get("captions_burned") or _use_veed),
+                              "models": _bmodels, "whats_changed": _bfb, "feedback": _bfb})
+                _variants.append(_bvar)
+                logger.info(f"[avatar-lipsync] A/B: primary lip-sync {sub['provider']} + alt {_bsub['provider']}")
+        except Cancelled:
+            raise
+        except Exception as _abe:
+            logger.warning(f"[avatar-lipsync] A/B second lip-sync skipped: {_abe}")
+
+    # attach the per-generation model-call log to every variant (best-effort)
+    _mc = _drain_model_calls(req.request_id)
+    for _v in _variants:
+        _v["model_calls"] = _mc
+    return _variants
 
 
 async def recipe_fal_video(req: RunRequest) -> list:

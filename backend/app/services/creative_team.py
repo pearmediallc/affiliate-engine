@@ -687,6 +687,17 @@ Return STRICT JSON: {{"realism": <0-10>, "lipsync": <0-10>, "captions": <0-10>,
                 "fault_personas": []}
     out["verified"] = True
     out["fault_personas"] = [p for p in (out.get("fault_personas") or []) if p in _FAULT_PERSONAS]
+    if not is_talking:
+        # SKIP lip-sync scoring for a non-talking beat: a scenic/b-roll frame has NO speaker, so a
+        # "frame is not a talking head → lip-sync impossible" observation is CORRECT, not a defect.
+        # Force lip-sync to a pass and drop any lip-sync complaint (and the 'shots' fault when that was
+        # its only cause) so the beat is never failed + retried on "lipsync evaluation impossible".
+        out["lipsync"] = 10
+        _kept = [i for i in (out.get("issues") or [])
+                 if not _re.search(r"lip[\s-]?sync|talking head", str(i), _re.I)]
+        if not _kept:
+            out["fault_personas"] = [p for p in out["fault_personas"] if p != "shots"]
+        out["issues"] = _kept
     return out
 
 

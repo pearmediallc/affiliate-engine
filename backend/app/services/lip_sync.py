@@ -247,15 +247,16 @@ def _fal_submit(video_url: str, audio_url: str) -> str:
     return rid
 
 
-# fal hosts SEVERAL lip-sync models at wildly different prices for the same job:
-#   kling  $0.014 / 5s block  ≈ $0.17/min   ← bulk workhorse
-#   sync-1.9-beta            ≈ $0.70/min
-#   veed/lipsync  $0.07/sec  ≈ $4.20/min    ← what we were silently defaulting to ($6.23 for one ad)
-# Same audio→video task, 25x price spread. Endpoint choice IS the cost model.
+# fal hosts SEVERAL lip-sync models at different prices for the same job. REAL rates below are from
+# fal's ACTUAL invoice, NOT the docs sticker price ($0.07/sec for veed overstates real billing ~7x):
+#   veed/lipsync             ≈ $0.60/min   ← cheapest WORKING lane → leads the bulk chain
+#   sync-1.9-beta (falsync)  ≈ $0.70/min   ← mid tier
+#   kling  $0.014 / 5s block ≈ $0.17/min   ← headline-cheap but rejects >10s clips (dead end for UGC)
+# Endpoint choice IS the cost model.
 FAL_LIPSYNC_ENDPOINTS = {
-    "kling": "fal-ai/kling-video/lipsync/audio-to-video",   # ~$0.17/min — default
+    "kling": "fal-ai/kling-video/lipsync/audio-to-video",   # ~$0.17/min — >10s clips rejected
     "falsync": "fal-ai/sync-lipsync",                        # ~$0.70/min — mid tier
-    "veed": "veed/lipsync",                                  # ~$4.20/min — hero/opt-in ONLY
+    "veed": "veed/lipsync",                                  # ~$0.60/min real — cheapest working lane (bulk lead)
 }
 # Observed from fal's ACTUAL invoice (~$1.20 for a full day of veed renders), NOT the
 # docs sticker price of $0.07/sec (=$4.20/min) which over-states real billing ~5x.
@@ -348,27 +349,22 @@ def submit_relipsync(video_url: str, audio_url: str, prefer: str = None, quality
     """Submit a video→video re-lipsync, routed by cost/quality. Returns {provider, job} WITHOUT
     waiting — the caller persists this + polls. bulk = cheapest-first (Replicate per-render is
     cheapest for volume); premium = best-quality-first (sync.so). `prefer` overrides."""
-    # bulk: LatentSync/Wav2Lip (Replicate, ~$0.03–0.09) → fal → sync.so (pricey at volume)
-    # premium: sync.so (best) → fal → Replicate
+    # bulk (default): veed (fal veed/lipsync) LEADS — at ~$0.60/min real it is the cheapest WORKING
+    #   lane (fal-kling is cheaper on paper but rejects >10s clips) → falsync → Replicate.
+    # premium: sync.so FIRST (blends the mouth/jaw seam best) but it is EXPENSIVE per job (~$1.5–5),
+    #   so it leads ONLY when premium is explicitly requested → then veed → falsync → Replicate.
     # Replicate lanes are dropped entirely unless the account is funded (REPLICATE_ENABLED) —
     # an unfunded token 402s on every render, which just burns time and falls through anyway.
-    # COST-ORDERED. 'fal' used to mean veed/lipsync (~$4.20/min) and sat ahead of sync.so, so with
-    # Replicate unfunded EVERY bulk render silently took the single most expensive lane on the
-    # market — one 89s ad billed $6.23. Same task on fal-kling costs ~$0.25.
-    #   kling ~$0.17/min · latentsync ~$0.09/render · wav2lip ~$0.03 · falsync ~$0.70 · sync.so ~$0.70 · veed ~$4.20
-    # NOTE: fal-kling is NOT in any chain. Per fal's docs it accepts only 2-10 SECOND source
-    # videos (ours are 20-45s), so it rejects every real avatar clip with "Video size is too large"
-    # after a ~12min wait — a guaranteed dead end, not a cheap lane. Its $0.17/min headline rate is
-    # unreachable for full-length UGC. Kept selectable via `prefer` for short clips only.
-    # FINAL ORDER — 'veed' is DELIBERATELY absent from every default chain (it is the priciest lane,
-    # ~$4.20/min, and hero-only, reachable solely via an explicit prefer="veed"). sync.so blends the
-    # mouth/jaw seam best AND runs on a free credit, so it LEADS both chains; then the cheaper fal
-    # (falsync) and Replicate (latentsync/wav2lip) lanes. This fixes the old contradiction where the
-    # comment said "veed is NEVER default" yet veed sat FIRST — so every bulk render silently took the
-    # single most expensive lane on the market.
-    #   premium & bulk: sync.so → falsync → latentsync → wav2lip
-    chain = (["sync", "falsync", "latentsync", "wav2lip"] if quality == "premium"
-             else ["sync", "falsync", "latentsync", "wav2lip"])
+    # REAL per-lane rates (fal's ACTUAL invoice, not docs sticker):
+    #   veed ~$0.60/min · falsync ~$0.70/min · kling ~$0.17/min · latentsync ~$0.09/render · wav2lip ~$0.03
+    #   sync.so (direct) ~$1.5–5/job — priciest, best seam → premium lead only.
+    # NOTE: fal-kling is NOT in any chain. Per fal's docs it accepts only 2-10 SECOND source videos
+    # (ours are 20-45s), so it rejects every real avatar clip with "Video size is too large" after a
+    # ~12min wait — a guaranteed dead end. Kept selectable via `prefer` for short clips only.
+    #   bulk:    veed → falsync → latentsync → wav2lip
+    #   premium: sync → veed → falsync → latentsync → wav2lip
+    chain = (["sync", "veed", "falsync", "latentsync", "wav2lip"] if quality == "premium"
+             else ["veed", "falsync", "latentsync", "wav2lip"])
     if not settings.replicate_usable:
         chain = [p for p in chain if p not in ("latentsync", "wav2lip")]
     order, seen, errors = [], set(), []
