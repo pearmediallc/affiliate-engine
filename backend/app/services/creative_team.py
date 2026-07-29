@@ -242,6 +242,8 @@ WINNER STRUCTURE (reference): {winner_transcript[:900]}
 AVAILABLE REFERENCES: {json.dumps(refs)[:600]}
 HAVE REAL CHARACTER FOOTAGE: {has_real_character}   HAVE WINNER VIDEO: {has_winner_video}
 
+Do NOT name specific voice/TTS/model providers (e.g. ElevenLabs, f5, OpenAI) anywhere in approach/model_intent/notes — describe the DESIRED voice qualities (age, tone, delivery) instead; the engine picks the provider.
+
 Return STRICT JSON:
 {{"approach": "one-line creative direction for the whole ad",
   "reference_plan": "which references to use and where (hook, body, proof, CTA)",
@@ -579,9 +581,12 @@ _TECHNIQUE_BY_STRATEGY = {
 
 # ── 6. Prompt Writer (deterministic composition from the library) ─────────────
 def prompt_writer(*, beats: list, entity_desc: str, vertical: str,
-                  n_reference_images: int = 0, has_reference_video: bool = False) -> list:
+                  n_reference_images: int = 0, has_reference_video: bool = False,
+                  omit_spoken_line: bool = False) -> list:
     """Compose each beat's final prompt from the Prompt Reference Library via the realism engine.
-    No hardcoded style string — the request_type selects the reference DNA."""
+    No hardcoded style string — the request_type selects the reference DNA.
+    omit_spoken_line=True → don't render 'They say exactly: "…"' (the t2v per-clip caller appends its
+    own authoritative SPOKEN LINE, so rendering it here too would produce two conflicting instructions)."""
     for b in beats:
         b["prompt"] = rpe.build_prompt(
             model=b["model"],
@@ -595,6 +600,7 @@ def prompt_writer(*, beats: list, entity_desc: str, vertical: str,
             vertical=vertical,
             n_reference_images=n_reference_images,
             has_reference_video=has_reference_video,
+            omit_spoken_line=omit_spoken_line,
         )
     return beats
 
@@ -798,8 +804,8 @@ def _summarize_master_plan(plan: dict) -> str:
 
 
 def _summarize_beat_prompts(beats: list) -> str:
-    """Surface the ACTUAL prompts the Prompt Writer composed (per-beat, truncated) so the work-log
-    shows the real composition, not just a '{n} prompts composed' count. Defensive: never raises;
+    """Surface the ACTUAL prompts the Prompt Writer composed (per-beat, FULL) so the work-log shows
+    the real composition, not just a '{n} prompts composed' count. Defensive: never raises;
     degrades to the generic count label."""
     try:
         bs = beats or []
@@ -810,12 +816,15 @@ def _summarize_beat_prompts(beats: list) -> str:
             prompt = " ".join(str(b.get("prompt") or "").split())
             if not prompt:
                 continue
-            snippet = prompt[:120] + ("…" if len(prompt) > 120 else "")
+            # Show the FULL composed prompt for each beat — a 120-char snippet cut every prompt off
+            # mid-sentence ("… her …"). Cap at 6000 to match build_prompt's own max (so nothing that
+            # was actually sent is half-shown), and raise the overall cap so beats aren't cut either.
+            snippet = prompt[:6000] + ("…" if len(prompt) > 6000 else "")
             parts.append(f"beat {i} ({kind}): {snippet}")
         summary = " | ".join(parts).strip()
         if not summary:
             return f"{len(bs)} prompts composed"
-        return (f"{len(bs)} prompts composed — " + summary)[:600]
+        return (f"{len(bs)} prompts composed — " + summary)[:60000]
     except Exception:
         return f"{len(beats or [])} prompts composed"
 
@@ -841,6 +850,7 @@ async def run_creative_team(
     run_critic: bool = True,
     user_script: str = "",
     allow_rewrite: bool = True,
+    omit_spoken_line: bool = False,
 ) -> dict:
     """Run the full team (led by the Creative Director) and return an executable CreativePlan:
     {plan, strategy, script, entity_desc, beats:[...], critique}. Every step reports live to the
@@ -918,7 +928,8 @@ async def run_creative_team(
     # 6) Prompt Writer: compose anti-slop prompts from the reference library.
     ts = act.start("prompt", job_id, "composing anti-slop prompts")
     beats = prompt_writer(beats=beats, entity_desc=character, vertical=vertical,
-                          n_reference_images=n_reference_images, has_reference_video=has_reference_video)
+                          n_reference_images=n_reference_images, has_reference_video=has_reference_video,
+                          omit_spoken_line=omit_spoken_line)
     act.finish("prompt", job_id, ts, ok=True, detail=_summarize_beat_prompts(beats),
                helpfulness=1.0 if beats else 0.0)
 

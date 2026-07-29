@@ -150,6 +150,9 @@ def build_prompt(
     n_reference_images: int = 0,
     has_reference_video: bool = False,
     audio: bool = True,
+    omit_spoken_line: bool = False,    # t2v per-clip path appends its OWN authoritative SPOKEN LINE, so
+                                       # skip rendering 'They say exactly: "…"' here (avoids two conflicting
+                                       # speech instructions). Avatar/other callers keep the line (default).
 ) -> str:
     """Compose a front-loaded, one-action prompt for THIS request type by pulling the matching
     STYLE PROFILE + rules from the Prompt Reference Library (not a hardcoded single style)."""
@@ -167,7 +170,7 @@ def build_prompt(
         parts.append(f"Environment: {environment}.")
     parts.append(f"Lighting: {lit}.")                                 # 4) lighting
     parts.append(f"Action (one continuous motion, no cuts): {action.strip()}.")   # 5) one action
-    if line:
+    if line and not omit_spoken_line:
         parts.append(f'They say exactly: "{line.strip()}" with matching lip movement, '
                      f'{_emotion_cue(emotion, gesture)}.')
     parts.append(prof["look"])                                        # 6) request-type aesthetic (anti-slop)

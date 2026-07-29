@@ -1954,8 +1954,17 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             _rt = str(out.get("request_type") or "").lower()
             _gd = str(out.get("gender") or "").lower()
             _ab = str(out.get("age_band") or "").lower()
+            # DURATION FROM THE BRIEF. The user may have stated the length earlier (e.g. a brief
+            # answer "24 SECONDS") rather than in this message. The router's own `seconds` is
+            # unreliable (it defaults to 15 on every classify), so it must NEVER win — parse a
+            # duration the USER actually stated ANYWHERE in the conversation; if none was ever stated
+            # return 0 (=Auto, so AE sizes runtime from the script), never a default.
+            _user_said = " ".join((h.get("text") or "") for h in history
+                                  if (h.get("role") or "user") == "user") + " " + message
+            _sm = re.search(r"(\d{1,3})\s*(?:s\b|sec|second)", _user_said, re.I)
+            _stated_secs = int(_sm.group(1)) if _sm else 0
             return {"action": "make_video", "source": src,
-                    "prompt": (out.get("prompt") or message).strip(), "seconds": int(out.get("seconds") or 15),
+                    "prompt": (out.get("prompt") or message).strip(), "seconds": _stated_secs,
                     "request_type": _rt if _rt in ("ugc", "broll") else None,
                     "gender": _gd if _gd in ("female", "male") else None,
                     "age_band": _ab if _ab in ("under35", "45-55", "55plus") else None}
@@ -3892,6 +3901,11 @@ async def recipe_generate(req: RunRequest) -> list:
                 # avatar reroute already used, now applied at the office so ALL lanes agree.
                 user_script=_verbatim_user_script(assets),
                 allow_rewrite=_rewrite_allowed(assets),
+                # T2V PER-CLIP OWNS THE SPEECH. On this lane each clip appends its OWN authoritative
+                # `SPOKEN LINE FOR THIS CLIP`, so the composed beat prompt must NOT also render
+                # `They say exactly: "…"` — two speech instructions in one prompt fight each other.
+                # Harmless on the avatar lane (which speaks plan["script"], not the visual prompt).
+                omit_spoken_line=True,
                 run_critic=True)
             refined = (plan.get("beats") or [{}])[0].get("prompt")
             if refined:
@@ -4167,6 +4181,19 @@ async def recipe_generate(req: RunRequest) -> list:
         # a fixed seconds/15 that repeats. Non-talking (broll) keeps the seconds-based split.
         from ..services import realism_prompt_engine as _rpe
         _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=28) if is_talk else []
+        # TALKING-HEAD IDENTITY GUARD (t2v fallback). A synthetic talking head rendered as MULTIPLE
+        # independent t2v generations comes back with a DIFFERENT face per clip — Seedance re-rolls the
+        # character each generation and first-frame anchoring only softens the drift. When a talking-head
+        # UGC that WANTED avatar-lipsync (no reference video, not an explicit b-roll) has fallen through
+        # to t2v because no avatar could be cast, render ONE continuous clip so identity stays consistent
+        # within the single generation — even though that caps the spoken length at ~one clip. Trim
+        # _vo_script to match so captions/TTS describe only what actually renders. Scenic b-roll (many
+        # distinct scenes) and winner-clone (reference video) keep their multi-clip split.
+        if is_talk and not video_urls and not _asked_broll and len(_vo_chunks) > 1:
+            _vo_chunks = _vo_chunks[:1]
+            _vo_script = _vo_chunks[0]
+            logger.info("[generate] talking-head t2v fallback (no castable avatar) → capping to ONE "
+                        "continuous clip for face consistency (identity guard)")
         _per_list = None
         if _vo_chunks:
             # Size clips off the SCRIPT, not the requested `seconds`: render EVERY chunk (so the whole
