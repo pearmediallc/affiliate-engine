@@ -250,11 +250,9 @@ def _cta_button_lines(text: str, start: float, end: float, play_w: int, play_h: 
         else:                        # steady pulse: grow then shrink within the cycle
             eff = r"{\an5\pos(%d,%d)\t(0,%d,\fscx106\fscy106)\t(%d,%d,\fscx100\fscy100)}" % (cx, cy, half, half, ms)
         lines.append("Dialogue: 2,%s,%s,Cta,,0,0,0,,%s%s" % (_fmt(t), _fmt(ce), eff, text))
-        # tap-ripple ring: expand the outline + fade to transparent over ~0.6s (layer BELOW the button)
-        r_ms = min(ms, 600)
-        ring = r"{\an5\pos(%d,%d)\bord%d\blur2\t(0,%d,\bord%d\blur9\alpha&HFF&)}" % (
-            cx, cy, max(4, int(5 * k)), r_ms, max(18, int(22 * k)))
-        lines.append("Dialogue: 1,%s,%s,CtaGlow,,0,0,0,,%s%s" % (_fmt(t), _fmt(min(t + r_ms / 1000.0, end)), ring, text))
+        # NOTE: the old "tap-ripple ring" (a CtaGlow copy of the SAME words with an expanding outline)
+        # rendered as a large, OFFSET yellow duplicate BEHIND the blue button — it read as a broken
+        # double caption. Removed: the blue pulsing button alone is the CTA affordance now.
         t = ce
     return lines
 
