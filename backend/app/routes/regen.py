@@ -590,6 +590,31 @@ def _stream_duration(path: str, kind: str = "v") -> float:
     except Exception:
         return 0.0
 
+def _speech_end_ts(path: str, video_end: float) -> Optional[float]:
+    """Timestamp where the FINAL trailing silence begins (i.e. the last spoken word ends), or None if
+    the audio runs sound-to-end (no trailing dead-air). Uses ffmpeg `silencedetect` (noise=-35dB, d=0.6)
+    and finds the LAST non-silent moment. Robust to ffmpeg builds that emit a silence_end at EOF: a
+    silence only counts as 'trailing' when it extends to within 0.35s of the clip end (or has no matching
+    end at all). Best-effort — returns None on any error so the caller keeps the original clip."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af", "silencedetect=noise=-35dB:d=0.6", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=180)
+        log = (proc.stderr or "") + (proc.stdout or "")
+        starts = [float(m) for m in re.findall(r"silence_start:\s*([0-9.]+)", log)]
+        ends = [float(m) for m in re.findall(r"silence_end:\s*([0-9.]+)", log)]
+        if not starts:
+            return None
+        # trailing silence only if the LAST detected silence runs to (near) the clip end:
+        #   • more starts than ends → a dangling silence_start ran to EOF, or
+        #   • the last silence_end lands within 0.35s of the clip end (EOF-flushed silence).
+        runs_to_eof = len(starts) > len(ends)
+        if not runs_to_eof and ends and video_end:
+            runs_to_eof = (video_end - ends[-1]) <= 0.35
+        return starts[-1] if runs_to_eof else None
+    except Exception:
+        return None
+
 def _probe_audio(path: str):
     """DETERMINISTIC tri-state: True (has an audio stream) / False (definitely none) / None (probe
     failed — unknown). A vision/frame critic literally cannot hear, so 'the fallback shipped silent
@@ -3498,6 +3523,25 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
         except Exception as e:
             logger.warning(f"[eval-gate] abrupt check errored: {e}")
 
+        # ── 1b′. NO TRAILING DEAD-AIR — video must not HANG on a frozen tail after speech ends ──────
+        # The MIRROR of never-abrupt: a fixed-length t2v clip whose narration finishes early leaves a
+        # frozen frame + dead silence that "hangs". The t2v lane trims this upstream; this is the safety
+        # net so it never ships unnoticed when the trim could not run. Detect where the final trailing
+        # silence begins (silencedetect); flag as a spec/quality issue if the dead-air exceeds ~1.5s.
+        no_dead_air = None
+        try:
+            if vdur:
+                _spk_end = await asyncio.to_thread(_speech_end_ts, final_path, vdur)
+                if _spk_end is not None:
+                    _dead = vdur - _spk_end
+                    no_dead_air = _dead <= 1.5
+                    checks.append(("no_dead_air", no_dead_air))
+                    if not no_dead_air:
+                        reasons.append(f"trailing dead-air / frozen tail: {_dead:.1f}s of silence after "
+                                       f"the last word (video {vdur:.1f}s, speech ends ~{_spk_end:.1f}s)")
+        except Exception as e:
+            logger.warning(f"[eval-gate] trailing dead-air check errored: {e}")
+
         # ── 1c. NO RESIDUAL CAPTIONS — only when OUR captions are OFF ──────────────────────────────
         # The caller passes the RESOLVED captions flag (whether we actually burned any). If ours are
         # OFF but the detector still finds burned-in text, it is the source footage's captions → fail.
@@ -3631,6 +3675,7 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
             _fails = []
             if faithful is False:    _fails.append(("faithfulness", "spoken audio does not match the script"))
             if not_abrupt is False:  _fails.append(("abrupt-end", "video ends before the narration (last word cut)"))
+            if no_dead_air is False: _fails.append(("trailing-dead-air", "video hangs on a frozen tail after the narration ends"))
             if no_residual is False: _fails.append(("residual-captions", "source footage's burned-in captions on screen"))
             if hard_artifact:        _fails.append(("visible-artifact", "hard visual artifact (eyes/hands/warp/text)"))
             if cast_ok is False:     _fails.append(("cast-mismatch", "on-camera person is the wrong gender"))
@@ -4992,6 +5037,31 @@ async def recipe_generate(req: RunRequest) -> list:
                 import shutil as _shf; _shf.move(_fin, out_path)
             except Exception as _fe:
                 logger.warning(f"[generate] finish pass skipped: {_fe}")
+        # ── TRIM TRAILING DEAD-AIR / FROZEN TAIL (t2v/Seedance ONLY) ────────────────────────────────
+        # Seedance renders a FIXED clip length, so when the narration ends before the clip does the tail
+        # is a frozen frame + dead silence that "hangs" (user: t2v clip "stuck for the last 3 seconds").
+        # This is the MIRROR of the avatar lane's freeze-hold (which EXTENDS a short video to cover the
+        # voice): here we END cleanly right after the last word (+ a ~0.4s breath). Detect the real end of
+        # speech via silencedetect; if the trailing dead-air is meaningful (>0.8s), re-encode with `-t`
+        # (no resolution change). Never over-trim below a 3s floor. Runs before the eval gate so QA sees
+        # the corrected file. Best-effort: any failure keeps the original clip.
+        try:
+            _vend = await asyncio.to_thread(_stream_duration, out_path, "v") \
+                    or await asyncio.to_thread(_ffprobe_duration, out_path)
+            _spk_end = await asyncio.to_thread(_speech_end_ts, out_path, _vend)
+            if _vend and _spk_end is not None and (_vend - _spk_end) > 0.8:
+                _trim_to = max(3.0, min(_vend, _spk_end + 0.4))
+                if _vend - _trim_to > 0.25:   # only re-encode when it actually shortens the clip
+                    _trimmed = os.path.join(work, "trimmed.mp4")
+                    await asyncio.to_thread(_ffmpeg,
+                        ["-i", out_path, "-t", f"{_trim_to:.2f}", "-c:v", "libx264", "-preset", "veryfast",
+                         "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-y", _trimmed], 400)
+                    if os.path.exists(_trimmed):
+                        import shutil as _sht; _sht.move(_trimmed, out_path)
+                        logger.info(f"[generate] t2v trailing dead-air {_vend - _trim_to:.1f}s trimmed "
+                                    f"→ ends at {_trim_to:.1f}s (last word ~{_spk_end:.1f}s)")
+        except Exception as _te:
+            logger.warning(f"[generate] trailing dead-air trim skipped: {_te}")
         # EVAL GATE — the global examiner on the assembled deliverable (faithfulness, never-abrupt,
         # residual captions, specs, cast + a cross-family semantic judge). Wraps final-video QA so it
         # runs once. Pass the RESOLVED captions flag (whether we actually burned any). Recorded to
