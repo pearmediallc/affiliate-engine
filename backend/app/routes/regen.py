@@ -1993,6 +1993,7 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     history = payload.get("history") or []
     message = (payload.get("message") or "").strip()
     vertical = payload.get("vertical") or ""
+    user_id = str(payload.get("user_id") or "").strip()   # CL passes req.user.id — memory is scoped to it
     if not message:
         return {"action": "reply", "text": "What would you like to make?"}
     lines = []
@@ -2046,12 +2047,24 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
         f"{round(2.5 * _brief_secs)} words per script for a {_brief_secs}-second read; going over the "
         f"budget is a defect. Keep the hook (first sentence) and the CTA (last sentence) tight.\n"
     ) if _brief_secs > 0 else ""
+    # PER-USER LONG-TERM MEMORY (best-effort; NEVER blocks or breaks chat). Inject what we've learned
+    # about THIS user (scoped by user_id) so the router personalizes + pre-fills the brief instead of
+    # re-asking what they've historically always chosen. Empty (no-op) when we know nothing about them.
+    _mem_block = ""
+    if user_id:
+        try:
+            from ..services import user_memory
+            _mems = await user_memory.retrieve(user_id, message)
+            _prefs = user_memory.preferences(user_id)
+            _mem_block = user_memory.render_context_block(_mems, _prefs)
+        except Exception as _me:
+            logger.warning(f"studio memory retrieve failed: {_me}")
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
         "then output ONE strict-JSON action. Prefer acting over asking for edits/iterations — BUT for a "
         "NEW script/video request that lacks the creative brief, gathering the brief FIRST is the correct "
         "action, not a fallback (see FOLLOW-UP BEFORE WRITING — it is MANDATORY there).\n\n"
-        + _no_placeholder + _dna_block +
+        + _no_placeholder + _dna_block + _mem_block +
         f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
         f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
@@ -2103,6 +2116,21 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     try:
         out = await _gemini_json(ask)
         action = str(out.get("action") or "reply").lower()
+        # Fire-and-forget: learn this user's stable preferences + what they made from this turn.
+        # Best-effort and non-blocking — a memory failure must never delay or break the response.
+        if user_id:
+            try:
+                from ..services import user_memory
+                _recent = [{"role": h.get("role") or "user", "text": h.get("text") or ""}
+                           for h in history[-8:]]
+                _recent.append({"role": "user", "text": message})
+                _recent.append({"role": "assistant",
+                                "text": f"[took action: {action}; vertical="
+                                        f"{out.get('vertical') or _vt}; seconds="
+                                        f"{out.get('seconds') or _brief_secs or ''}]"})
+                asyncio.create_task(user_memory.extract(user_id, _recent))
+            except Exception as _xe:
+                logger.warning(f"studio memory extract schedule failed: {_xe}")
         if action == "write_script":
             scripts = [s for s in (out.get("scripts") or []) if (s.get("text") or "").strip()][:5]
             if not scripts:

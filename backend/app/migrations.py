@@ -133,3 +133,74 @@ def run_migrations() -> None:
         except Exception as e:
             # Likely already migrated; not fatal.
             logger.debug(f"migrations: usage_logs.cost_usd ALTER skipped: {e}")
+
+    # Per-user long-term agentic memory table. Created here (not from a SQLAlchemy model) because it
+    # picks its embedding column type at runtime — vector(1536) when pgvector is available, else a
+    # JSON-text fallback — which a static model can't express.
+    _ensure_user_memory_table()
+
+
+def _ensure_user_memory_table() -> None:
+    """Create the pgvector-optional `user_memory` table (idempotent).
+
+    Detects pgvector at runtime: on Postgres we try `CREATE EXTENSION IF NOT EXISTS vector` (the DB
+    user may lack permission — we log and continue), then check pg_type. If `vector` is available the
+    embedding column is vector(1536) and search uses the `<=>` operator; otherwise embedding is TEXT
+    holding a JSON float array and cosine similarity is computed in Python (per-user rows are few).
+    """
+    dialect = engine.dialect.name
+    is_pg = dialect.startswith("postgres")
+
+    use_vector = False
+    if is_pg:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        except Exception as e:
+            logger.warning(f"migrations: pgvector extension unavailable ({e}); "
+                           f"user_memory will use the JSON-text embedding fallback")
+        try:
+            with engine.connect() as conn:
+                use_vector = bool(conn.execute(
+                    text("SELECT 1 FROM pg_type WHERE typname = 'vector'")).first())
+        except Exception:
+            use_vector = False
+
+    id_ddl = "BIGSERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    emb_ddl = "vector(1536)" if use_vector else "TEXT"   # TEXT = JSON float array (fallback)
+    ts_ddl = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"        # portable across SQLite + Postgres
+
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS user_memory (
+            id          {id_ddl},
+            user_id     TEXT NOT NULL,
+            kind        TEXT NOT NULL DEFAULT 'factual',   -- factual | episodic | semantic
+            mem_key     TEXT,                              -- set for factual overrides; NULL for episodic
+            content     TEXT,
+            embedding   {emb_ddl},
+            source_ref  TEXT,                              -- provenance: the message/turn it came from
+            created_at  {ts_ddl},
+            updated_at  {ts_ddl}
+        )
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        logger.info(f"migrations: user_memory table ready (embedding={emb_ddl})")
+    except Exception as e:
+        logger.error(f"migrations: failed to create user_memory: {e}")
+        return
+
+    try:
+        with engine.begin() as conn:
+            # Every read/write filters by user_id (strict per-user scoping).
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id)"))
+            # Upsert key for factual overrides: one row per (user_id, kind, mem_key). Episodic rows
+            # carry mem_key=NULL, and NULLs are distinct in a unique index on BOTH SQLite and Postgres,
+            # so episodic memories append freely while factual ones overwrite (no stale duplicates).
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_memory_key "
+                "ON user_memory(user_id, kind, mem_key)"))
+    except Exception as e:
+        logger.warning(f"migrations: user_memory index skipped: {e}")
