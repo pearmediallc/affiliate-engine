@@ -26,6 +26,7 @@ so chat/generation is never broken by this subsystem.
 """
 import json
 import math
+import re
 import asyncio
 import logging
 from typing import Optional
@@ -219,13 +220,27 @@ async def extract(user_id, recent_messages: list) -> None:
         )
         if not isinstance(data, dict):
             return
+        # ANTI-HALLUCINATION: provenance must be REAL, not merely present. Build a normalized blob of
+        # what the USER actually said and only store an item whose cited `source` is genuinely a phrase
+        # in it. This makes a fabricated fact structurally impossible to persist — the model cannot
+        # invent both a value AND a matching quote, because the quote is checked against the transcript.
+        def _norm(t: str) -> str:
+            return re.sub(r"\s+", " ", (t or "").lower()).strip()
+        _said = _norm(" ".join(
+            str(m.get("text") or m.get("content") or "") for m in recent_messages
+            if isinstance(m, dict) and (m.get("role") in (None, "user"))))
+
+        def _grounded(src: str) -> bool:
+            s = _norm(src)
+            return len(s) >= 4 and s in _said   # the cited quote must actually appear in the user's words
+
         for item in (data.get("factual") or []):
             if not isinstance(item, dict):
                 continue
             key = _norm_key(item.get("key"))
             val = str(item.get("value") or "").strip()
             src = str(item.get("source") or "").strip()[:400]
-            if not key or not val or not src:   # require provenance — no source, no store
+            if not key or not val or not _grounded(src):   # require REAL provenance — no verified quote, no store
                 continue
             content = f"{key}: {val}"
             _upsert(user_id, "factual", key, content, await _embed(content), src)
@@ -234,7 +249,7 @@ async def extract(user_id, recent_messages: list) -> None:
                 continue
             summary = str(item.get("summary") or "").strip()[:1000]
             src = str(item.get("source") or "").strip()[:400]
-            if not summary or not src:
+            if not summary or not _grounded(src):
                 continue
             _upsert(user_id, "episodic", None, summary, await _embed(summary), src)
     except Exception as e:
