@@ -4250,13 +4250,19 @@ async def _cast_library_avatar(intent: dict):
             (best_any.get("url") if best_any else None), best_any)
 
 
-async def _cast_library_broll(intent: dict, limit: int = 8) -> list:
+async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
     """Scan the tagged asset library for scenic B-ROLL clips matching the parsed intent. Mirrors
     _cast_library_avatar's DB scan but collects clips tagged usable_as/kind == 'broll' with a url.
     Ranked by vertical match (strong), then scene, preferring LOW face_score (b-roll should be
-    scenic, not a face). Read-only, never raises. Returns up to `limit` clip URLs, best first."""
+    scenic, not a face). Read-only, never raises. Returns up to `limit` clip URLs, best first.
+
+    prefer_kind: when set (e.g. 'hook' for the oddly-satisfying scroll-stopper openers — leaf-blowing,
+    hedge-trimming), boost that kind AND return it FIRST regardless of vertical. Those satisfaction
+    clips are cross-vertical (tagged vertical=None), so the same-vertical hard-filter below would
+    otherwise drop them whenever the vertical has its own interior b-roll. Absent → today's behavior."""
     want_scene = (intent.get("scene") or "").lower()
     want_vert = (intent.get("vertical") or "").lower()
+    prefer_kind = (prefer_kind or "").lower()
     try:
         from ..database import SessionLocal
         from ..models.asset_tag import AssetTag
@@ -4281,27 +4287,37 @@ async def _cast_library_broll(intent: dict, limit: int = 8) -> list:
         if (t.get("usable_as") or "").lower() != "broll" and (t.get("kind") or "").lower() != "broll":
             continue
         _cv = (t.get("vertical") or "").lower()
+        _kind = (t.get("kind") or "").lower()
         s = 0.0
         _same_vert = bool(want_vert and _cv == want_vert)
         if _same_vert:
             s += 6                                   # STRONGLY prefer same-vertical footage
+        if prefer_kind and _kind == prefer_kind:
+            s += 5                                   # bias the asked-for kind (e.g. satisfaction 'hook')
         if want_scene and want_scene in (t.get("scene") or "").lower():
             s += 2
         s -= 1.5 * float(t.get("face_score") or 0)   # b-roll is scenic → LOW face_score wins
-        scored.append((s, url, _cv, _same_vert))
+        scored.append((s, url, _cv, _same_vert, _kind))
     scored.sort(key=lambda x: x[0], reverse=True)
+    # PREFERRED KIND wins first, ACROSS verticals: the satisfaction 'hook' openers are the scroll-
+    # stopper and are tagged vertical=None, so honor them before the same-vertical filter below (which
+    # would otherwise strip them). Falls through to the normal ranking when we have none of that kind.
+    if prefer_kind:
+        _pk = [(s, u) for s, u, cv, sv, kd in scored if kd == prefer_kind]
+        if _pk:
+            return [u for _, u in _pk[:max(1, int(limit))]]
     # RELEVANCE FILTER: when we know the vertical AND we have clips tagged for it, return ONLY those —
     # never pad a home-insurance ad with off-vertical footage (e.g. an auto clip) just to fill time.
     # If NOTHING matches the vertical, fall back to generic-tagged clips (untagged vertical), and only
     # then to the full ranked set — so it still produces something when the library has no exact match.
     if want_vert:
-        _match = [(s, u) for s, u, cv, sv in scored if sv]
+        _match = [(s, u) for s, u, cv, sv, kd in scored if sv]
         if _match:
             return [u for _, u in _match[:max(1, int(limit))]]
-        _generic = [(s, u) for s, u, cv, sv in scored if not cv]
+        _generic = [(s, u) for s, u, cv, sv, kd in scored if not cv]
         if _generic:
             return [u for _, u in _generic[:max(1, int(limit))]]
-    return [u for _, u, _cv, _sv in scored[:max(1, int(limit))]]
+    return [u for _, u, _cv, _sv, _kd in scored[:max(1, int(limit))]]
 
 
 async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_ratio: str,
@@ -5656,7 +5672,200 @@ async def _diversify_hook(script: str, index: int, total: int, offer_value: str,
         return script
 
 
-async def recipe_avatar_lipsync(req: RunRequest) -> list:
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# UGC-BROLL ASSEMBLER
+# The real library UGC-BROLL format (S2-TX-UGC-BROLL-HAM / -RIT): ONE continuous first-person voice,
+# kinetic red-box captions running from frame 1, and the picture alternating between a real filmed
+# talking-head (lip-synced) and oddly-satisfying / transformation b-roll (leaf-blowing a drive clean,
+# laying garage-floor tiles, an interior "same house" walk). Two proven layouts:
+#   ham  → open COLD on satisfaction b-roll (VO+captions already going), then the character cuts in
+#          and CONTINUES the same sentence in lip-sync, then a mid-roll interior insert.
+#   rit  → open on the talking-head (~4s), then cut to the satisfaction/transformation b-roll that
+#          carries the middle, then back to the face for the CTA.
+# Built entirely by ASSEMBLY: the lip-sync step (recipe_avatar_lipsync) already gives us the face
+# video AND the continuous VO; we just swap the PICTURE on the b-roll windows (audio plays straight
+# through) and let the existing kinetic-caption burn run over the whole composite. Best-effort:
+# any shortfall (no footage, ffmpeg error) returns None and the caller ships the plain talking-head.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+def _clean_windows(windows: list, T: float, min_len: float = 1.5) -> list:
+    """Clamp (start,end) b-roll windows to [0,T], drop any shorter than min_len, sort, and drop
+    overlaps (keep the earlier). Pure math, no I/O."""
+    out = []
+    for s, e in windows:
+        s = max(0.0, min(float(s), T))
+        e = max(0.0, min(float(e), T))
+        if e - s >= min_len:
+            out.append((round(s, 2), round(e, 2)))
+    out.sort()
+    merged = []
+    for s, e in out:
+        if merged and s < merged[-1][1]:
+            continue                                  # overlaps the previous window → skip
+        merged.append((s, e))
+    return merged
+
+
+def _partition_timeline(b_windows: list, T: float) -> list:
+    """Turn b-roll windows into an ordered, gap-free segment list covering [0,T]. Each item is
+    (start, end, kind, pool) where kind is 'face' or 'broll'. The FIRST b-roll window uses the
+    'hook' (satisfaction) pool — it is the scroll-stopper in both layouts — and later windows use
+    'interior'. Always ends on a face segment (the CTA lands on the real person)."""
+    segs, cur, bi = [], 0.0, 0
+    for s, e in b_windows:
+        if s - cur >= 0.5:
+            segs.append((cur, s, "face", None))
+        segs.append((s, e, "broll", "hook" if bi == 0 else "interior"))
+        cur = e
+        bi += 1
+    if T - cur >= 0.5:
+        segs.append((cur, T, "face", None))
+    return segs
+
+
+async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str, tag: str = "b") -> str:
+    """Build ONE silent WxH/30fps b-roll track of exactly `length` seconds from a pool of clip URLs
+    (mirrors recipe_broll's montage loop: download → ~4s cuts, re-window on re-use, scale/crop to
+    fill, concat, hard-trim). Returns the track path, or None if no usable footage."""
+    SEG = 4.0
+    srcs = []
+    for u in clip_urls:
+        try:
+            srcs.append(await _download_to_temp(u, ".mp4"))
+        except Exception as de:
+            logger.warning(f"[ugc-broll] {tag} clip download failed: {de}")
+    if not srcs:
+        return None
+    seg_paths, total, idx, guard = [], 0.0, 0, 0
+    while total < length and srcs and guard < 200:
+        src = srcs[idx % len(srcs)]
+        pass_no = idx // len(srcs); idx += 1; guard += 1
+        sd = await asyncio.to_thread(_ffprobe_duration, src)
+        if sd <= 0.4:
+            continue
+        off = min(pass_no * SEG, max(0.0, sd - 1.0))          # a different window each re-use
+        take = min(SEG, sd - off, length - total)
+        if take < 0.8:
+            off, take = 0.0, min(SEG, sd, length - total)
+        if take < 0.4:
+            break
+        seg = os.path.join(work, f"{tag}_{len(seg_paths):03d}.mp4")
+        try:
+            await asyncio.to_thread(_ffmpeg,
+                ["-ss", f"{off:.2f}", "-i", src, "-t", f"{take:.2f}", "-an",
+                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                        f"crop={W}:{H},fps=30,setpts=PTS-STARTPTS",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-threads", "2", seg], 300)
+        except Exception as se:
+            logger.warning(f"[ugc-broll] {tag} segment build failed: {se}"); continue
+        seg_paths.append(seg); total += take
+    if not seg_paths:
+        return None
+    listf = os.path.join(work, f"{tag}_list.txt")
+    with open(listf, "w") as f:
+        for s in seg_paths:
+            f.write("file '%s'\n" % s.replace("'", "'\\''"))
+    out = os.path.join(work, f"{tag}_track.mp4")
+    try:
+        await asyncio.to_thread(_ffmpeg,
+            ["-f", "concat", "-safe", "0", "-i", listf, "-t", f"{length:.2f}", "-an",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-pix_fmt", "yuv420p", "-threads", "2", out], 400)
+    except Exception as ce:
+        logger.warning(f"[ugc-broll] {tag} track concat failed: {ce}"); return None
+    return out if os.path.exists(out) else None
+
+
+async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: dict,
+                             layout: str, work: str, req: "RunRequest") -> str:
+    """Intercut satisfaction/interior b-roll over the lip-synced talking-head, keeping ONE continuous
+    VO. Returns a composited (UN-captioned) mp4 — the caller's existing kinetic-caption burn then
+    runs over the whole thing, so captions play from frame 1 incl. the b-roll opener. Returns None on
+    any shortfall so the caller ships the plain talking-head. `layout` ∈ {'ham','rit'}."""
+    if not (face_path and os.path.exists(face_path) and vo_audio and os.path.exists(vo_audio) and T > 3):
+        return None
+    W, H = await asyncio.to_thread(_ffprobe_dims, face_path)
+    if not (W and H):
+        return None
+
+    # 1) b-roll windows (seconds). Opener capped so a short ad never spends half its length off-face.
+    if layout == "ham":                                       # satisfaction cold-open → face → insert
+        b_windows = [(0.0, min(6.0, 0.32 * T)), (0.55 * T, 0.72 * T)]
+    else:                                                      # rit: face cold-open → satisfaction mid
+        b_windows = [(min(4.0, 0.22 * T), 0.62 * T)]
+    b_windows = _clean_windows(b_windows, T)
+    if not b_windows:
+        return None
+    segs = _partition_timeline(b_windows, T)
+    if not any(k == "broll" for _, _, k, _ in segs):
+        return None
+
+    # 2) cast footage pools — satisfaction 'hook' openers (cross-vertical) + same-vertical interiors.
+    hooks = await _cast_library_broll(intent, limit=5, prefer_kind="hook")
+    interiors = await _cast_library_broll(intent, limit=6)
+    if not hooks:                                             # no satisfaction clips → reuse interiors
+        hooks = interiors
+    if not interiors:
+        interiors = hooks
+    if not hooks and not interiors:
+        logger.info("[ugc-broll] library has no b-roll to cast — plain talking-head")
+        return None
+
+    # 3) render each timeline segment at WxH/30fps, silent (face cut from the lip-sync master; b-roll
+    #    montage from the right pool). Keeping each face segment at its ORIGINAL time preserves the
+    #    lip-sync against the continuous VO we mux back at the end.
+    seg_files = []
+    for si, (s, e, kind, pool) in enumerate(segs):
+        L = e - s
+        if L < 0.4:
+            continue
+        if kind == "face":
+            fp = os.path.join(work, f"face_{si:02d}.mp4")
+            try:
+                await asyncio.to_thread(_ffmpeg,
+                    ["-ss", f"{s:.2f}", "-i", face_path, "-t", f"{L:.2f}", "-an",
+                     "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                            f"crop={W}:{H},fps=30,setpts=PTS-STARTPTS",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                     "-pix_fmt", "yuv420p", "-threads", "2", fp], 300)
+            except Exception as fe:
+                logger.warning(f"[ugc-broll] face segment {si} failed: {fe}"); return None
+            seg_files.append(fp)
+        else:
+            pool_urls = hooks if pool == "hook" else interiors
+            track = await _broll_track(pool_urls, L, W, H, work, tag=f"br{si:02d}")
+            if not track:                                    # a required b-roll window failed → bail
+                logger.info(f"[ugc-broll] b-roll window {si} produced no footage — plain talking-head")
+                return None
+            seg_files.append(track)
+    if len(seg_files) < 2:                                    # need at least one face + one b-roll
+        return None
+
+    # 4) concat all segments (re-encode → identical params) then mux the CONTINUOUS VO as the audio.
+    listf = os.path.join(work, "compose_list.txt")
+    with open(listf, "w") as f:
+        for s in seg_files:
+            f.write("file '%s'\n" % s.replace("'", "'\\''"))
+    silent = os.path.join(work, "compose_silent.mp4")
+    try:
+        await asyncio.to_thread(_ffmpeg,
+            ["-f", "concat", "-safe", "0", "-i", listf, "-an",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-threads", "2", silent], 600)
+    except Exception as ce:
+        logger.warning(f"[ugc-broll] compose concat failed: {ce}"); return None
+    out = os.path.join(work, "ugc_broll.mp4")
+    try:
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", silent, "-i", vo_audio, "-map", "0:v:0", "-map", "1:a:0",
+             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", out], 300)
+    except Exception as me:
+        logger.warning(f"[ugc-broll] compose mux failed: {me}"); return None
+    return out if os.path.exists(out) else None
+
+
+async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> list:
     """The team's real CapCut flow, automated end-to-end: take a REAL character clip from
     our own asset library, write/adapt a natural spoken script (inserting the offer value),
     generate a matching voice (optionally CLONED from the character's own footage for max
@@ -6162,6 +6371,32 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     except Exception as _moe:
         logger.warning(f"[avatar-lipsync] mouth-region composite skipped: {_moe}")
 
+    # ── UGC-BROLL COMPOSITE (optional) ─────────────────────────────────────────────────────────────
+    # For a "UGC + B-Roll" ask, intercut satisfaction/interior b-roll over this lip-synced talking-head
+    # while the VO (out_audio) plays straight through — the library format (open on oddly-satisfying
+    # b-roll with captions already running, then the character cuts in and CONTINUES in lip-sync). The
+    # layout VARIES per generation (ham = b-roll cold-open, rit = face cold-open) via the variation
+    # index, so a batch isn't identical. Swap `result` to the composite BEFORE captions so the existing
+    # kinetic-caption burn runs over the whole thing (opener included). Best-effort: on any shortfall
+    # `result` is untouched and we ship the plain talking-head.
+    if ugc_broll or (isinstance(a, dict) and a.get("ugc_broll")):
+        try:
+            _fm = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
+            _ub_work = tempfile.mkdtemp()   # NOT cleaned here — the composite lives in it until variant reads it
+            _ub_intent = {"vertical": (vertical or ""), "scene": (a.get("scene") or ""),
+                          "gender": (a.get("gender") or ""), "age_band": (a.get("age_band") or "")}
+            _ub_layout = "ham" if (_vidx % 2 == 1) else "rit"
+            _ub = await _compose_ugc_broll(_fm, out_audio, float(vo_sec), _ub_intent, _ub_layout, _ub_work, req)
+            if _ub and os.path.exists(_ub):
+                result = {"local_path": _ub}
+                logger.info(f"[ugc-broll] composited b-roll over talking-head (layout={_ub_layout}, {vo_sec:.0f}s)")
+            else:
+                logger.info("[ugc-broll] no b-roll composited — delivering the plain talking-head")
+        except Cancelled:
+            raise
+        except Exception as _ube:
+            logger.warning(f"[ugc-broll] composite failed ({_ube}) — plain talking-head")
+
     # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
     # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
     # are per-prediction. sync.so uses a free credit → $0.
@@ -6483,6 +6718,11 @@ async def recipe_generate_router(req: RunRequest) -> list:
 _RECIPES = {
     "Full Ad": recipe_full_ad,
     "Avatar Lipsync": recipe_avatar_lipsync,
+    # UGC + B-Roll = the avatar-lipsync talking-head with satisfaction/interior b-roll intercut over
+    # one continuous VO (the S2-TX-UGC-BROLL library format). Same real-clip + voice-clone + lip-sync
+    # spine; the ugc_broll flag turns on the b-roll compositing tail. Also honored via assets.ugc_broll.
+    "UGC + B-Roll": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
+    "UGC + B-Roll Home Insurance": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
     "Create from Assets": recipe_from_assets,
     "Generate Video": recipe_generate_router,
     "Avatar/UGC": recipe_avatar,
