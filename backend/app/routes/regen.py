@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 GEMINI_MODEL = "gemini-2.5-flash"
+# CROSS-FAMILY semantic judge for the EVAL GATE — deliberately NOT Gemini (which grades in-flight),
+# so the final examiner can't self-grade its own family's output. Pinned here as one source of truth.
+EVAL_JUDGE_MODEL = "gpt-4o"
 CALLBACK_SECRET = os.getenv("REGEN_CALLBACK_SECRET", "change-me-regen-callback")
 
 # HARD COST CEILING for a single job's paid render. Projected (never actual-after-the-fact) spend is
@@ -3322,6 +3325,274 @@ def _team_eval_passed(ev: dict) -> bool:
         return False
 
 
+async def _openai_vision_json(frame_paths: list, prompt: str) -> dict:
+    """CROSS-FAMILY vision judge for the EVAL GATE: base64 frames → OpenAI gpt-4o → strict JSON.
+    Deliberately NOT Gemini so the final examiner does not self-grade the family that graded in-flight.
+    Raises if the key is missing (caller falls back to the in-house Gemini vision)."""
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    def _call() -> str:
+        from openai import OpenAI
+        oai = OpenAI(api_key=settings.openai_api_key)
+        content: list = [{"type": "text", "text": prompt}]
+        for fp in frame_paths:
+            with open(fp, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        resp = oai.chat.completions.create(
+            model=EVAL_JUDGE_MODEL, temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": content}])
+        return resp.choices[0].message.content or "{}"
+    return json.loads(await asyncio.to_thread(_call))
+
+
+async def _cross_family_vision(frame_paths: list, prompt: str):
+    """Prefer the CROSS-FAMILY OpenAI judge; fall back to the in-house Gemini vision (and NOTE it).
+    Returns (json_dict, engine) where engine ∈ {'openai','gemini','none'}."""
+    if settings.openai_api_key:
+        try:
+            return await _openai_vision_json(frame_paths, prompt), "openai"
+        except Exception as e:
+            logger.warning(f"[eval-gate] OpenAI judge failed ({e}) — falling back to Gemini vision")
+    try:
+        return await _gemini_vision(frame_paths, prompt), "gemini"
+    except Exception as e:
+        logger.warning(f"[eval-gate] Gemini vision fallback also failed ({e})")
+        return {}, "none"
+
+
+async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict, work: str) -> dict:
+    """GLOBAL EVAL GATE — the examiner. Measures the DELIVERED file against the brief and turns every
+    verdict into an action, then auto-delivers ONLY when it passes.
+
+    A video can LOOK done yet fail FAITHFULNESS (wrong/garbled script, residual burned-in captions from
+    the source footage, an abrupt end that clips the last word, the wrong cast). The clip-level critic
+    grades each clip BEFORE stitch/post, so it is structurally blind to those. This runs on the FINAL
+    file: cheap OBJECTIVE code checks + a CROSS-FAMILY OpenAI semantic judge. It NEVER rewards shape
+    (length/keywords) — only the observable outcome — writes each dimension to creative_decisions
+    (_record_qc) + creative_lessons (record_lesson 'eval'), and returns a deliver decision.
+
+    Best-effort: any internal error DEFAULTS TO DELIVER (never blocks the pipeline) but is logged.
+    Returns {faithful, quality, confidence, deliver, reasons, issues, overall, ...}."""
+    try:
+        assets = assets if isinstance(assets, dict) else {}
+        reasons: list = []
+        checks: list = []   # (name, passed) — passed True/False, or None when the check could not run
+
+        # ── did-it-render (baseline) + per-stream durations (reused by the abrupt check) ──────────
+        try:
+            rendered = bool(final_path and os.path.isfile(final_path)
+                            and os.path.getsize(final_path) > 1000)
+        except Exception:
+            rendered = False
+        vdur = adur = 0.0
+        try:
+            vdur = await asyncio.to_thread(_stream_duration, final_path, "v")
+            adur = await asyncio.to_thread(_stream_duration, final_path, "a")
+        except Exception as e:
+            logger.warning(f"[eval-gate] stream-duration probe failed: {e}")
+
+        # AUGMENT the existing holistic final-video QA — run it ONCE here (transcript duplication /
+        # incompleteness / script-mismatch + the in-house Gemini vision grade + its own
+        # creative_decisions row). Both recipes now call _eval_gate instead of _final_video_qa, so it
+        # still runs exactly once — no double work.
+        fqa = {}
+        try:
+            fqa = await _final_video_qa(request_id, final_path, script, work) or {}
+        except Exception as e:
+            logger.warning(f"[eval-gate] final_video_qa skipped: {e}")
+        fqa_issues = [str(i) for i in (fqa.get("issues") or [])]
+
+        # 3 FINAL frames — shared by the residual-caption, cast, and semantic checks (extract once).
+        frames = []
+        try:
+            _d = vdur or await asyncio.to_thread(_ffprobe_duration, final_path) or 12.0
+            frames = await asyncio.to_thread(_extract_frames, final_path,
+                                             [1.0, _d / 2.0, max(1.0, _d - 1.5)], work)
+        except Exception as e:
+            logger.warning(f"[eval-gate] frame extract failed: {e}")
+
+        # ── 1a. FAITHFULNESS — final audio transcript vs the script (overlap + $/number survival) ──
+        faithful = None
+        try:
+            ok, why = await _audio_matches_script(final_path, script or "")
+            faithful = bool(ok)
+            checks.append(("faithful", faithful))
+            if not faithful:
+                reasons.append(f"faithfulness: {why}")
+        except Exception as e:
+            logger.warning(f"[eval-gate] faithfulness check errored: {e}")
+
+        # ── 1b. NEVER-ABRUPT — video must not end before the audio (a clipped last word) ──────────
+        not_abrupt = None
+        try:
+            if vdur and adur:
+                not_abrupt = (adur - vdur) <= 0.15
+                checks.append(("not_abrupt", not_abrupt))
+                if not not_abrupt:
+                    reasons.append(f"abrupt end: video {vdur:.1f}s < audio {adur:.1f}s (last word cut)")
+        except Exception as e:
+            logger.warning(f"[eval-gate] abrupt check errored: {e}")
+
+        # ── 1c. NO RESIDUAL CAPTIONS — only when OUR captions are OFF ──────────────────────────────
+        # The caller passes the RESOLVED captions flag (whether we actually burned any). If ours are
+        # OFF but the detector still finds burned-in text, it is the source footage's captions → fail.
+        # If ours are ON, on-screen text is expected → skip.
+        no_residual = None
+        try:
+            our_caps = bool(assets.get("captions", False))
+            if not our_caps and frames:
+                boxes = await _detect_caption_boxes(frames[:3])
+                no_residual = not boxes
+                checks.append(("no_residual", no_residual))
+                if not no_residual:
+                    reasons.append("residual source captions: burned-in text on screen but "
+                                   "OUR captions are OFF")
+        except Exception as e:
+            logger.warning(f"[eval-gate] residual-caption check errored: {e}")
+
+        # ── 1d. SPECS — duration within the requested budget (±25%); resolution matches request ────
+        spec_ok = None
+        try:
+            _req_secs = assets.get("seconds")
+            if _req_secs and str(_req_secs).lower() != "auto" and vdur:
+                _want = float(_req_secs)
+                if _want > 0 and abs(vdur - _want) > _want * 0.25:
+                    spec_ok = False
+                    reasons.append(f"spec: duration {vdur:.1f}s off the {_want:.0f}s request (>25%)")
+                else:
+                    spec_ok = spec_ok if spec_ok is False else True
+            _req_res = str(assets.get("resolution") or "").lower()
+            if _req_res and frames:
+                _short_want = {"480p": 480, "540p": 540, "720p": 720, "1080p": 1080}.get(_req_res)
+                if _short_want:
+                    _w, _h = await asyncio.to_thread(_video_dims, final_path)
+                    if abs(min(_w, _h) - _short_want) > 0.15 * _short_want:
+                        spec_ok = False
+                        reasons.append(f"spec: resolution {_w}x{_h} ≠ requested {_req_res}")
+                    else:
+                        spec_ok = spec_ok if spec_ok is False else True
+            if spec_ok is not None:
+                checks.append(("spec", spec_ok))
+        except Exception as e:
+            logger.warning(f"[eval-gate] spec check errored: {e}")
+
+        # ── 1e. CAST (best-effort) — on-camera gender vs the requested cast ───────────────────────
+        cast_ok = None
+        try:
+            _want_g = str(assets.get("gender") or "").strip().lower()
+            if _want_g in ("man", "male", "woman", "female") and frames:
+                _norm = "man" if _want_g in ("man", "male") else "woman"
+                jr, _eng = await _cross_family_vision(frames[:2],
+                    'Look at the on-camera person in these video frames. Return STRICT JSON '
+                    '{"person":"man|woman|unclear"} — the apparent gender presentation only.')
+                seen = str((jr or {}).get("person") or "").lower()
+                if seen in ("man", "woman"):
+                    cast_ok = (seen == _norm)
+                    checks.append(("cast", cast_ok))
+                    if not cast_ok:
+                        reasons.append(f"cast: requested {_norm} but the on-camera person looks {seen}")
+        except Exception as e:
+            logger.warning(f"[eval-gate] cast check errored: {e}")
+
+        # ── 2. SEMANTIC JUDGE — CROSS-FAMILY (OpenAI gpt-4o), one-line rubrics, booleans only ─────
+        real_ok = arti_ok = lip_ok = None
+        judge_engine = "none"
+        hard_artifact = False
+        if frames:
+            try:
+                jr, judge_engine = await _cross_family_vision(frames[:3],
+                    'You are a strict ad-QA examiner looking at frames from a FINAL delivered video ad. '
+                    'Judge ONLY what is OBSERVABLE in the pixels (ignore length, keywords, intent). '
+                    'Return STRICT JSON {"real_not_plastic": true|false, "no_visible_artifacts": '
+                    'true|false, "lipsync_natural": true|false, "why": "<=8 words"}. Set '
+                    'no_visible_artifacts=false ONLY for a HARD defect: laser/blown-out eyes, warped or '
+                    'extra fingers/hands, melting faces, mirrored or gibberish on-screen text.')
+                if judge_engine != "none" and jr:
+                    real_ok = bool(jr.get("real_not_plastic", True))
+                    arti_ok = bool(jr.get("no_visible_artifacts", True))
+                    lip_ok = bool(jr.get("lipsync_natural", True))
+                    _why = str(jr.get("why") or "").strip()
+                    if not real_ok:
+                        reasons.append(f"semantic: looks plastic/AI ({_why})".strip())
+                    if not lip_ok:
+                        reasons.append(f"semantic: lip-sync unnatural ({_why})".strip())
+                    if not arti_ok:
+                        reasons.append(f"semantic: visible artifact ({_why})".strip())
+                        # A HARD artifact only BLOCKS delivery when the CROSS-FAMILY (OpenAI) judge saw
+                        # it — the Gemini fallback already fed _final_video_qa, so don't double-block.
+                        hard_artifact = (judge_engine == "openai")
+                    if judge_engine == "gemini":
+                        logger.info(f"[eval-gate] {request_id} semantic graded by Gemini fallback "
+                                    f"(OpenAI key missing/failed)")
+            except Exception as e:
+                logger.warning(f"[eval-gate] semantic judge errored: {e}")
+
+        # ── 3. CONFIDENCE + DELIVER ───────────────────────────────────────────────────────────────
+        _obj = [p for (_n, p) in checks if p is not None]
+        obj_frac = (sum(1 for p in _obj if p) / len(_obj)) if _obj else 1.0
+        _sem = [p for p in (real_ok, arti_ok, lip_ok) if p is not None]
+        sem_frac = (sum(1 for p in _sem if p) / len(_sem)) if _sem else 1.0
+        confidence = round(0.20 * (1.0 if rendered else 0.0) + 0.50 * obj_frac + 0.30 * sem_frac, 2)
+        # deliver ONLY if faithfulness, never-abrupt and no-residual all pass AND no hard artifact.
+        # A check that could not run (None) is treated as non-blocking (best-effort, never over-block).
+        deliver = bool((faithful is not False) and (not_abrupt is not False)
+                       and (no_residual is not False) and (not hard_artifact))
+
+        verdict = {
+            "faithful": (faithful is not False),
+            "quality": bool(obj_frac >= 0.999 and sem_frac >= 0.999),
+            "confidence": confidence,
+            "deliver": deliver,
+            "reasons": reasons,
+            "semantic_engine": judge_engine,
+            # compat with the existing generate/avatar surfacing (reads .issues / .overall):
+            "issues": (fqa_issues + reasons),
+            "overall": fqa.get("overall"),
+            "eval_gate": True,
+        }
+
+        # ── 4/5. RECORD → creative_decisions (_record_qc) + creative_lessons (record_lesson 'eval') ─
+        # Passes record a qc_passed=True row so ROI can attach later; fails record a failing row.
+        try:
+            _ev = {"overall": (8.0 if deliver else 3.0),
+                   "issues": (reasons if reasons else (["eval clean"] if deliver else [])),
+                   "final_qa": True, "eval_gate": True}
+            _record_qc(request_id, {"i": "eval"}, _ev, unverified=(not rendered), stage="eval")
+        except Exception as e:
+            logger.warning(f"[eval-gate] QC persist skipped: {e}")
+        # Every FAIL dimension → a permanent EVAL-scoped lesson (Learning tab + next-run signal).
+        try:
+            from ..services import creative_learning as learn
+            _fails = []
+            if faithful is False:    _fails.append(("faithfulness", "spoken audio does not match the script"))
+            if not_abrupt is False:  _fails.append(("abrupt-end", "video ends before the narration (last word cut)"))
+            if no_residual is False: _fails.append(("residual-captions", "source footage's burned-in captions on screen"))
+            if hard_artifact:        _fails.append(("visible-artifact", "hard visual artifact (eyes/hands/warp/text)"))
+            if cast_ok is False:     _fails.append(("cast-mismatch", "on-camera person is the wrong gender"))
+            if spec_ok is False:     _fails.append(("spec-mismatch", "duration/resolution off the request"))
+            for _dim, _detail in _fails:
+                learn.record_lesson("eval", trigger=_dim, reason=_detail[:500],
+                                    rule=f"Avoid: {_dim}", job_id=request_id)
+        except Exception as e:
+            logger.warning(f"[eval-gate] lesson write skipped: {e}")
+
+        if deliver:
+            logger.info(f"[eval-gate] {request_id} PASS (confidence {confidence})")
+        else:
+            logger.warning(f"[eval-gate] {request_id} NEEDS REVIEW (confidence {confidence}): {reasons}")
+        return verdict
+    except Exception as e:
+        # An eval-internal error must NEVER block a real render — default to deliver, but log loudly.
+        logger.error(f"[eval-gate] {request_id} internal error → defaulting to DELIVER: {e}",
+                     exc_info=True)
+        return {"faithful": True, "quality": True, "confidence": 0.5, "deliver": True,
+                "reasons": [f"eval-gate error: {e}"], "semantic_engine": "error",
+                "issues": [], "overall": None, "eval_gate": True}
+
+
 async def _gen_beat_with_eval(job_id: str, beat: dict, work: str, gen_attempt) -> Optional[str]:
     """Generate ONE beat, then run the eval self-learning loop: vision-QA the result, and if it
     scores below the bar, coach the faulted persona(s) + fold the correction into the beat prompt
@@ -4659,13 +4930,16 @@ async def recipe_generate(req: RunRequest) -> list:
                 import shutil as _shf; _shf.move(_fin, out_path)
             except Exception as _fe:
                 logger.warning(f"[generate] finish pass skipped: {_fe}")
-        # FINAL-VIDEO QA — the only check that sees the assembled deliverable (duplicate speech,
-        # unfinished script, post-stitch artifacts). Recorded to creative_decisions either way.
+        # EVAL GATE — the global examiner on the assembled deliverable (faithfulness, never-abrupt,
+        # residual captions, specs, cast + a cross-family semantic judge). Wraps final-video QA so it
+        # runs once. Pass the RESOLVED captions flag (whether we actually burned any). Recorded to
+        # creative_decisions + creative_lessons either way; returns a deliver decision.
         _final_qa = {}
         try:
-            _final_qa = await _final_video_qa(req.request_id, out_path, _vo_script or prompt, work)
+            _final_qa = await _eval_gate(req.request_id, out_path, _vo_script or prompt,
+                                         {**assets, "captions": _caps_burned}, work)
         except Exception as _qe:
-            logger.warning(f"[generate] final QA skipped: {_qe}")
+            logger.warning(f"[generate] eval gate skipped: {_qe}")
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
@@ -4697,11 +4971,18 @@ async def recipe_generate(req: RunRequest) -> list:
         # take ranks BELOW clean output everywhere confidence is used, instead of shipping as an
         # equal peer. UNVERIFIED (QA could not run) sits between the two — never treated as clean.
         _qa_issues = _final_qa.get("issues") or []
-        _confidence = 0.75
-        if _qa_issues:
-            _confidence = 0.25
-        elif _final_qa.get("overall") is None:
-            _confidence = 0.55
+        # The EVAL GATE already folds objective + semantic checks into one weighted confidence —
+        # prefer it; fall back to the coarse issue-based scale only if the gate could not run.
+        _confidence = _final_qa.get("confidence")
+        if _confidence is None:
+            _confidence = 0.75
+            if _qa_issues:
+                _confidence = 0.25
+            elif _final_qa.get("overall") is None:
+                _confidence = 0.55
+        # deliver=False → flag the take as "needs review" with the failing reason NAMED (never hard-drop).
+        _eval_flag = (" ⚠ EVAL (needs review): " + "; ".join((_final_qa.get("reasons") or [])[:2])
+                      if _final_qa.get("deliver") is False else "")
         # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend).
         # Populated from what ACTUALLY ran (same signals as whats_changed).
         _video_label = ("veo-3.1" if _prov == "kie-veo"
@@ -4729,7 +5010,8 @@ async def recipe_generate(req: RunRequest) -> list:
                     + _prov_note + "."
                     # HONEST QA label — never ship a known-defective video looking clean.
                     + (" ⚠ QA: " + "; ".join((_final_qa.get("issues") or [])[:2])
-                       if (_final_qa.get("issues")) else "")),
+                       if (_final_qa.get("issues")) else "")
+                    + _eval_flag),
                  "qc_issues": (_final_qa.get("issues") or []),
                  "qc_verified": (_final_qa.get("overall") is not None),
                  "models": _models, "model_calls": _drain_model_calls(req.request_id)}
@@ -5846,19 +6128,23 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     except Exception as _ce:
         logger.warning(f"[avatar-lipsync] tail-extend check skipped: {_ce}")
 
-    # ── FINAL-VIDEO QA (transcript fidelity + vision) — PERSISTED via _record_qc ─────────────────
-    # This lane never ran _final_video_qa, so nothing was ever written to creative_decisions for an
-    # avatar job and /learn/decisions came back []. Run the same holistic check the t2v lane runs on
-    # the delivered file. Best-effort: it must never break or block delivery.
+    # ── EVAL GATE (global examiner on the delivered file) — PERSISTED via _record_qc + lessons ───
+    # This lane never ran the final examiner, so nothing was written to creative_decisions for an
+    # avatar job and /learn/decisions came back []. The gate wraps final-video QA (so it runs once)
+    # and adds the objective faithfulness/never-abrupt/residual-caption/spec/cast checks + a
+    # cross-family semantic judge. Pass the RESOLVED captions flag (whether we actually burned any).
+    # Best-effort: it must never break or block delivery — its verdict just FLAGS the take below.
+    _eval = {}
     try:
         _fqwork = tempfile.mkdtemp()
         try:
-            await _final_video_qa(req.request_id, os.path.join(UPLOAD_DIR, name), script, _fqwork)
+            _eval = await _eval_gate(req.request_id, os.path.join(UPLOAD_DIR, name), script,
+                                     {**a, "captions": bool(ass_path or _use_veed)}, _fqwork) or {}
         finally:
             import shutil as _sh3
             _sh3.rmtree(_fqwork, ignore_errors=True)
     except Exception as _fqe:
-        logger.warning(f"[avatar-lipsync] final-video QA skipped: {_fqe}")
+        logger.warning(f"[avatar-lipsync] eval gate skipped: {_fqe}")
 
     # ── POST-RENDER VISUAL QA (grade + coach, NO retry) ──────────────────────────────────────────
     # The avatar-lipsync path produced its clip but nothing ever critiqued the OUTPUT — so no persona
@@ -5913,6 +6199,9 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
           + (f" · variation {_vidx}/{_vtot} on the {_axis} axis" if _diversify else "")
           + (f" · ⚠ {_axis_note}" if _axis_note else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
+    # EVAL GATE verdict → flag the take as "needs review" with the failing reason NAMED (never drop).
+    if _eval.get("deliver") is False:
+        fb += " ⚠ EVAL (needs review): " + "; ".join((_eval.get("reasons") or [])[:2])
     # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend);
     # populated from what ACTUALLY ran (same signals as whats_changed).
     _voice_label = ("f5-tts (clone)" if voice_res.get("provider") == "fal-clone"
@@ -5928,7 +6217,10 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     variant.update({"voice": voice_res.get("provider"), "voice_id": voice_id, "cloned": _cloned,
                     "voice_swapped": bool(_swapped), "voice_requested": voice_res.get("requested"),
                     "captions": bool(ass_path or _use_veed), "caption_method": _cap_method,
-                    "models": _models, "whats_changed": fb, "feedback": fb})
+                    "models": _models, "whats_changed": fb, "feedback": fb,
+                    # EVAL GATE — a needs-review take ranks BELOW clean output (same signal as t2v).
+                    "confidence": _eval.get("confidence", 0.7),
+                    "qc_issues": (_eval.get("issues") or [])})
 
     # ── STATE: log every choice so the loop can learn from ROI later ──
     try:
