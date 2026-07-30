@@ -1986,7 +1986,8 @@ def _fit_script_to_seconds(text: str, seconds: int) -> str:
 
 
 @router.post("/studio/route")
-async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)):
+async def studio_route(payload: dict, background: BackgroundTasks,
+                       _auth: bool = Depends(require_service_key)):
     """ChatGPT-style Studio router. Given the recent thread history + the new message, classify into
     ONE strict-JSON action AND (for write actions) produce the content inline, so Node needs a single
     round-trip. Always degrades to a plain reply on any failure."""
@@ -1994,6 +1995,7 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     message = (payload.get("message") or "").strip()
     vertical = payload.get("vertical") or ""
     user_id = str(payload.get("user_id") or "").strip()   # CL passes req.user.id — memory is scoped to it
+    logger.info(f"[studio/route] user_id={user_id!r} msg_len={len(message)}")
     if not message:
         return {"action": "reply", "text": "What would you like to make?"}
     lines = []
@@ -2059,12 +2061,23 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
             _mem_block = user_memory.render_context_block(_mems, _prefs)
         except Exception as _me:
             logger.warning(f"studio memory retrieve failed: {_me}")
+    # How the router may USE that memory: for ONE optional suggestion line only. It must NEVER pre-fill,
+    # auto-answer, or skip a brief question, and must NEVER auto-personalize the written script. Present
+    # only when we actually know something about the user (else empty → no behavioral change).
+    _mem_usage = (
+        "USING WHAT WE KNOW ABOUT THIS USER (above): it is for ONE optional, friendly SUGGESTION only. "
+        "When you return a 'reply' that gathers the brief, you MAY open with a single short suggestion "
+        "line drawn from it — e.g. \"Last time you did a fast personal-story hook for home insurance and "
+        "it performed well — want that again, or try something new?\" — and then ask the FULL numbered "
+        "brief questions exactly as usual. NEVER use memory to pre-fill, auto-answer, or skip ANY brief "
+        "question, and NEVER auto-personalize the written script from it. Always still ask everything.\n\n"
+    ) if _mem_block else ""
     ask = (
         "You are the router for a creative video Studio. Read the conversation and the NEW user message, "
         "then output ONE strict-JSON action. Prefer acting over asking for edits/iterations — BUT for a "
         "NEW script/video request that lacks the creative brief, gathering the brief FIRST is the correct "
         "action, not a fallback (see FOLLOW-UP BEFORE WRITING — it is MANDATORY there).\n\n"
-        + _no_placeholder + _dna_block + _mem_block +
+        + _no_placeholder + _dna_block + _mem_block + _mem_usage +
         f"CONVERSATION:\n{hist_text}\n\nNEW USER MESSAGE: \"{message}\"\n"
         f"DEFAULT VERTICAL: {_vt or 'general'}\n\n"
         "ACTIONS (pick exactly one; output JSON ONLY, no prose):\n"
@@ -2116,8 +2129,11 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     try:
         out = await _gemini_json(ask)
         action = str(out.get("action") or "reply").lower()
-        # Fire-and-forget: learn this user's stable preferences + what they made from this turn.
-        # Best-effort and non-blocking — a memory failure must never delay or break the response.
+        # Learn this user's stable preferences + what they made from this turn. Runs as a FastAPI
+        # BackgroundTask (NOT asyncio.create_task): a bare create_task is fire-and-forget with no strong
+        # reference, so the loop can garbage-collect it before the ~1s Gemini+embed extraction finishes —
+        # which is why nothing was ever stored. Starlette reliably awaits BackgroundTasks after the
+        # response is sent, so this completes without delaying the reply. Best-effort — never breaks chat.
         if user_id:
             try:
                 from ..services import user_memory
@@ -2128,7 +2144,7 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
                                 "text": f"[took action: {action}; vertical="
                                         f"{out.get('vertical') or _vt}; seconds="
                                         f"{out.get('seconds') or _brief_secs or ''}]"})
-                asyncio.create_task(user_memory.extract(user_id, _recent))
+                background.add_task(user_memory.extract, user_id, _recent)
             except Exception as _xe:
                 logger.warning(f"studio memory extract schedule failed: {_xe}")
         if action == "write_script":
@@ -2202,6 +2218,19 @@ async def studio_route(payload: dict, _auth: bool = Depends(require_service_key)
     except Exception as e:
         logger.warning(f"studio route failed: {e}")
         return {"action": "reply", "text": "I hit a snag routing that — could you rephrase?"}
+
+
+@router.get("/studio/memory")
+async def studio_memory(user_id: str = "", _auth: bool = Depends(require_service_key)):
+    """Diagnostic: the long-term memory stored for ONE user (strict user_id scope). Verifies that writes
+    are landing live — no DB access needed. Returns the factual preference map + every stored row."""
+    from ..services import user_memory
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"user_id": "", "preferences": {}, "memories": [], "count": 0}
+    prefs = user_memory.preferences(uid)
+    mems = user_memory.dump(uid)
+    return {"user_id": uid, "preferences": prefs, "memories": mems, "count": len(mems)}
 
 
 @router.get("/creative-team/reports")

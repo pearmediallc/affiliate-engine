@@ -317,12 +317,30 @@ def preferences(user_id) -> dict:
         return {}
 
 
+def dump(user_id) -> list:
+    """ALL stored memories for THIS user (diagnostic — no similarity filter, no embeddings). Lets the
+    /studio/memory endpoint verify writes are landing live without DB access. Best-effort → []."""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return []
+    try:
+        sql = text("SELECT kind, mem_key, content, source_ref, updated_at FROM user_memory "
+                   "WHERE user_id = :uid ORDER BY updated_at DESC")
+        with engine.connect() as conn:
+            rows = conn.execute(sql, {"uid": user_id}).mappings().all()
+        return [{"kind": r["kind"], "mem_key": r["mem_key"], "content": r["content"],
+                 "source_ref": r["source_ref"], "updated_at": str(r["updated_at"])} for r in rows]
+    except Exception as e:
+        logger.warning(f"user_memory.dump failed: {e}")
+        return []
+
+
 def render_context_block(mems: list, prefs: dict) -> str:
     """Compact prompt block of what we know about the user. Empty string when we know nothing."""
     if not mems and not prefs:
         return ""
-    lines = ["WHAT WE KNOW ABOUT THIS USER (use to personalize + pre-fill the brief; do NOT re-ask "
-             "what's already known here):"]
+    lines = ["WHAT WE KNOW ABOUT THIS USER (for an optional SUGGESTION only — ALWAYS still ask all the "
+             "brief questions; never auto-fill their per-request choices):"]
     for k, v in (prefs or {}).items():
         if v:
             lines.append(f"- {k}: {v}")
