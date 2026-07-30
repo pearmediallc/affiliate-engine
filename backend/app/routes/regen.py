@@ -2976,7 +2976,12 @@ async def recipe_broll(req: RunRequest, label="Broll") -> list:
         # keywords. Taken whenever there's a real spoken script (assets.script, honoring allow_rewrite,
         # else the source transcript). Best-effort: any gap (no footage / synth / align) falls through
         # to the simple stock-clip behavior below — never a hard fail.
-        _assets = req.assets if isinstance(req.assets, dict) else {}
+        # The variation route nests the caller's script under directive.assets (dispatchRun
+        # forwards the directive, not the top-level assets), so fall back to it when req.assets is
+        # empty — the same idiom recipe_full_ad uses. Top-level assets wins when present. Without
+        # this the UGC branch never saw the script and dropped to the simple stock+original-audio path.
+        _assets = req.assets or req.directive.get("assets", {}) or {}
+        _assets = _assets if isinstance(_assets, dict) else {}
         script = _verbatim_user_script(_assets) or (transcript or "").strip()
         if len((script or "").split()) >= 6:
             try:
