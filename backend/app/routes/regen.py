@@ -574,6 +574,19 @@ def _ffprobe_duration(path: str) -> float:
     except Exception:
         return 0.0
 
+def _stream_duration(path: str, kind: str = "v") -> float:
+    """Duration of a SPECIFIC stream (kind='v' video | 'a' audio) in seconds, 0.0 if unknown.
+    format=duration reports only the LONGEST stream, so it cannot tell a short video from a longer
+    audio — this reads the per-stream duration so a video that ends before the narration is caught."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"{kind}:0",
+                              "-show_entries", "stream=duration",
+                              "-of", "default=noprint_wrappers=1:nokey=1", path],
+                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+        return float(out[0]) if out and out[0] not in ("", "N/A") else 0.0
+    except Exception:
+        return 0.0
+
 def _probe_audio(path: str):
     """DETERMINISTIC tri-state: True (has an audio stream) / False (definitely none) / None (probe
     failed — unknown). A vision/frame critic literally cannot hear, so 'the fallback shipped silent
@@ -1358,25 +1371,104 @@ async def learn_summary(vertical: str = "", _auth: bool = Depends(require_servic
 @router.get("/learn/events")
 async def learn_events(brain: str = "", vertical: str = "", limit: int = 50,
                        _auth: bool = Depends(require_service_key)):
-    """The changelog: recent LearningEvents newest-first (every keep/reject of a governed rule),
-    filterable by brain/vertical. This is the auditable record of every self-correction."""
+    """The changelog, newest-first. Merges the tuner's governed-rule keep/reject events
+    (LearningEvent) with the LIVING activity that actually accumulates on EVERY run: critic +
+    final-video QA verdicts, human verdicts and stitched ROI (creative_decisions), and the
+    corrective lessons those failures produced (creative_lessons). This is why the tab is populated
+    from day one — before the nightly tuner has ever promoted a rule. Each source is guarded so a
+    schema-drift in one store never blanks the whole feed. Filterable by brain/vertical."""
+    from datetime import datetime as _dt
     from ..database import SessionLocal
-    from ..models.learning import LearningEvent
+    cap = min(max(limit, 1), 200)
     db = SessionLocal()
+    merged = []   # list of (sort_dt, event_dict)
+
+    def _iso(d):
+        return d.isoformat() if d else None
+
     try:
-        q = db.query(LearningEvent)
-        if brain:
-            q = q.filter(LearningEvent.brain == brain)
-        if vertical:
-            q = q.filter(LearningEvent.vertical == vertical)
-        rows = q.order_by(LearningEvent.created_at.desc()).limit(min(max(limit, 1), 200)).all()
-        items = [{"brain": r.brain, "vertical": r.vertical, "summary": r.summary,
-                  "agreement_before": r.agreement_before, "agreement_after": r.agreement_after,
-                  "detail": r.detail_json,
-                  "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
-        return {"success": True, "count": len(items), "events": items}
+        # 1) Tuner governed-rule events (the original source).
+        try:
+            from ..models.learning import LearningEvent
+            q = db.query(LearningEvent)
+            if brain:
+                q = q.filter(LearningEvent.brain == brain)
+            if vertical:
+                q = q.filter(LearningEvent.vertical == vertical)
+            for r in q.order_by(LearningEvent.created_at.desc()).limit(cap).all():
+                merged.append((r.created_at or _dt.min, {
+                    "brain": r.brain, "vertical": r.vertical, "summary": r.summary,
+                    "agreement_before": r.agreement_before, "agreement_after": r.agreement_after,
+                    "detail": r.detail_json, "source": "tuner",
+                    "created_at": _iso(r.created_at)}))
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"[learn] events: LearningEvent read failed: {e}")
+
+        # 2) Critic + final-video QA verdicts, human verdicts, stitched ROI (creative_decisions).
+        # Only rows that ARE an event — a QA fail, a human verdict, or an ROI attach; a plain passing
+        # decision is state, not news. Decisions carry no brain column, so a brain filter ⇒ tuner-only.
+        if not brain:
+            try:
+                from ..models.creative_team import CreativeDecision
+                dq = db.query(CreativeDecision)
+                if vertical:
+                    dq = dq.filter(CreativeDecision.vertical == vertical)
+                for r in dq.order_by(CreativeDecision.created_at.desc()).limit(cap).all():
+                    try:
+                        _reasons = json.loads(r.qc_reasons) if r.qc_reasons else {}
+                    except Exception:
+                        _reasons = {}
+                    _stage = _reasons.get("stage") or "clip"
+                    _iss = _reasons.get("issues") or []
+                    when = r.verdict_at or r.roi_updated_at or r.created_at
+                    if r.human_verdict:
+                        summary = "human verdict: " + r.human_verdict + (f" — {r.human_reason}" if r.human_reason else "")
+                        b = "human"
+                    elif r.qc_passed is False:
+                        summary = (f"{_stage} QA FAILED"
+                                   + (f": {'; '.join(str(i) for i in _iss[:2])}" if _iss else ""))
+                        b = "final_qa" if _stage == "final_video" else "critic"
+                    elif r.roi is not None:
+                        summary = f"ROI attached: {r.roi}"
+                        b = "roi"
+                    else:
+                        continue
+                    merged.append((when or _dt.min, {
+                        "brain": b, "vertical": r.vertical, "summary": summary,
+                        "agreement_before": None, "agreement_after": None,
+                        "detail": {"request_id": r.request_id, "creative_ref": r.creative_ref,
+                                   "roi": r.roi, "qc_passed": r.qc_passed}, "source": "decision",
+                        "created_at": _iso(when)}))
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"[learn] events: CreativeDecision read failed: {e}")
+
+        # 3) The corrective lessons those failures produced (creative_lessons) — what the brain now obeys.
+        try:
+            from ..models.creative_team import CreativeLesson
+            lq = db.query(CreativeLesson).filter(CreativeLesson.active == True)  # noqa: E712
+            if vertical:
+                lq = lq.filter(CreativeLesson.vertical == vertical)
+            for r in lq.order_by(CreativeLesson.updated_at.desc()).limit(cap).all():
+                if brain and r.scope != brain:
+                    continue
+                summary = ((r.rule or r.reason or r.trigger or "lesson")
+                           + (f"  [seen {r.hits}x]" if (r.hits or 0) > 1 else ""))
+                merged.append((r.updated_at or r.created_at or _dt.min, {
+                    "brain": r.scope or "lesson", "vertical": r.vertical, "summary": summary,
+                    "agreement_before": None, "agreement_after": None,
+                    "detail": {"trigger": r.trigger, "reason": r.reason, "rule": r.rule, "hits": r.hits},
+                    "source": "lesson", "created_at": _iso(r.updated_at or r.created_at)}))
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"[learn] events: CreativeLesson read failed: {e}")
     finally:
         db.close()
+
+    merged.sort(key=lambda t: t[0], reverse=True)
+    items = [e for _, e in merged[:cap]]
+    return {"success": True, "count": len(items), "events": items}
 
 
 @router.post("/learn/run-tuning")
@@ -3206,6 +3298,13 @@ async def _final_video_qa(request_id: str, out_path: str, script: str, work: str
     except Exception as e:
         logger.warning(f"[final-qa] vision check skipped: {e}")
     verdict = {**ev, "issues": issues, "final_qa": True}
+    # A FINAL defect (duplicate speech / incomplete / script-mismatch / a post-stitch artifact) must
+    # count as a FAILED verdict so _record_qc flags the creative_decisions row AND turns each issue
+    # into a lesson — even when the vision frames scored clean, because eval_passed only reads
+    # `overall` and is structurally blind to the transcript checks above. Pin the score below the bar
+    # (7) so the failure and its lessons actually land where the Learning tab reads them.
+    if issues and _team_eval_passed(verdict):
+        verdict["overall"] = min(float(ev.get("overall") or 0), 3.0)
     _record_qc(request_id, {"i": "final"}, verdict,
                unverified=(ev.get("overall") is None and not spoken), stage="final_video")
     if issues:
@@ -4895,6 +4994,48 @@ async def _color_match_to_reference(synced_path: str, ref_url: str, request_id: 
         return None
 
 
+async def _mouth_region_composite(synced_path: str, orig_url: str, request_id: str) -> Optional[str]:
+    """CONSTRAIN the lip-sync to the mouth. veed/sync re-render a WIDE face region, so the blend
+    edge drags the jaw/background/objects around it (the 'wobble'). Video→video lip-sync keeps the
+    head in the SAME position, so we can composite ONLY a tight lower-centre mouth box from the
+    synced clip back over the ORIGINAL untouched footage — every pixel outside that box stays the
+    real, un-wobbled original. The seam runs through cheek/jaw where both sources are the same face
+    in the same place, so it is invisible. Best-effort: returns a new path, else None to keep the
+    full synced clip. NO resolution change (output keeps the synced clip's dimensions)."""
+    try:
+        orig_local = orig_url
+        if isinstance(orig_url, str) and orig_url.startswith("http"):
+            orig_local = await _download_to_temp(orig_url, ".mp4")
+        if not (orig_local and os.path.exists(orig_local) and os.path.exists(synced_path)):
+            return None
+        W, H = await asyncio.to_thread(_video_dims, synced_path)
+        if not (W and H):
+            return None
+        # Tight lower-centre mouth box (fixed fraction — the head is centred in these talking-head
+        # clips, so no face detector is needed). Even dims/offsets for yuv420p chroma.
+        bw = (int(W * 0.42) // 2) * 2
+        bh = (int(H * 0.30) // 2) * 2
+        bx = (((W - bw) // 2) // 2) * 2
+        by = (int(H * 0.52) // 2) * 2
+        if bw < 16 or bh < 16 or by + bh > H:
+            return None
+        out = synced_path.rsplit(".", 1)[0] + "_mouth.mp4"
+        # base = ORIGINAL scaled to the synced geometry + last-frame-held so it never ends before the
+        # synced audio; overlay = the mouth box cropped from the synced clip; audio = the synced clip.
+        fc = (f"[0:v]scale={W}:{H},tpad=stop_mode=clone:stop_duration=6[bg];"
+              f"[1:v]crop={bw}:{bh}:{bx}:{by}[m];"
+              f"[bg][m]overlay={bx}:{by}:shortest=1[v]")
+        await asyncio.to_thread(_ffmpeg, [
+            "-i", orig_local, "-i", synced_path, "-filter_complex", fc,
+            "-map", "[v]", "-map", "1:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "copy", out], 400)
+        return out if os.path.exists(out) else None
+    except Exception as e:
+        logger.warning(f"[avatar-lipsync] mouth-region composite skipped for {request_id}: {e}")
+        return None
+
+
 async def _cover_audio_with_footage(char_url: str, need_sec: float, request_id: str) -> str:
     """Guarantee the base clip is at least as long as the voice-over.
 
@@ -5595,6 +5736,18 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
     except Exception as _cme:
         logger.warning(f"[avatar-lipsync] post-sync tone match skipped: {_cme}")
 
+    # ── CONSTRAIN THE RE-RENDER TO THE MOUTH (kill the surrounding wobble) ────────────────────────
+    # The provider repaints a WIDE region, so its blend edge drags the jaw/background/objects. Put
+    # ONLY a tight mouth box from the synced clip back over the ORIGINAL footage — everything outside
+    # it is the real, un-wobbled original. Best-effort: on ANY failure keep the full synced clip.
+    try:
+        _sp = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
+        _mouthed = await _mouth_region_composite(_sp, char_url, req.request_id)
+        if _mouthed:
+            result = {"local_path": _mouthed}
+    except Exception as _moe:
+        logger.warning(f"[avatar-lipsync] mouth-region composite skipped: {_moe}")
+
     # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
     # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
     # are per-prediction. sync.so uses a free credit → $0.
@@ -5666,6 +5819,32 @@ async def recipe_avatar_lipsync(req: RunRequest) -> list:
         except Exception as e:
             logger.warning(f"VEED captions failed, keeping base video: {e}")
     _set_lipsync_status(req.request_id, "done")
+
+    # ── NEVER AN ABRUPT STOP (reject-if-cut) ──────────────────────────────────────────────────────
+    # The synced video should span the full padded VO (the 0.45s tail lives in the audio fed to the
+    # provider), but a provider can hand back video a beat SHORTER than its audio — which chops the
+    # final word. ffprobe BOTH streams of the DELIVERED file; if the video is shorter, freeze-hold the
+    # last frame to cover the audio so the WHOLE narration always plays. Runs before the final QA so
+    # QA sees the corrected file. Best-effort: never truncate, never hard-fail, no resolution change.
+    try:
+        _final = os.path.join(UPLOAD_DIR, name)
+        _vdur = await asyncio.to_thread(_stream_duration, _final, "v")
+        _adur = await asyncio.to_thread(_stream_duration, _final, "a")
+        if _vdur and _adur and (_adur - _vdur) > 0.15:
+            _hold = _final.rsplit(".", 1)[0] + "_hold.mp4"
+            await asyncio.to_thread(_ffmpeg, [
+                "-i", _final,
+                "-vf", f"tpad=stop_mode=clone:stop_duration={_adur - _vdur + 0.1:.2f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                "-c:a", "copy", _hold], 400)
+            if os.path.exists(_hold):
+                import shutil as _sh5
+                _sh5.move(_hold, _final)
+                _ae_persist(_final, name)
+                logger.warning(f"[avatar-lipsync] {req.request_id}: video {_vdur:.1f}s < audio {_adur:.1f}s "
+                               f"→ held last frame to cover the full narration (no truncation)")
+    except Exception as _ce:
+        logger.warning(f"[avatar-lipsync] tail-extend check skipped: {_ce}")
 
     # ── FINAL-VIDEO QA (transcript fidelity + vision) — PERSISTED via _record_qc ─────────────────
     # This lane never ran _final_video_qa, so nothing was ever written to creative_decisions for an
