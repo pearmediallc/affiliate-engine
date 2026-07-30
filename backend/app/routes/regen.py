@@ -3343,6 +3343,7 @@ async def recipe_full_ad(req: RunRequest) -> list:
         # prompts → critic). This lights up the office live-feed under this job's request_id, and
         # returns per-beat anti-slop prompts composed from the Prompt Reference Library.
         from ..services import creative_team as team
+        _ra = req.assets if isinstance(req.assets, dict) else {}
         plan = await team.run_creative_team(
             offer_desc=(hint or transcript[:300] or "the offer in this ad"),
             job_id=req.request_id, vertical=vertical,
@@ -3352,8 +3353,11 @@ async def recipe_full_ad(req: RunRequest) -> list:
             entity_desc=entity_desc,
             has_real_character=bool(anchor_url), has_winner_video=bool(lw),
             n_reference_images=1 if anchor_url else 0,
-            user_script=_verbatim_user_script(req.assets if isinstance(req.assets, dict) else {}),
-            allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}))
+            user_script=_verbatim_user_script(_ra),
+            allow_rewrite=_rewrite_allowed(_ra),
+            # SINGLE SOURCE OF TRUTH: requested cast/setting → office PLAN matches the render.
+            cast_gender=(_ra.get("gender") or ""), cast_age_band=(_ra.get("age_band") or ""),
+            scene=(_ra.get("scene") or ""), geo=(_ra.get("state") or ""))
         beats = (plan.get("beats") or [])[:4]   # cap 4 clips (~48s) to bound cost/time
         script = plan.get("script", transcript)
         if not beats:
@@ -3458,7 +3462,10 @@ async def recipe_from_assets(req: RunRequest) -> list:
             has_real_character=False, has_winner_video=False, n_reference_images=1,
             # from_assets ALWAYS has a user-provided script — honor it verbatim unless rewrite is on.
             user_script=script,
-            allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}))
+            allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}),
+            # SINGLE SOURCE OF TRUTH: requested cast/setting → office PLAN matches the render.
+            cast_gender=(assets.get("gender") or ""), cast_age_band=(assets.get("age_band") or ""),
+            scene=(assets.get("scene") or ""), geo=(assets.get("state") or ""))
         beats = plan.get("beats") or []
         if not beats:
             beats = [{"i": i, "line": s, "prompt": "", "request_type": "broll"}
@@ -4009,6 +4016,10 @@ async def recipe_generate(req: RunRequest) -> list:
                 # avatar reroute already used, now applied at the office so ALL lanes agree.
                 user_script=_verbatim_user_script(assets),
                 allow_rewrite=_rewrite_allowed(assets),
+                # SINGLE SOURCE OF TRUTH: thread the requested cast/setting so the office PLAN matches
+                # the render (a man on a porch, not a defaulted woman 45+).
+                cast_gender=(assets.get("gender") or ""), cast_age_band=(assets.get("age_band") or ""),
+                scene=(assets.get("scene") or ""), geo=(assets.get("state") or ""),
                 # T2V PER-CLIP OWNS THE SPEECH. On this lane each clip appends its OWN authoritative
                 # `SPOKEN LINE FOR THIS CLIP`, so the composed beat prompt must NOT also render
                 # `They say exactly: "…"` — two speech instructions in one prompt fight each other.

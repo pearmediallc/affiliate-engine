@@ -17,6 +17,7 @@ Contents (all editable data, meant to be Langfuse-versioned + grown by the Learn
 retrieve(request_type, model) returns the bundle the Prompt Writer agent composes from.
 add_exemplar()/dump() let the Learner + an admin grow it without code changes.
 """
+import random
 from typing import Optional
 
 GLOBAL_RULES = [
@@ -25,6 +26,18 @@ GLOBAL_RULES = [
     "Keep the SUBJECT identity/wardrobe identical across every clip (consistency).",
     "No on-screen text, captions, subtitles or watermarks — captions are added afterward.",
     "Prefer believable imperfection over polish; specificity over generic description.",
+]
+
+# UGC camera framing is VARIED per generation (not one hardcoded angle) so we get natural handheld
+# variety AND discover what converts — retrieve() picks one per call for the ugc profile. Every option
+# is a believable phone-UGC framing: vertical 9:16, handheld, at/near eye level. NONE is a high/overhead
+# top-down looking-down angle (locking to that was the bug we're fixing).
+UGC_CAMERA_ANGLES = [
+    "handheld phone selfie at EYE LEVEL, straight-on, vertical 9:16",
+    "handheld phone selfie from slightly BELOW eye level looking gently up, vertical 9:16",
+    "arm's-length selfie held just ABOVE the eye line angled slightly toward the face (not overhead), vertical 9:16",
+    "handheld phone at a natural over-the-shoulder-ish 3/4 angle, roughly eye level, vertical 9:16",
+    "propped phone at EYE LEVEL, subject framed straight-on a step back, vertical 9:16",
 ]
 
 # Per-request-type STYLE PROFILES. `look` = the aesthetic layer; `camera`/`lighting` = defaults;
@@ -36,7 +49,8 @@ STYLE_PROFILES = {
                  "artifacts, light sensor noise, faded colors, soft contrast. No stabilization, no "
                  "cinematic moves, no modern grade. Candid documentary realism, imperfect off-center "
                  "framing, believable unscripted body language, realistic skin texture, minimal makeup."),
-        "camera": "handheld selfie at EYE LEVEL, phone held at eye height, straight-on — NOT a high or overhead angle, not looking down; vertical 9:16",
+        "camera": UGC_CAMERA_ANGLES[0],   # default; retrieve() varies this per generation across UGC_CAMERA_ANGLES
+
         "lighting": "available natural light, uneven",
         "audio": "ambient/diegetic only — no music, no narration, no sound design",
     },
@@ -183,10 +197,15 @@ def retrieve(request_type: str, model: str = "", max_exemplars: int = 3) -> dict
     model_rule, exemplars}. The Prompt Writer composes from this — no hardcoded single style."""
     rt = _norm(request_type)
     fam = _model_family(model)
+    profile = STYLE_PROFILES[rt]
+    if rt == "ugc":
+        # VARY the handheld UGC angle per generation (natural variety; never a top-down overhead).
+        # Shallow copy so we override camera without mutating the shared profile.
+        profile = dict(profile, camera=random.choice(UGC_CAMERA_ANGLES))
     ex = [e["pattern"] for e in EXEMPLARS if e["type"] == rt][:max_exemplars]
     return {
         "request_type": rt,
-        "profile": STYLE_PROFILES[rt],
+        "profile": profile,
         "global_rules": GLOBAL_RULES,
         "model_rule": MODEL_RULES.get(fam, ""),
         "exemplars": ex,

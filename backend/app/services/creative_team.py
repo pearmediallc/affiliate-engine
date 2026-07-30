@@ -210,7 +210,9 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
                             model: str, winner_hook: str = "", winner_transcript: str = "",
                             available_references: Optional[dict] = None,
                             has_real_character: bool = False,
-                            has_winner_video: bool = False) -> dict:
+                            has_winner_video: bool = False,
+                            cast_gender: str = "", cast_age_band: str = "",
+                            scene: str = "", geo: str = "") -> dict:
     """The leader. Sets the MASTER PLAN the rest of the team executes: the creative approach,
     which references to use where, the model routing intent, and — crucially — WHERE in the
     timeline we lip-sync a real character vs hard-cut to b-roll/map/product inserts.
@@ -228,6 +230,13 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
         plan_route["notes"] = (plan_route.get("notes", "") + f" (learned: avoid {plan_route['engine']} for {plan_route['style']})").strip()
     playbook = pb.summary_for_prompt()
     lessons = learn.lessons_for_prompt(style=plan_route["style"], vertical=vertical)
+    # REQUESTED CAST & SETTING: the plan MUST describe the character/setting we actually render (a man
+    # on a porch, not a defaulted woman 45+). Injected so creative_director's approach/structure match.
+    _cast = ""
+    if cast_gender or cast_age_band or scene or geo:
+        _cast = ("REQUESTED CAST & SETTING (the plan MUST match this — do NOT default to a woman): "
+                 f"gender={cast_gender or 'unspecified'}, age={cast_age_band or 'unspecified'}"
+                 f"{(', region=' + geo) if geo else ''}{(', scene=' + scene) if scene else ''}.\n")
     from . import prompt_craft
     prompt = f"""{playbook}\n\n{lessons}\n\n{prompt_craft.UGC_AD_CRAFT}\n\nYou are the Creative Director — the leader of a direct-response video team. You
 decide the whole plan and delegate. Be concrete about REFERENCES, MODEL, and where we LIP-SYNC a
@@ -237,7 +246,7 @@ OFFER: {offer_desc}
 VERTICAL: {vertical}
 REQUEST TYPE: {request_type}
 PREFERRED MODEL (or 'Auto'): {model}
-WINNING HOOK: {winner_hook[:300]}
+{_cast}WINNING HOOK: {winner_hook[:300]}
 WINNER STRUCTURE (reference): {winner_transcript[:900]}
 AVAILABLE REFERENCES: {json.dumps(refs)[:600]}
 HAVE REAL CHARACTER FOOTAGE: {has_real_character}   HAVE WINNER VIDEO: {has_winner_video}
@@ -258,9 +267,12 @@ Return STRICT JSON:
         return out
     # heuristic master plan: real character → lipsync body with b-roll inserts; else winner-clone
     technique = "lipsync" if has_real_character else ("hard_cut" if has_winner_video else "lipsync")
+    _who = ((cast_gender or "real") + " talking person"
+            + (f", age {cast_age_band}" if cast_age_band else "")
+            + (f", in a {scene}" if scene else ""))
     return {
         "route": plan_route,
-        "approach": f"Hook fast on the winning angle, then deliver the offer with a real talking person and cut to relevant inserts.",
+        "approach": f"Hook fast on the winning angle, then deliver the offer with a {_who} and cut to relevant inserts.",
         "reference_plan": ("Open on the winning hook; use the real character for spoken beats; "
                            "cut to b-roll/map inserts on proof points; clean CTA card." if has_real_character
                            else "Clone the proven winner structure for this offer."),
@@ -360,12 +372,31 @@ def _strategist_heuristic(offer_desc: str, winner_hook: str, metrics: dict) -> d
             "fix": "Sharpen the CTA and offer clarity; keep the winning structure."}
 
 
-# ── 2. Script Writer ──────────────────────────────────────────────────────────
+# Proven direct-response copywriting formulas the Copywriter SELECTS + ROTATES between — structural
+# variety (a genuinely different skeleton per script) beats the same angle with reworded sentences.
+# Source: readstoleads "best copywriting formulas".
+COPY_FORMULAS = (
+    "PROVEN COPYWRITING FORMULAS — SELECT the ONE that best fits THIS offer + goal, then write the "
+    "spoken script to that formula's STRUCTURE. ROTATE: do NOT default to the same formula every time; "
+    "for a set of variations use DIFFERENT formulas so the scripts differ STRUCTURALLY, not just by a "
+    "few reworded words.\n"
+    "- AIDA — Attention, Interest, Desire, Action.\n"
+    "- PAS — Problem, Agitate, Solution.\n"
+    "- BAB (Before-After-Bridge) — life with the problem, life once it's solved, the bridge (offer) between.\n"
+    "- PPPP — Promise, Picture, Proof, Push.\n"
+    "- AICPBSAWN — Attention, Interest, Credibility, Proof, Benefits, Scarcity, Action, Warn, Now.\n"
+    "Treat any example/winner scripts below as STYLE reference ONLY — never a template to reword."
+)
+
+
+# ── 2. Copywriter (script) ────────────────────────────────────────────────────
 async def script_writer(*, offer_desc: str, vertical: str, strategy: dict,
                         loser_transcript: str = "", winner_hook: str = "",
-                        winner_transcript: str = "") -> str:
-    """Write/enhance the spoken script per the Strategist's fix. Keep the offer; open on the
-    winning hook. Returns plain script text (spoken lines only, no stage directions)."""
+                        winner_transcript: str = "", script_ref: str = "") -> str:
+    """Write/enhance the spoken script per the Strategist's fix, as a COPYWRITER working a chosen +
+    rotated copywriting formula (structural variety, not reworded sameness). Keep the offer; open on
+    the winning hook. If `script_ref` (an explicitly referenced/approved library script) is supplied,
+    use IT accurately instead of writing a new one. Returns plain script text (spoken lines only)."""
     from . import vertical_dna
     _dna = vertical_dna.style_guide(vertical)
     # A script is SPOKEN aloud — a bracket placeholder is a defect, never a template slot.
@@ -373,10 +404,17 @@ async def script_writer(*, offer_desc: str, vertical: str, strategy: dict,
         "\nNEVER write bracketed placeholders ([Website], [Brand], [Company], [State], [XX]). "
         "If no brand/site was supplied, use a natural generic CTA ('tap the link below', "
         "'click the link on this page'); if one WAS supplied, say it verbatim and naturally.")
-    prompt = f"""{_coach_pre('scriptwriter')}You are the Script Writer on a direct-response creative team. Write a tight,
+    _ref = (script_ref or "").strip()
+    _formula_block = (
+        ("An APPROVED reference script is provided — reproduce it ACCURATELY (keep its message, offer "
+         "and structure); only lightly polish wording/flow. Do NOT invent a new angle or formula.")
+        if _ref else COPY_FORMULAS)
+    prompt = f"""{_coach_pre('scriptwriter')}You are the Copywriter on a direct-response creative team. Write a tight,
 natural spoken script (first-person, conversational, no stage directions, no on-screen text
 markers) for a short vertical ad.
 {(chr(10) + _dna + chr(10)) if _dna else ''}
+{_formula_block}
+
 OFFER (must stay intact): {offer_desc}
 VERTICAL: {vertical}
 STRATEGIST FIX: {strategy.get('fix','')}
@@ -384,15 +422,15 @@ ANGLE: {strategy.get('angle','')}
 KEEP: {json.dumps(strategy.get('keep', []))}
 CHANGE: {json.dumps(strategy.get('change', []))}
 WINNING HOOK to open on: {winner_hook[:300]}
-LOSER SCRIPT (to enhance, not copy): {loser_transcript[:1200]}
-WINNER SCRIPT (proven structure to echo): {winner_transcript[:1200]}
+{("APPROVED REFERENCE SCRIPT — use accurately, do NOT rewrite the angle: " + _ref[:1200] + chr(10)) if _ref else ""}LOSER SCRIPT (to enhance, not copy): {loser_transcript[:1200]}
+WINNER SCRIPT (proven structure to echo as STYLE only): {winner_transcript[:1200]}
 
 Rules: hook in the first sentence; one clear idea per sentence; end on a clean CTA. 40-90 words.
-Return STRICT JSON: {{"script": "the spoken script as plain sentences"}}"""
+Return STRICT JSON: {{"formula": "the formula used (AIDA|PAS|BAB|PPPP|AICPBSAWN|reference)", "script": "the spoken script as plain sentences"}}"""
     out = await _gemini_json(prompt, temperature=0.6)
     if out and out.get("script"):
         return str(out["script"]).strip()
-    return _script_heuristic(offer_desc, loser_transcript, winner_hook)
+    return _ref or _script_heuristic(offer_desc, loser_transcript, winner_hook)
 
 
 def _script_heuristic(offer_desc: str, loser_transcript: str, winner_hook: str) -> str:
@@ -402,13 +440,13 @@ def _script_heuristic(offer_desc: str, loser_transcript: str, winner_hook: str) 
 
 
 _STRATEGY_SPEC = {"diagnosis": str, "lagging_metric": str, "angle": str,
-                  "keep": list, "change": list, "fix": str}
+                  "keep": list, "change": list, "fix": str, "formula": str}
 
 
 async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: str,
                                loser_transcript: str = "", loser_metrics: Optional[dict] = None,
                                winner_hook: str = "", winner_transcript: str = "",
-                               variation_directive: str = "") -> tuple:
+                               variation_directive: str = "", script_ref: str = "") -> tuple:
     """MERGED Strategist + Script Writer in ONE round-trip (diagnosis + script together) — halves
     latency/cost vs two sequential calls. Returns (strategy: Strategy, script: str). Falls back to
     the two deterministic heuristics if the LLM is unavailable."""
@@ -433,6 +471,20 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
                       "guidance to maximize this script, THEN write the improved script.")
         diag_hint = ("forward-looking opportunity, NOT a verdict on past performance "
                      "(e.g. 'To maximize this, open on the payoff…')")
+    # HONOR AN EXPLICIT SCRIPT REFERENCE: when the caller supplied a specific/approved library script,
+    # the Copywriter USES it accurately (keep its message/offer/structure; light polish only) instead
+    # of writing a new formula-driven one — never overwrite a user-referenced script. Verbatim-lock is
+    # handled upstream (run_creative_team's short-circuit); this covers the rewrite-allowed reference.
+    _ref = (script_ref or "").strip()
+    if _ref:
+        write_block = ("An APPROVED reference script from the library is provided below. USE IT "
+                       "ACCURATELY — keep its message, offer and structure; do NOT replace it with a "
+                       "new formula-driven script. Only lightly polish wording/flow and keep a clean "
+                       "CTA. (No formula rotation here — the reference IS the structure.)")
+        formula_hint = "the formula the reference already follows, or 'reference'"
+    else:
+        write_block = COPY_FORMULAS
+        formula_hint = "the formula you chose (AIDA|PAS|BAB|PPPP|AICPBSAWN)"
     from . import vertical_dna
     prompt = f"""{pb.MISSION}
 
@@ -441,29 +493,33 @@ async def strategize_and_write(*, offer_desc: str, vertical: str, request_type: 
 
 {learn.lessons_for_prompt(vertical=vertical)}
 
-{_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Script
-Writer on THIS project (above). {task_instr} Keep the offer intact.
+{write_block}
+
+{_coach_pre('strategist')}{_coach_pre('scriptwriter')}You are the Strategist AND the Copywriter
+on THIS project (above). {task_instr} Keep the offer intact.
 
 OFFER: {_sanitize(offer_desc, MAX_OFFER)}
 VERTICAL: {vertical}   REQUEST TYPE: {request_type}
 {("REAL LOSER METRICS (from live data, lower=worse): " + json.dumps(metrics)[:500]) if grounded else "PERFORMANCE DATA: none — this is a fresh script with no metrics."}
 {"LOSER TRANSCRIPT" if grounded else "SOURCE SCRIPT (draft to improve, not a past ad)"}: {_sanitize(loser_transcript, MAX_TRANSCRIPT)}
-WINNING HOOK to open on: {_sanitize(winner_hook, MAX_HOOK)}
+{("APPROVED REFERENCE SCRIPT — use accurately, do NOT rewrite the angle: " + _sanitize(_ref, MAX_TRANSCRIPT) + chr(10)) if _ref else ""}WINNING HOOK to open on: {_sanitize(winner_hook, MAX_HOOK)}
 WINNER SCRIPT (proven structure): {_sanitize(winner_transcript, MAX_WINNER_TX)}
 {(_sanitize(variation_directive, 400) + chr(10)) if variation_directive else ""}
 Script rules: hook in the first sentence; one idea per sentence; clean CTA; 40-90 words; first-person;
 no stage directions or on-screen-text markers.
 Return STRICT JSON: {{"diagnosis": "{diag_hint}", "lagging_metric": "hook_rate|hold_rate|offer_cr|ctr|roas|unknown",
+  "formula": "{formula_hint}",
   "angle": "...", "keep": ["..."], "change": ["..."], "fix": "one-line directive",
   "script": "the spoken script as plain sentences"}}"""
     out = await _gemini_json(prompt, temperature=0.5)
     if out and out.get("script"):
         strategy = _coerce(out, _STRATEGY_SPEC)
         return strategy, str(out.get("script")).strip()
-    # fallback: metric-grounded diagnosis when we have real metrics, else forward-looking guidance
+    # fallback: metric-grounded diagnosis when we have real metrics, else forward-looking guidance;
+    # an explicitly referenced script is returned accurately (never the heuristic mash-up).
     strategy = (_strategist_heuristic(offer_desc, winner_hook, metrics) if grounded
                 else _forward_heuristic(offer_desc, winner_hook))
-    return strategy, _script_heuristic(offer_desc, loser_transcript, winner_hook)
+    return strategy, (_ref or _script_heuristic(offer_desc, loser_transcript, winner_hook))
 
 
 # ── 3. Director (scene / emotion / gesture per beat) ──────────────────────────
@@ -506,27 +562,47 @@ One object per input beat, same order."""
 # ── 4. Character Manager (consistent identity) ────────────────────────────────
 async def character_manager(*, request_type: str, vertical: str,
                             avatar_hint: Optional[dict] = None,
-                            entity_desc: str = "") -> str:
+                            entity_desc: str = "",
+                            cast_gender: str = "", cast_age_band: str = "",
+                            scene: str = "", geo: str = "") -> str:
     """Lock ONE character descriptor reused across every beat (identity consistency).
-    If an entity_desc is already supplied (e.g. from a real Top-Avatar reference), keep it."""
+    If an entity_desc is already supplied (e.g. from a real Top-Avatar reference), keep it.
+    The REQUESTED cast (cast_gender/cast_age_band/scene/geo) wins over any avatar_hint over the casting
+    default — so the PLAN describes the character we actually render (a man on a porch, not a defaulted
+    woman 45+). Both the LLM prompt and the fallback honor the requested gender/age when provided."""
     if entity_desc:
         return entity_desc
     hint = avatar_hint or {}
-    if hint:
-        age = hint.get("age", "45+"); gender = hint.get("gender", "woman"); region = hint.get("region", "American")
-        return (f"a real, ordinary {region} {gender} aged {age}, natural un-retouched skin with pores, "
-                f"minimal makeup, everyday casual clothes, believable candid demeanor")
+    # requested cast wins → avatar_hint → default; normalize age band tokens to readable prose.
+    gender = (cast_gender or hint.get("gender") or "").strip()
+    gender = {"male": "man", "female": "woman"}.get(gender.lower(), gender)
+    age = (cast_age_band or hint.get("age") or "").strip().replace("plus", "+").replace("under", "under ")
+    region = (geo or hint.get("region") or "American").strip()
+    setting = (scene or "").strip()
+    if hint and not (cast_gender or cast_age_band or scene or geo):
+        # legacy avatar_hint-only path (unchanged): deterministic descriptor from the hint
+        return (f"a real, ordinary {region} {gender or 'woman'} aged {age or '45+'}, natural un-retouched "
+                f"skin with pores, minimal makeup, everyday casual clothes, believable candid demeanor")
     from . import prompt_craft
+    _cast = (f"\nCAST — use EXACTLY this, do NOT default to a woman: a {gender or 'person'} aged "
+             f"{age or 'adult'}{(', ' + region) if region else ''}"
+             f"{(', filmed in a ' + setting) if setting else ''}."
+             ) if (gender or age or setting) else ""
     prompt = f"""{_coach_pre('character')}{prompt_craft.UGC_IMAGE_CRAFT}
 
 You are the Character Manager. Describe ONE believable, ordinary
 real person to be the consistent on-camera talent for a {vertical} {request_type} ad. Anti-slop: no
-model looks, natural skin, everyday clothes. {cm.CHARACTER_CASTING}
+model looks, natural skin, everyday clothes. {cm.CHARACTER_CASTING}{_cast}
 Return STRICT JSON: {{"entity_desc": "one vivid sentence"}}"""
     out = await _gemini_json(prompt, temperature=0.5)
     if out and out.get("entity_desc"):
         return str(out["entity_desc"]).strip()
-    # casting rule fallback: default to a real 45+ woman (per the team's casting guidance)
+    # casting fallback: honor the requested cast when provided; else the team's default (45+ woman).
+    if gender or age:
+        _where = f", in a {setting}" if setting else ""
+        return (f"a real, ordinary {region} {gender or 'woman'} aged {age or '45+'}, natural un-retouched "
+                f"skin with visible pores, minimal makeup, everyday casual clothes, relaxed candid "
+                f"demeanor{_where}")
     return ("a real, ordinary American woman aged 45+, natural un-retouched skin with visible "
             "pores, minimal makeup, everyday casual clothes, relaxed candid demeanor")
 
@@ -851,6 +927,10 @@ async def run_creative_team(
     user_script: str = "",
     allow_rewrite: bool = True,
     omit_spoken_line: bool = False,
+    cast_gender: str = "",
+    cast_age_band: str = "",
+    scene: str = "",
+    geo: str = "",
 ) -> dict:
     """Run the full team (led by the Creative Director) and return an executable CreativePlan:
     {plan, strategy, script, entity_desc, beats:[...], critique}. Every step reports live to the
@@ -872,7 +952,8 @@ async def run_creative_team(
             offer_desc=offer_desc, vertical=vertical, request_type=request_type,
             model=model, winner_hook=winner_hook, winner_transcript=winner_transcript,
             available_references=available_references,
-            has_real_character=has_real_character, has_winner_video=has_winner_video)
+            has_real_character=has_real_character, has_winner_video=has_winner_video,
+            cast_gender=cast_gender, cast_age_band=cast_age_band, scene=scene, geo=geo)
         act.finish("director", job_id, ts_d, ok=True, detail=_summarize_master_plan(plan),
                    helpfulness=1.0 if plan.get("structure") else 0.5)
     except Exception as e:
@@ -900,7 +981,8 @@ async def run_creative_team(
         strategy, script = await strategize_and_write(
             offer_desc=offer_desc, vertical=vertical, request_type=request_type,
             loser_transcript=loser_transcript, loser_metrics=loser_metrics,
-            winner_hook=winner_hook, winner_transcript=winner_transcript)
+            winner_hook=winner_hook, winner_transcript=winner_transcript,
+            script_ref=_uscript)
         act.finish("strategist", job_id, ts_s, ok=True, detail=strategy.get("diagnosis", "diagnosed"),
                    helpfulness=1.0 if strategy.get("fix") else 0.5)
         act.finish("scriptwriter", job_id, ts_w, ok=True, detail="script written",
@@ -913,7 +995,9 @@ async def run_creative_team(
              helpfulness=lambda b: 1.0 if b else 0.0),
         _run("character", job_id, "locking the character",
              character_manager(request_type=request_type, vertical=vertical,
-                               avatar_hint=avatar_hint, entity_desc=entity_desc),
+                               avatar_hint=avatar_hint, entity_desc=entity_desc,
+                               cast_gender=cast_gender, cast_age_band=cast_age_band,
+                               scene=scene, geo=geo),
              helpfulness=lambda c: 1.0 if c else 0.0),
     )
 
