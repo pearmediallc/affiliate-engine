@@ -14,6 +14,7 @@ Recipes are ordered chains over the engine's EXISTING separate features
 """
 import os
 import re
+import random
 import json
 import math
 import base64
@@ -5975,6 +5976,11 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     #    clips); fall back to the AE-side cast only when none were passed. LIBRARY ONLY — never stock.
     hooks = list(hook_urls or []) or await _cast_library_broll(intent, limit=5, prefer_kind="hook")
     interiors = list(interior_urls or []) or await _cast_library_broll(intent, limit=6)
+    # SHUFFLE both pools so every gen gets a DIFFERENT opener (hooks[0]) + different interior inserts —
+    # the opener is always hooks[0], so without this the same first clip repeats even when CL rotated
+    # the set. AE-side shuffle guarantees rotation independent of the caller's order.
+    random.shuffle(hooks)
+    random.shuffle(interiors)
     nh, ni = len(hooks), len(interiors)
     _src = "cl" if (hook_urls or interior_urls) else "ae"
     if not hooks:                                             # no satisfaction clips → reuse interiors
@@ -6330,7 +6336,10 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # Natural pauses come from the punctuation + the model's own prosody. Only the ElevenLabs branch
     # (which genuinely honors SSML) may add breaths, applied inline there — never to the f5 path.
     _older = (a.get("age_band") in ("55plus", "45-55"))
-    _tts_text = script
+    # ALL-CAPS emphasis words ("jumped AGAIN", "save HUNDREDS") make TTS SPELL them letter-by-letter
+    # ("A-G-A-I-N"). Lower-case caps runs of >=4 letters for the SPOKEN text only (keep short all-caps
+    # like IRS/USA as acronyms). Captions still use `script`, so the on-screen emphasis is preserved.
+    _tts_text = re.sub(r"\b[A-Z][A-Z']{3,}\b", lambda m: m.group(0).lower(), script)
     # When the register is non-neutral, lead with an expressive real voice over the clone (clone stays
     # as fallback for timbre). Neutral tone → unchanged (clone/cast voice leads).
     _emotional_delivery = any(w in (a.get("tone") or "").lower() for w in _EMOTIONAL_TONES)
