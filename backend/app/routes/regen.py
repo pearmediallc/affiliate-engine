@@ -6135,8 +6135,14 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # talking-head / no captions) with nothing to catch it — so DON'T shortcut those; fall through to a
     # full run so the composite, captions and the QA gate all apply. (Proper step-ledger resume that
     # reuses veed AND re-applies b-roll/captions is the follow-up; until then, correctness wins.)
+    # Skip-triggers = every stage that runs AFTER the veed checkpoint and would be lost by the raw-render
+    # shortcut: captions (burn), b-roll (composite), AND lipsync_ab (produces a SECOND variant — the
+    # shortcut returns one, so an A/B retry would silently drop an arm). The always-on tone-seam color
+    # match is best-effort (keeps the un-matched video on failure), so skipping it is a minor quality
+    # delta, not a broken deliverable — not worth forcing a full re-spend over.
     _reuse_ok = (not a.get("force_fresh")
                  and not a.get("captions")
+                 and not a.get("lipsync_ab")
                  and not (ugc_broll or a.get("ugc_broll")))
     if _reuse_ok:
         try:
