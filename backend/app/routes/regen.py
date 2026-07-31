@@ -6554,6 +6554,13 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
                     vo_sec = await asyncio.to_thread(_audio_seconds, out_audio)
                     seconds = max(1, int(round(vo_sec)))
                     logger.info(f"[avatar-lipsync] slowed a fast read ({_wc/vo_sec:.2f} w/s) → atempo {_factor:.3f} → {vo_sec:.1f}s")
+                    # CRITICAL SYNC FIX: audio_url was hosted from the PRE-stretch audio (above). The
+                    # lip-sync consumes audio_url; the captions align to out_audio. We just changed
+                    # out_audio — so re-host it and repoint audio_url, else veed syncs the FAST original
+                    # while captions time to the SLOW one (audio runs fast, captions crawl behind).
+                    _reup = StorageService.upload_file(out_audio, f"voice/vo_{req.request_id[:8]}_slow.mp3")
+                    if _reup:
+                        audio_url = StorageService.presign_url(_reup) or _reup
     except Exception as _psle:
         logger.warning(f"[avatar-lipsync] pace slow-down skipped: {_psle}")
     from ..services import creative_qc as qc
