@@ -2546,11 +2546,33 @@ async def _execute(req: RunRequest):
 
 
 async def _callback(url: Optional[str], payload: dict):
+    """POST the result back to CL. A LOST callback orphans a fully-rendered, already-PAID job at
+    'running' FOREVER (CL never hears it finished — exactly the "showing generating but never lands"
+    bug), so delivery must be durable: retry with backoff, treat ANY non-2xx as a retryable failure
+    (httpx does not raise on 4xx/5xx by default → a CL 500/502 would otherwise look like success and
+    lose the variant), and log LOUDLY if every attempt fails. Never raises — a callback error must not
+    get re-caught by _execute and flipped into a spurious 'failed' callback that buries a ready result."""
     if not url:
         logger.warning("no callback_url; dropping result")
         return
-    async with httpx.AsyncClient(timeout=30) as c:
-        await c.post(url, json=payload, headers={"x-regen-secret": CALLBACK_SECRET})
+    rid = payload.get("request_id")
+    last = None
+    for attempt in range(5):
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(url, json=payload, headers={"x-regen-secret": CALLBACK_SECRET})
+            if r.status_code < 300:
+                if attempt:
+                    logger.info(f"[callback] {rid} delivered on retry #{attempt}")
+                return
+            last = f"HTTP {r.status_code}: {(r.text or '')[:200]}"
+        except Exception as e:
+            last = str(e)[:200]
+        logger.warning(f"[callback] {rid} attempt {attempt + 1}/5 failed: {last}")
+        await asyncio.sleep(min(2 ** attempt, 20))
+    logger.error(f"[callback] {rid} PERMANENTLY UNDELIVERED after 5 attempts — a rendered/paid "
+                 f"variant is now orphaned at 'running' in CL (self-heal will reconcile it). "
+                 f"status={payload.get('status')} last_error={last}")
 
 
 # ── Recipes (each returns a list of variant dicts) ────────────────────────────
