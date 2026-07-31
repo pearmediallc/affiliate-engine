@@ -258,9 +258,22 @@ FAL_LIPSYNC_ENDPOINTS = {
     "falsync": "fal-ai/sync-lipsync",                        # ~$0.70/min — mid tier
     "veed": "veed/lipsync",                                  # ~$0.60/min real — cheapest working lane (bulk lead)
 }
-# Observed from fal's ACTUAL invoice (~$1.20 for a full day of veed renders), NOT the
-# docs sticker price of $0.07/sec (=$4.20/min) which over-states real billing ~5x.
-FAL_LIPSYNC_PER_MIN = {"kling": 0.168, "falsync": 0.70, "veed": 0.60}
+# Per-minute $ actually billed by fal for each lip-sync endpoint. Defaults are what we OBSERVED on
+# fal's real invoices — NOT the docs sticker ($0.07/sec for veed = $4.20/min, which overstates real
+# billing ~7x and is what inflated the office cost). SET THESE FROM YOUR OWN fal invoice via env
+# (PRICE_LIPSYNC_VEED_PER_MIN etc.) so the number shown is grounded in reality, never a guessed sticker.
+def _env_rate(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name, "")
+        return float(v) if v else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+FAL_LIPSYNC_PER_MIN = {
+    "kling":   _env_rate("PRICE_LIPSYNC_KLING_PER_MIN", 0.168),
+    "falsync": _env_rate("PRICE_LIPSYNC_FALSYNC_PER_MIN", 0.70),
+    "veed":    _env_rate("PRICE_LIPSYNC_VEED_PER_MIN", 0.60),
+}
 
 
 def _fal_submit_ep(video_url: str, audio_url: str, ep_key: str = "kling") -> str:

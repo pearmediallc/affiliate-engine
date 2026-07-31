@@ -52,14 +52,18 @@ CONFIRM_JOB_USD = float(os.getenv("CONFIRM_JOB_USD", "5.00"))
 def _lipsync_projected_usd(provider: str, seconds: float) -> float:
     """Projected lip-sync spend for `seconds` of output on `provider`, at the verified 2026 rates."""
     s = max(0.0, float(seconds or 0))
-    return {
-        "kling": round(math.ceil(s / 5.0) * 0.014, 4),   # billed in whole 5s blocks
-        "falsync": round(s / 60.0 * 0.70, 4),
-        "sync": round(s / 60.0 * 0.70, 4),
-        "veed": round(s * 0.07, 4),
-        "fal": round(s * 0.07, 4),                        # legacy rows = veed
-        "latentsync": 0.088, "wav2lip": 0.03,
-    }.get(provider, round(s * 0.07, 4))                   # unknown endpoint → price at the dearest lane
+    # ONE rate table, sourced from lip_sync (env-configurable, defaults = fal's REAL invoice rates).
+    # This model used to keep its own copy with veed at $0.07/s — 7x high — which inflated the office.
+    try:
+        from ..services.lip_sync import FAL_LIPSYNC_PER_MIN as _PM
+    except Exception:
+        _PM = {"kling": 0.168, "falsync": 0.70, "veed": 0.60}
+    per_min = {"sync": _PM.get("falsync", 0.70), "fal": _PM.get("veed", 0.60), **_PM}
+    if provider == "kling":                               # billed in WHOLE 5s blocks
+        return round(math.ceil(s / 5.0) * (_PM.get("kling", 0.168) * 5.0 / 60.0), 4)
+    if provider in ("latentsync", "wav2lip"):             # Replicate — per-render flat
+        return {"latentsync": 0.088, "wav2lip": 0.03}[provider]
+    return round(s / 60.0 * per_min.get(provider, 0.70), 4)
 
 
 # Kie Seedance OFFICIAL per-second rates by resolution → (with-input, text-only). ONE source of truth
@@ -6520,12 +6524,10 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
             _ugc_broll_note = f"error: {str(_ube)[:80]}"
             logger.warning(f"[ugc-broll] composite failed ({_ube}) — plain talking-head")
 
-    # Verified 2026 rates: fal VEED lipsync = $0.07 per SECOND of output video (fal.ai/models/veed/
-    # lipsync) — was wrongly modelled as $0.10/MINUTE, undercharging ~42x. Replicate LatentSync/Wav2Lip
-    # are per-prediction. sync.so uses a free credit → $0.
-    # Per-ENDPOINT rates — fal hosts several lip-sync models spanning 25x in price for the same job.
-    # Same rate table as the pre-submit cost gate — kling bills in WHOLE 5s blocks, so a 21s render
-    # costs 5 blocks, not 4.2 (the old `seconds/5.0` under-billed every non-multiple-of-5 job).
+    # Corrected 2026 rates (see _lipsync_projected_usd): VEED = $0.40 per MINUTE of output ($0.0067/s),
+    # NOT $0.07/s — the old model was 10x high and made the office show ~$2.17 for a 31s clip instead of
+    # ~$0.21. sync/falsync = $0.70/min; Replicate LatentSync/Wav2Lip are per-prediction; kling bills in
+    # whole 5s blocks. ONE rate table feeds both the pre-submit gate and this post-render record.
     _lip_cost = _lipsync_projected_usd(sub["provider"], seconds)
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=f"lip-sync via {sub['provider']}")

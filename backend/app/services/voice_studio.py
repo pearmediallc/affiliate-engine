@@ -21,6 +21,7 @@ Public API:
 """
 import logging
 import os
+import re
 import subprocess
 import uuid
 import base64
@@ -311,14 +312,38 @@ def _syn_gemini(text: str, voice: str, out_path: str, style: Optional[str] = Non
 FAL_CLONE_MODEL = os.getenv("FAL_CLONE_MODEL", "fal-ai/f5-tts")
 
 
+def _first_pause_end(path: str, lo: float = 0.2, hi: float = 1.9,
+                     noise: str = "-30dB", d: float = 0.10) -> Optional[float]:
+    """Return the END time (s) of the FIRST silence gap whose start falls in [lo, hi], via ffmpeg
+    silencedetect — i.e. the pause right after a short sacrificial lead phrase. None if none found."""
+    try:
+        p = subprocess.run(["ffmpeg", "-i", path, "-af", f"silencedetect=noise={noise}:d={d}",
+                            "-f", "null", "-"], capture_output=True, text=True, timeout=60)
+        starts = re.findall(r"silence_start:\s*([-\d.]+)", p.stderr)
+        ends = re.findall(r"silence_end:\s*([-\d.]+)", p.stderr)
+        for s, e in zip(starts, ends):
+            s, e = float(s), float(e)
+            if lo <= s <= hi:
+                return e
+    except Exception:
+        pass
+    return None
+
+
 def _syn_fal_clone(text: str, out_path: str, sample_url: str, ref_text: Optional[str] = None) -> dict:
     key = settings.fal_key or settings.fal_api_key
     if not key:
         raise RuntimeError("no fal key")
     if not sample_url:
         raise RuntimeError("fal clone needs a reference audio sample")
-    payload = {"gen_text": text[:5000], "ref_audio_url": sample_url,
-               "model_type": "F5-TTS", "remove_silence": True, "speed": VOICE_SPEED}
+    # ── KILL THE f5 BOUNDARY ARTIFACT (the stray "us"/blob heard before the first word) ───────────
+    # F5-TTS emits a spurious ~0.5s token at the very start of the output. We prepend a SACRIFICIAL
+    # lead word so the artifact attaches to IT, keep silences (remove_silence=False) so the pause
+    # right after the lead survives, then hard-cut everything up to that pause — so the real script
+    # starts clean. remove_silence would otherwise erase the pause we need to find the cut point.
+    LEAD = "So. "
+    payload = {"gen_text": (LEAD + text)[:5000], "ref_audio_url": sample_url,
+               "model_type": "F5-TTS", "remove_silence": False, "speed": VOICE_SPEED}
     if ref_text:
         payload["ref_text"] = ref_text[:2000]   # else fal ASRs the reference itself
     r = requests.post(f"https://fal.run/{FAL_CLONE_MODEL}",
@@ -329,7 +354,22 @@ def _syn_fal_clone(text: str, out_path: str, sample_url: str, ref_text: Optional
     url = ((r.json() or {}).get("audio_url") or {}).get("url")
     if not url:
         raise RuntimeError("fal clone returned no audio")
-    _dl(url, out_path)
+    tmp = out_path + ".lead.mp3"
+    _dl(url, tmp)
+    # cut up to the pause after the sacrificial lead; then re-trim any residual leading silence.
+    cut = _first_pause_end(tmp, lo=0.2, hi=1.9)
+    strip_lead_sil = "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB"
+    try:
+        args = ["ffmpeg", "-y", "-loglevel", "error"]
+        if cut and cut > 0.1:
+            args += ["-ss", f"{cut:.2f}"]
+        args += ["-i", tmp, "-af", strip_lead_sil, "-c:a", "libmp3lame", "-q:a", "2", out_path]
+        subprocess.run(args, check=True, timeout=120)
+        if not os.path.exists(out_path):
+            raise RuntimeError("trim produced no file")
+    except Exception:
+        import shutil
+        shutil.move(tmp, out_path)   # NEVER lose the audio — worst case keep the raw output
     return {"provider": "fal-clone", "voice": "cloned from character", "cost_usd": 0.02}
 
 
