@@ -533,6 +533,37 @@ async def _transcribe_file(path: str) -> str:
         try: os.remove(apath)
         except OSError: pass
 
+def _clean_ref_wav(raw_path: str, out_wav: str, lo: float = 6.0, hi: float = 11.0) -> str:
+    """Extract a CLEAN F5-TTS reference: mono 24k, STARTING at the first speech onset and ENDING on a
+    natural silence in [lo,hi]s — never the old hard mid-word `-t 15` cut. THAT is the root of the
+    repeated-word echo: a long, mid-word reference makes f5 re-prime on the ref and inject a reference
+    word at every sentence boundary. A clean, phrase-bounded ~6-11s ref lets f5 separate ref from gen.
+    Falls back to a <=hi hard cut. Synchronous; returns out_wav."""
+    buf = out_wav + ".buf.wav"
+    _ffmpeg(["-i", raw_path, "-vn", "-ac", "1", "-ar", "24000", "-t", f"{hi + 2.0:.1f}", buf], 120)
+    start, end = 0.0, hi
+    try:
+        p = subprocess.run(["ffmpeg", "-i", buf, "-af", "silencedetect=noise=-32dB:d=0.15", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=60)
+        s_starts = [float(x) for x in re.findall(r"silence_start:\s*([\d.]+)", p.stderr)]
+        s_ends = [float(x) for x in re.findall(r"silence_end:\s*([\d.]+)", p.stderr)]
+        for e in s_ends:                       # skip any leading silence → start on the first word
+            if e <= 1.5:
+                start = e
+        cand = [s for s in s_starts if lo <= s <= hi and s > start + 3.0]   # end on a real phrase boundary
+        if cand:
+            end = cand[-1]
+    except Exception:
+        pass
+    _ffmpeg(["-ss", f"{start:.2f}", "-i", buf, "-t", f"{max(3.0, end - start):.2f}",
+             "-ac", "1", "-ar", "24000", out_wav], 120)
+    try:
+        os.remove(buf)
+    except OSError:
+        pass
+    return out_wav
+
+
 async def _audio_matches_script(audio_path: str, script: str):
     """Clone-QA: transcribe synthesized audio and compare to the intended script. Returns (ok, reason).
     Garbled when token overlap is low (< 0.65) OR a dollar amount / number in the script did not survive
@@ -4374,7 +4405,9 @@ def _voice_clone_get(character_key: str):
                                   "WHERE character_key=:k"), {"k": character_key}).first()
         finally:
             db.close()
-        if row and row[0]:
+        # Only reuse clean-era ('v2') references; a stale mid-word ref (old key) is ignored so it
+        # re-extracts cleanly and re-caches — never serve a reference that causes the boundary echo.
+        if row and row[0] and "clonev2" in str(row[0]):
             return {"sample_key": row[0], "ref_text": row[1], "provider": row[2]}
     except Exception as e:
         logger.warning(f"[voice-clone] cache read failed: {e}")
@@ -6173,8 +6206,11 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
             try:
                 raw = await _download_to_temp(char_url, ".mp4")
                 wav = raw.rsplit(".", 1)[0] + ".wav"
-                # F5-TTS wants a clean ~10-15s reference of the person actually speaking
-                await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
+                # ROOT FIX for the repeated-word echo: a CLEAN, phrase-bounded ~6-11s reference (starts
+                # on the first word, ends on a natural silence) instead of a hard mid-word 15s cut. A
+                # mid-word/over-long ref is what made f5 re-prime and inject a reference word at each
+                # sentence boundary ("Satisfied"/"US"). ref_text below transcribes THIS exact segment.
+                await asyncio.to_thread(_clean_ref_wav, raw, wav)
                 _clone_wav = wav
                 # REF TEXT: tell F5-TTS exactly what the reference clip SAYS (without it fal auto-ASRs
                 # the ref and its errors bleed in as a spurious token at every sentence start). Best-effort.
@@ -6186,7 +6222,9 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
                     logger.warning(f"ref-text transcribe failed (f5 will ASR): {_rte}")
                 # SAVE to a STABLE per-character key so it can be re-presigned + REUSED; record it.
                 if _vc_key:
-                    _stable_key = "voice/clone_" + re.sub(r"[^A-Za-z0-9]", "", _vc_key)[:60] + ".wav"
+                    # 'v2' = the clean-reference era. Bumping the prefix invalidates any clone saved
+                    # with the old mid-word 15s ref (see _voice_clone_get), so it re-extracts cleanly.
+                    _stable_key = "voice/clonev2_" + re.sub(r"[^A-Za-z0-9]", "", _vc_key)[:60] + ".wav"
                     if StorageService.upload_file(wav, _stable_key):
                         _voice_clone_put(_vc_key, _stable_key, _ref_text, provider="f5")
                         sample_url = StorageService.presign_url(_stable_key)
