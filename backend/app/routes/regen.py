@@ -5785,7 +5785,8 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
 
 
 async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: dict,
-                             layout: str, work: str, req: "RunRequest") -> str:
+                             layout: str, work: str, req: "RunRequest",
+                             hook_urls: list = None, interior_urls: list = None) -> tuple:
     """Intercut satisfaction/interior b-roll over the lip-synced talking-head, keeping ONE continuous
     VO. Returns (composited_path | None, status) — status is surfaced in the variant feedback so a live
     run REVEALS exactly what happened (cast counts / bail reason) without needing server logs. The
@@ -5809,18 +5810,20 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     if not any(k == "broll" for _, _, k, _ in segs):
         return None, "skipped: no broll segment"
 
-    # 2) cast footage pools — satisfaction 'hook' openers (cross-vertical) + same-vertical interiors.
-    #    LIBRARY ONLY: these come from our own tagged asset library (now re-signed fresh so they fetch).
-    hooks = await _cast_library_broll(intent, limit=5, prefer_kind="hook")
-    interiors = await _cast_library_broll(intent, limit=6)
+    # 2) footage pools — satisfaction 'hook' openers (cross-vertical) + same-vertical interiors.
+    #    PREFER URLs the CL caller cast from asset_library (AE's own asset_tags store doesn't hold these
+    #    clips); fall back to the AE-side cast only when none were passed. LIBRARY ONLY — never stock.
+    hooks = list(hook_urls or []) or await _cast_library_broll(intent, limit=5, prefer_kind="hook")
+    interiors = list(interior_urls or []) or await _cast_library_broll(intent, limit=6)
     nh, ni = len(hooks), len(interiors)
+    _src = "cl" if (hook_urls or interior_urls) else "ae"
     if not hooks:                                             # no satisfaction clips → reuse interiors
         hooks = interiors
     if not interiors:
         interiors = hooks
     if not hooks and not interiors:
         logger.info("[ugc-broll] library has no b-roll to cast — plain talking-head")
-        return None, f"no b-roll cast (hooks={nh} interiors={ni})"
+        return None, f"no b-roll cast (src={_src} hooks={nh} interiors={ni})"
 
     # 3) render each timeline segment at WxH/30fps, silent (face cut from the lip-sync master; b-roll
     #    montage from the right pool). Keeping each face segment at its ORIGINAL time preserves the
@@ -5878,7 +5881,7 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
         logger.warning(f"[ugc-broll] compose mux failed: {me}")
         return None, "mux failed"
     if os.path.exists(out):
-        return out, f"composited {layout} · {nbroll} b-roll window(s) · lib hooks={nh} interiors={ni}"
+        return out, f"composited {layout} · {nbroll} b-roll window(s) · src={_src} hooks={nh} interiors={ni}"
     return None, "no output file"
 
 
@@ -6404,7 +6407,10 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
             _ub_intent = {"vertical": (vertical or ""), "scene": (a.get("scene") or ""),
                           "gender": (a.get("gender") or ""), "age_band": (a.get("age_band") or "")}
             _ub_layout = "ham" if (_vidx % 2 == 1) else "rit"
-            _ub, _ub_status = await _compose_ugc_broll(_fm, out_audio, float(vo_sec), _ub_intent, _ub_layout, _ub_work, req)
+            _ub_hooks = a.get("broll_hook_urls") if isinstance(a, dict) else None
+            _ub_inter = a.get("broll_interior_urls") if isinstance(a, dict) else None
+            _ub, _ub_status = await _compose_ugc_broll(_fm, out_audio, float(vo_sec), _ub_intent, _ub_layout,
+                                                       _ub_work, req, hook_urls=_ub_hooks, interior_urls=_ub_inter)
             _ugc_broll_note = _ub_status or ""
             if _ub and os.path.exists(_ub):
                 result = {"local_path": _ub}
