@@ -6129,8 +6129,17 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
         script = await _diversify_hook(script, _vidx, _vtot, offer_value, seconds)
         if _axis_eff == "script" and verbatim:
             _axis_note = "script axis on a verbatim user script → varied the opening HOOK only"
-    act.finish("scriptwriter", req.request_id, t0,
-               detail=("used YOUR script verbatim · " if verbatim else "") + script[:160])
+    # Surface the copywriting FORMULA the office actually used (AIDA/PAS/BAB/PPPP/AICPBSAWN), and pass
+    # the FULL script — the office clips the row visually but shows all of it when you click the
+    # Copywriter. Proves the framework is applied (strategize_and_write rotates COPY_FORMULAS).
+    try:
+        _formula = (_strategy.get("formula") if isinstance(_strategy, dict)
+                    else getattr(_strategy, "formula", "")) or ""
+    except Exception:
+        _formula = ""
+    _lead = ("used YOUR script verbatim · " if verbatim
+             else (f"Copywriter · {_formula} formula · " if _formula else "Copywriter · "))
+    act.finish("scriptwriter", req.request_id, t0, detail=_lead + (script or ""))
     _track_cost(req.request_id, "script", ("none" if verbatim else "gemini"),
                 model=("user-supplied" if verbatim else "gemini-2.5-flash"),
                 cost_usd=(0.0 if verbatim else 0.001),

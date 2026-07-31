@@ -131,7 +131,7 @@ def tick(job_id: str, note: str = "") -> None:
         if j:
             j["updated"] = _now()
             if note:
-                j["feed"].appendleft({"t": _now(), "persona": "generation", "event": "progress", "detail": note[:160]})
+                j["feed"].appendleft({"t": _now(), "persona": "generation", "event": "progress", "detail": note[:800]})
     if note:
         logger.info(f"[office] {job_id} progress: {note[:160]}")
         _persist("generation", "progress", job_id=job_id, detail=note[:160])   # durable
@@ -174,9 +174,14 @@ def finish(persona: str, job_id: str, started: float, *, ok: bool = True, revise
         j = _job(job_id)
         j["updated"] = ts
         if persona in j["personas"]:
+            # FULL detail on the per-employee record — this is what the office shows when you click an
+            # employee, so the whole script / prompt / direction is visible (was clipped to 160 chars).
             j["personas"][persona] = {"status": "idle", "task": None, "since": None,
-                                      "last": {"t": ts, "ms": ms, "ok": ok, "revised": revised, "detail": detail[:160]}}
-        j["feed"].appendleft({"t": ts, "persona": persona, "event": event, "ms": ms, "detail": detail[:160]})
+                                      "last": {"t": ts, "ms": ms, "ok": ok, "revised": revised,
+                                               "detail": (detail or "")}}
+        # Feed list keeps a generous cap (the frontend visually clamps the row; click shows full above).
+        j["feed"].appendleft({"t": ts, "persona": persona, "event": event, "ms": ms,
+                              "detail": (detail or "")[:800]})
         led = _LEDGER.get(persona)
         if led is not None:
             led["runs"] += 1; led["total_ms"] += ms
