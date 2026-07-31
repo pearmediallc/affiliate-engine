@@ -6485,6 +6485,25 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     _cast_id = f"{voice_res.get('provider')}:{voice_res.get('voice')}"
     _vmeta = (next((v for v in vs.list_voices() if v.get("id") == _cast_id), None)
               or next((v for v in vs.list_voices() if v.get("id") == voice_id), {}))
+    # ── SELF-CORRECTING PACE ─────────────────────────────────────────────────────────────────────
+    # f5 can synth a read ABOVE the natural ceiling (e.g. 3.74 w/s), and the QC gate below would then
+    # HARD-FAIL the whole generation. There was no path to slow a too-fast read (pacing only sped up
+    # a too-slow one). STRETCH it under the ceiling instead of aborting — verbatim stays verbatim, all
+    # words intact. Target 3.3 w/s (comfortably inside 1.8-3.6); atempo<1 lengthens; floor 0.75.
+    try:
+        _wc = len((script or "").split())
+        if _wc >= 8 and vo_sec > 0 and (_wc / vo_sec) > 3.5:
+            _factor = max(0.75, vo_sec / (_wc / 3.3))
+            if _factor < 0.985:
+                _slow = out_audio.rsplit(".", 1)[0] + "_slow.mp3"
+                await asyncio.to_thread(_ffmpeg, ["-i", out_audio, "-filter:a", f"atempo={_factor:.3f}", _slow], 120)
+                if os.path.exists(_slow):
+                    out_audio = _slow
+                    vo_sec = await asyncio.to_thread(_audio_seconds, out_audio)
+                    seconds = max(1, int(round(vo_sec)))
+                    logger.info(f"[avatar-lipsync] slowed a fast read ({_wc/vo_sec:.2f} w/s) → atempo {_factor:.3f} → {vo_sec:.1f}s")
+    except Exception as _psle:
+        logger.warning(f"[avatar-lipsync] pace slow-down skipped: {_psle}")
     from ..services import creative_qc as qc
     _qc = qc.verify_pre_lipsync(
         script=script, vo_seconds=vo_sec,
