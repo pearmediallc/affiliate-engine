@@ -6100,6 +6100,36 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
         pass
     brief = (a.get("brief") or req.expectation or "").strip()
 
+    # ── REUSE ALREADY-PAID WORK ON RETRY ───────────────────────────────────────────────────────
+    # A retry/redispatch of THIS request must not re-burn the expensive lip-sync ($0.33 veed) a prior
+    # attempt already paid for. If a checkpoint exists (LipsyncJob persisted at submit) and its provider
+    # job still resolves, produce the variant straight from it — skipping script, TTS AND the paid veed
+    # submit. Fail-open: a missing / expired / errored checkpoint just falls through to a full fresh run,
+    # so first-time generations are completely unaffected. Opt out with assets.force_fresh=true.
+    if not a.get("force_fresh"):
+        try:
+            from ..models.creative_team import LipsyncJob as _LJ
+            from ..database import SessionLocal as _SL
+            _cdb = _SL()
+            try:
+                _ck = _cdb.query(_LJ).filter(_LJ.id == req.request_id).first()
+                _ckd = ({"provider": _ck.provider, "provider_job": _ck.provider_job,
+                         "out_name": _ck.out_name, "script": _ck.script} if _ck else None)
+            finally:
+                _cdb.close()
+            if _ckd and _ckd.get("provider") and _ckd.get("provider_job"):
+                from ..services import lip_sync as _ls
+                _st, _res = await asyncio.to_thread(lambda: _ls.poll_relipsync(_ckd["provider"], _ckd["provider_job"]))
+                if _st == "done" and _res:
+                    logger.info(f"[avatar-lipsync] REUSE checkpoint {req.request_id}: prior "
+                                f"{_ckd['provider']} lip-sync still resolves — skipping script/TTS/veed re-spend")
+                    _rn = _ckd.get("out_name") or _out_url(req, "avatar_lipsync")[0]
+                    _rv = await _produce_lipsync_variant(req.request_id, _rn, _res, _ckd.get("script") or base or "")
+                    _rv.setdefault("whats_changed", "Recovered from the paid lip-sync checkpoint (no re-spend)")
+                    return [_rv]
+        except Exception as _rue:
+            logger.warning(f"[avatar-lipsync] checkpoint reuse skipped ({req.request_id}): {_rue}")
+
     # ── DIVERSIFICATION AXIS (shared contract with the creative-library caller) ────────────────
     # CL may ask for N GENUINELY-different variations of ONE request along one axis. Absent / total<=1
     # → exactly today's single-variation behavior, unchanged. Parsed defensively; a bad value → no-op.
