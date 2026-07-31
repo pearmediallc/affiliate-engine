@@ -29,7 +29,7 @@ ROSTER = [
      "desc": "The smart leader — orchestrates everyone; picks references, model per beat, and marks cuts vs lip-sync."},
     {"id": "strategist", "role": "Strategist",        "seat": "left",  "emoji": "🧠",
      "desc": "Diagnoses the loser vs winner ROI data and decides the fix."},
-    {"id": "scriptwriter","role": "Script Writer",    "seat": "left",  "emoji": "✍️",
+    {"id": "scriptwriter","role": "Copywriter",       "seat": "left",  "emoji": "✍️",
      "desc": "Writes/enhances the script; keeps the offer + winning hook."},
     {"id": "scene",      "role": "Director (Scenes)", "seat": "left",  "emoji": "🎭",
      "desc": "Breaks the script into beats; assigns scene, emotion, gesture, environment."},
