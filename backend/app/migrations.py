@@ -142,6 +142,43 @@ def run_migrations() -> None:
     # Per-character voice-clone cache (SAVE + REUSE the character's cloned voice across generations).
     _ensure_voice_clones_table()
 
+    # Reconcile historical lip-sync costs to the REAL rate (veed was logged at ~7x). Recomputes from
+    # `units` (seconds), so it is idempotent and safe on every boot — fixes the inflated office totals.
+    _backfill_lipsync_costs()
+
+
+def _backfill_lipsync_costs() -> None:
+    """Recompute every stored lip-sync cost from its `units` (seconds) × the REAL per-minute rate.
+    Historical veed rows were written at $0.07/s (~7x high), which inflated the office 'spent this
+    month' and per-gen totals (they're SUMs of creation_costs.cost_usd). Recomputing from units is
+    idempotent — a correct row recomputes to itself — so this runs safely on every startup."""
+    import math
+    try:
+        from .services.lip_sync import FAL_LIPSYNC_PER_MIN as PM
+    except Exception:
+        PM = {"kling": 0.168, "falsync": 0.70, "veed": 0.60}
+    per_min = {"sync": PM.get("falsync", 0.70), "fal": PM.get("veed", 0.60), **PM}
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT id, provider, units FROM creation_costs "
+                "WHERE step='lipsync' AND unit_type='sec' AND units IS NOT NULL AND units > 0")).fetchall()
+            n = 0
+            for _id, prov, units in rows:
+                p = (prov or "").lower()
+                if p in ("latentsync", "wav2lip"):            # flat per-render — leave as-is
+                    continue
+                if p == "kling":                              # billed in whole 5s blocks
+                    new = round(math.ceil(float(units) / 5.0) * (PM.get("kling", 0.168) * 5.0 / 60.0), 4)
+                else:
+                    new = round(float(units) / 60.0 * per_min.get(p, 0.70), 4)
+                conn.execute(text("UPDATE creation_costs SET cost_usd=:c WHERE id=:i"),
+                             {"c": new, "i": _id})
+                n += 1
+        logger.info(f"migrations: reconciled {n} lip-sync cost rows to real rates")
+    except Exception as e:
+        logger.warning(f"migrations: lip-sync cost backfill skipped: {e}")
+
 
 def _ensure_voice_clones_table() -> None:
     """Create the `voice_clones` cache (idempotent). One row per character: the SAVED clone reference
