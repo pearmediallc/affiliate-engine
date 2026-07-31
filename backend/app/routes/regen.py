@@ -4327,6 +4327,49 @@ async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = N
     return _fresh([(k, u) for s, u, k, cv, sv, kd in scored[:max(1, int(limit))]])
 
 
+def _voice_clone_get(character_key: str):
+    """Return a character's SAVED voice-clone reference {sample_key, ref_text, provider}, or None.
+    Read-only, never raises — a cache miss just means we clone fresh."""
+    if not character_key:
+        return None
+    try:
+        from sqlalchemy import text
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            row = db.execute(text("SELECT sample_key, ref_text, provider FROM voice_clones "
+                                  "WHERE character_key=:k"), {"k": character_key}).first()
+        finally:
+            db.close()
+        if row and row[0]:
+            return {"sample_key": row[0], "ref_text": row[1], "provider": row[2]}
+    except Exception as e:
+        logger.warning(f"[voice-clone] cache read failed: {e}")
+    return None
+
+
+def _voice_clone_put(character_key: str, sample_key: str, ref_text: str = None, provider: str = "f5") -> None:
+    """SAVE/refresh a character's voice-clone reference so the next generation REUSES it. Portable
+    upsert (delete-then-insert). Best-effort, never raises."""
+    if not (character_key and sample_key):
+        return
+    try:
+        from sqlalchemy import text
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            db.execute(text("DELETE FROM voice_clones WHERE character_key=:k"), {"k": character_key})
+            db.execute(text("INSERT INTO voice_clones (character_key, sample_key, ref_text, provider) "
+                            "VALUES (:k,:s,:r,:p)"),
+                       {"k": character_key, "s": sample_key, "r": (ref_text or None), "p": provider})
+            db.commit()
+        finally:
+            db.close()
+        logger.info(f"[voice-clone] saved clone for {character_key}")
+    except Exception as e:
+        logger.warning(f"[voice-clone] cache write failed: {e}")
+
+
 async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_ratio: str,
                                       seconds: int, reasons: list) -> list:
     """Last-resort tiers when every paid text-to-video provider is out of credits/quota:
@@ -5515,7 +5558,7 @@ def _clean_script(s: str) -> str:
     return re.sub(r"\s*\n\s*", " ", s).strip()
 
 
-async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None):
+async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None, kinetic=False):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
@@ -5579,9 +5622,13 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
     if cap_words:
         try:
             from ..services import captions as cap
-            ass_path = cap.build_ass(cap_words, os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass"),
-                                     play_w=w, play_h=h)
-            logger.info(f"[captions] burning {len(cap_words)} words onto {w}x{h}")
+            # UGC-BROLL uses the reference RED-BOX kinetic captions (1-2 words, numbers/keywords boxed
+            # red); everything else keeps the standard TikTok caption style. Same word timings.
+            _capf = os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass")
+            ass_path = (cap.build_kinetic_ass(cap_words, _capf, play_w=w, play_h=h) if kinetic
+                        else cap.build_ass(cap_words, _capf, play_w=w, play_h=h))
+            logger.info(f"[captions] burning {len(cap_words)} words onto {w}x{h}"
+                        + (" (kinetic red-box)" if kinetic else ""))
         except Exception as e:
             logger.error(f"[captions] build failed: {e}")
 
@@ -6067,28 +6114,46 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # eyes/ears mismatch. Clone the character's own voice unless the caller EXPLICITLY opts out.
     _do_clone = a.get("clone_voice") is not False and bool(char_url)
     _clone_engine = str(a.get("clone_engine") or "f5").lower()   # f5 | elevenlabs | auto
+    # STABLE per-character key → SAVE the clone once and REUSE it across generations (consistent voice,
+    # and skip re-extract/transcribe). Empty key (no asset id) → per-request behavior, uncached.
+    _vc_key = str(a.get("character_asset_id") or a.get("source_filename") or "").strip()
     if _do_clone:
-        try:
-            raw = await _download_to_temp(char_url, ".mp4")
-            wav = raw.rsplit(".", 1)[0] + ".wav"
-            # F5-TTS wants a clean ~10-15s reference of the person actually speaking
-            await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
-            _clone_wav = wav
-            # REF TEXT: tell F5-TTS exactly what the reference clip SAYS. Without it, fal auto-ASRs
-            # the reference and its errors bleed into the output as a spurious token at every sentence
-            # start ("Bing, my home insurance…"). Transcribing the sample and passing it as ref_text
-            # is the documented F5 fix — it removes the boundary hallucination. Best-effort.
+        # 2a) REUSE a saved clone for this character if one exists (re-presign the stored sample key).
+        _vc_cached = _voice_clone_get(_vc_key) if _vc_key else None
+        if _vc_cached and _vc_cached.get("sample_key"):
+            _psu = StorageService.presign_url(_vc_cached["sample_key"])
+            if _psu:
+                sample_url = _psu
+                _ref_text = _vc_cached.get("ref_text") or None
+                logger.info(f"[avatar-lipsync] REUSING saved voice clone for {_vc_key}")
+        # 2b) else extract a fresh ~15s sample, SAVE it to a stable key, and record it for next time.
+        if not sample_url:
             try:
-                _rt = await _transcribe_file(wav)
-                if _rt and len(_rt.split()) >= 3:
-                    _ref_text = _rt.strip()
-            except Exception as _rte:
-                logger.warning(f"ref-text transcribe failed (f5 will ASR): {_rte}")
-            sample_url = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
-            # the clone model fetches this itself — our bucket is private, so presign it
-            sample_url = StorageService.presign_url(sample_url) or sample_url
-        except Exception as e:
-            logger.warning(f"voice-clone sample extract failed, using preset: {e}")
+                raw = await _download_to_temp(char_url, ".mp4")
+                wav = raw.rsplit(".", 1)[0] + ".wav"
+                # F5-TTS wants a clean ~10-15s reference of the person actually speaking
+                await asyncio.to_thread(_ffmpeg, ["-i", raw, "-vn", "-ac", "1", "-ar", "24000", "-t", "15", wav], 120)
+                _clone_wav = wav
+                # REF TEXT: tell F5-TTS exactly what the reference clip SAYS (without it fal auto-ASRs
+                # the ref and its errors bleed in as a spurious token at every sentence start). Best-effort.
+                try:
+                    _rt = await _transcribe_file(wav)
+                    if _rt and len(_rt.split()) >= 3:
+                        _ref_text = _rt.strip()
+                except Exception as _rte:
+                    logger.warning(f"ref-text transcribe failed (f5 will ASR): {_rte}")
+                # SAVE to a STABLE per-character key so it can be re-presigned + REUSED; record it.
+                if _vc_key:
+                    _stable_key = "voice/clone_" + re.sub(r"[^A-Za-z0-9]", "", _vc_key)[:60] + ".wav"
+                    if StorageService.upload_file(wav, _stable_key):
+                        _voice_clone_put(_vc_key, _stable_key, _ref_text, provider="f5")
+                        sample_url = StorageService.presign_url(_stable_key)
+                # no stable key (or upload failed) → per-request sample, uncached (unchanged old path)
+                if not sample_url:
+                    _pr = StorageService.upload_file(wav, f"voice/sample_{req.request_id[:8]}.wav")
+                    sample_url = StorageService.presign_url(_pr) or _pr
+            except Exception as e:
+                logger.warning(f"voice-clone sample extract failed, using preset: {e}")
     # ALWAYS cast a gender/age/tone-correct preset. It's the voice we speak with directly, AND the
     # fallback if the clone can't run — so a female character can never land on a male/androgynous
     # voice just because Chatterbox/Replicate was unavailable.
@@ -6379,16 +6444,19 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     except Exception as _cme:
         logger.warning(f"[avatar-lipsync] post-sync tone match skipped: {_cme}")
 
-    # ── CONSTRAIN THE RE-RENDER TO THE MOUTH (kill the surrounding wobble) ────────────────────────
-    # The provider repaints a WIDE region, so its blend edge drags the jaw/background/objects. Put
-    # ONLY a tight mouth box from the synced clip back over the ORIGINAL footage — everything outside
-    # it is the real, un-wobbled original. Best-effort: on ANY failure keep the full synced clip.
-    try:
+    # ── LIP-SYNC MASKING — DISABLED (fixed box drifts on a moving head) ───────────────────────────
+    # _mouth_region_composite pasted a FIXED-POSITION mouth box from the synced clip over the original,
+    # on the premise "the head stays in the same position." Real UGC clips move (the person turns /
+    # leans / gestures), so the static box slides off the mouth and the overlay becomes VISIBLE — the
+    # exact seam reported. veed's own output is a full-frame lip-sync that TRACKS the face, so deliver
+    # that instead (no static seam). Re-enable only behind a real per-frame FACE-TRACKED mask.
+    if False:  # keep the branch for an easy face-tracked revisit; never runs today
+      try:
         _sp = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
         _mouthed = await _mouth_region_composite(_sp, char_url, req.request_id)
         if _mouthed:
             result = {"local_path": _mouthed}
-    except Exception as _moe:
+      except Exception as _moe:
         logger.warning(f"[avatar-lipsync] mouth-region composite skipped: {_moe}")
 
     # ── UGC-BROLL COMPOSITE (optional) ─────────────────────────────────────────────────────────────
@@ -6474,7 +6542,8 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # 4) SAVE — normalize + persist to BOTH buckets (subtitle is built in here, sized to the real frame)
     variant = await _produce_lipsync_variant(req.request_id, name, result, script,
                                              cap_words=(None if _use_veed else _cap_words),
-                                             vertical=(vertical or None))
+                                             vertical=(vertical or None),
+                                             kinetic=bool(ugc_broll or (isinstance(a, dict) and a.get("ugc_broll"))))
     ass_path = variant.get("captions_burned")
 
     # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy

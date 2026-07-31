@@ -139,6 +139,34 @@ def run_migrations() -> None:
     # JSON-text fallback — which a static model can't express.
     _ensure_user_memory_table()
 
+    # Per-character voice-clone cache (SAVE + REUSE the character's cloned voice across generations).
+    _ensure_voice_clones_table()
+
+
+def _ensure_voice_clones_table() -> None:
+    """Create the `voice_clones` cache (idempotent). One row per character: the SAVED clone reference
+    (a stable S3 key for the ~15s voice sample + its transcript) so subsequent generations REUSE the
+    same cloned voice instead of re-extracting/re-transcribing — consistent voice, less cost."""
+    dialect = engine.dialect.name
+    is_pg = dialect.startswith("postgres")
+    ts_ddl = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS voice_clones (
+            character_key TEXT PRIMARY KEY,   -- stable per-character id (asset id / source filename)
+            sample_key    TEXT,               -- stable S3 key of the saved voice sample (re-presign on use)
+            ref_text      TEXT,               -- transcript of the sample → F5-TTS ref_text
+            provider      TEXT,               -- f5 | elevenlabs (which engine the clone is for)
+            created_at    {ts_ddl},
+            updated_at    {ts_ddl}
+        )
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        logger.info("migrations: voice_clones table ready")
+    except Exception as e:
+        logger.error(f"migrations: failed to create voice_clones: {e}")
+
 
 def _ensure_user_memory_table() -> None:
     """Create the pgvector-optional `user_memory` table (idempotent).
