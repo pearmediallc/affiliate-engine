@@ -6128,7 +6128,17 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # job still resolves, produce the variant straight from it — skipping script, TTS AND the paid veed
     # submit. Fail-open: a missing / expired / errored checkpoint just falls through to a full fresh run,
     # so first-time generations are completely unaffected. Opt out with assets.force_fresh=true.
-    if not a.get("force_fresh"):
+    #
+    # SAFETY: this shortcut only produces the RAW lip-synced talking head — it does NOT re-run the b-roll
+    # composite or the caption burn, and it BYPASSES the final QA gate. So it is only safe for a plain,
+    # caption-less Avatar Lipsync. For a UGC+B-Roll or captioned ask it would ship a degraded video (plain
+    # talking-head / no captions) with nothing to catch it — so DON'T shortcut those; fall through to a
+    # full run so the composite, captions and the QA gate all apply. (Proper step-ledger resume that
+    # reuses veed AND re-applies b-roll/captions is the follow-up; until then, correctness wins.)
+    _reuse_ok = (not a.get("force_fresh")
+                 and not a.get("captions")
+                 and not (ugc_broll or a.get("ugc_broll")))
+    if _reuse_ok:
         try:
             from ..models.creative_team import LipsyncJob as _LJ
             from ..database import SessionLocal as _SL
