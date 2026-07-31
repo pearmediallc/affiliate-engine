@@ -3708,6 +3708,23 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
         except Exception as e:
             logger.warning(f"[eval-gate] cast check errored: {e}")
 
+        # ── 1f. B-ROLL PRESENCE — a UGC+B-Roll ask MUST ship with real b-roll, not a silent plain
+        # talking-head. The composite lane falls back to plain on ANY shortfall (empty library, compose
+        # failure), and that fallback is invisible to every pixel/audio check above. So the CALLER passes
+        # _ugc_broll_requested (was it a UGC+B-Roll job) + _broll_applied (did the composite actually
+        # swap in b-roll); a requested-but-not-applied job is a hard fault. STRICT NO-OP when the key is
+        # absent/falsey → plain Avatar Lipsync and every other caller are never penalized.
+        broll_present = None
+        try:
+            if assets.get("_ugc_broll_requested"):
+                broll_present = bool(assets.get("_broll_applied"))
+                checks.append(("broll_present", broll_present))
+                if not broll_present:
+                    reasons.append("b-roll missing: UGC+B-Roll was requested but the final shipped a "
+                                   "plain talking-head")
+        except Exception as e:
+            logger.warning(f"[eval-gate] b-roll presence check errored: {e}")
+
         # ── 2. SEMANTIC JUDGE — CROSS-FAMILY (OpenAI gpt-4o), one-line rubrics, booleans only ─────
         real_ok = arti_ok = lip_ok = None
         judge_engine = "none"
@@ -3747,10 +3764,12 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
         _sem = [p for p in (real_ok, arti_ok, lip_ok) if p is not None]
         sem_frac = (sum(1 for p in _sem if p) / len(_sem)) if _sem else 1.0
         confidence = round(0.20 * (1.0 if rendered else 0.0) + 0.50 * obj_frac + 0.30 * sem_frac, 2)
-        # deliver ONLY if faithfulness, never-abrupt and no-residual all pass AND no hard artifact.
-        # A check that could not run (None) is treated as non-blocking (best-effort, never over-block).
+        # deliver ONLY if faithfulness, never-abrupt, no-residual and b-roll-presence all pass AND no
+        # hard artifact. A check that could not run (None) is treated as non-blocking (best-effort,
+        # never over-block) — so broll_present stays None (→ pass) for non-UGC+B-Roll callers.
         deliver = bool((faithful is not False) and (not_abrupt is not False)
-                       and (no_residual is not False) and (not hard_artifact))
+                       and (no_residual is not False) and (broll_present is not False)
+                       and (not hard_artifact))
 
         verdict = {
             "faithful": (faithful is not False),
@@ -5778,7 +5797,10 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
     _ae_persist(out_path, out_name)
     return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script,
             "captions_burned": bool(ass_path), "scrubbed_original_captions": bool(delogo),
-            "caption_removal": removal_method}
+            "caption_removal": removal_method,
+            # expose the FINAL local file so a caller can run the QA gate on the real bytes it just
+            # wrote (unknown keys are ignored by callers that don't need it).
+            "_local_path": out_path}
 
 
 async def _resume_one_lipsync(row):
@@ -6570,9 +6592,23 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
         char_gender=a.get("gender"), char_age=a.get("age_band"),
         offer_value=offer_value or None)
     if not _qc["ok"]:
-        logger.error(f"[qc] BLOCKED before lip-sync ({req.request_id}): {_qc['reasons']}")
-        _set_lipsync_status(req.request_id, "failed", "QC: " + "; ".join(_qc["reasons"])[:250])
-        raise RuntimeError("creative QC failed before render: " + "; ".join(_qc["reasons"]))
+        # NON-FATAL PACE: a pace-only pre-render miss must NOT abort the whole paid job anymore. The
+        # self-correcting atempo stretch just above already slows a too-fast read, and the FINAL eval
+        # gate re-checks faithfulness/pace on the delivered file — so pace has two later arbiters. Only
+        # raise when a NON-pace BLOCKER remains (gender/age mismatch), exactly as before. Decision keys
+        # off the block-severity blockers in _qc["checks"] (not _qc["reasons"], which also carries the
+        # soft offer WARN — that must never trigger a hard fail).
+        _blockers = [c for c in (_qc.get("checks") or [])
+                     if not c.get("ok") and c.get("severity") == "block"]
+        _pace_only = bool(_blockers) and all(str(c.get("name")).lower() == "pace" for c in _blockers)
+        if _pace_only:
+            logger.warning(f"[qc] pace-only pre-render miss ({req.request_id}) — NOT aborting "
+                           f"(stretch ran; final gate arbitrates): {_qc['reasons']}")
+            _set_lipsync_status(req.request_id, "warn", "QC pace (non-fatal): " + "; ".join(_qc["reasons"])[:230])
+        else:
+            logger.error(f"[qc] BLOCKED before lip-sync ({req.request_id}): {_qc['reasons']}")
+            _set_lipsync_status(req.request_id, "failed", "QC: " + "; ".join(_qc["reasons"])[:250])
+            raise RuntimeError("creative QC failed before render: " + "; ".join(_qc["reasons"]))
     if _qc["reasons"]:
         logger.warning(f"[qc] warnings ({req.request_id}): {_qc['reasons']}")
 
@@ -6682,6 +6718,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # kinetic-caption burn runs over the whole thing (opener included). Best-effort: on any shortfall
     # `result` is untouched and we ship the plain talking-head.
     _ugc_broll_note = ""   # surfaced on the creative's feedback so a live run reveals what the composite did
+    _broll_applied = False   # True ONLY if the composite actually swapped in b-roll — fed to the QA gate
     if ugc_broll or (isinstance(a, dict) and a.get("ugc_broll")):
         try:
             _fm = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
@@ -6696,6 +6733,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
             _ugc_broll_note = _ub_status or ""
             if _ub and os.path.exists(_ub):
                 result = {"local_path": _ub}
+                _broll_applied = True   # real b-roll composite shipped — the QA gate's presence check passes
                 logger.info(f"[ugc-broll] {_ub_status} ({vo_sec:.0f}s)")
             else:
                 logger.info(f"[ugc-broll] no composite ({_ub_status}) — delivering the plain talking-head")
@@ -6807,18 +6845,35 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # avatar job and /learn/decisions came back []. The gate wraps final-video QA (so it runs once)
     # and adds the objective faithfulness/never-abrupt/residual-caption/spec/cast checks + a
     # cross-family semantic judge. Pass the RESOLVED captions flag (whether we actually burned any).
-    # Best-effort: it must never break or block delivery — its verdict just FLAGS the take below.
+    # Fail-open on INTERNAL error (deliver defaults True), but a confident FAIL now BLOCKS delivery below.
     _eval = {}
     try:
         _fqwork = tempfile.mkdtemp()
         try:
+            # Carry the b-roll signal so the gate can BLOCK a UGC+B-Roll job that silently degraded to a
+            # plain talking-head (_broll_applied is set True only when the composite actually swapped in).
+            _assets_for_gate = {**a, "captions": bool(ass_path or _use_veed),
+                                "_ugc_broll_requested": bool(ugc_broll or (isinstance(a, dict) and a.get("ugc_broll"))),
+                                "_broll_applied": _broll_applied}
             _eval = await _eval_gate(req.request_id, os.path.join(UPLOAD_DIR, name), script,
-                                     {**a, "captions": bool(ass_path or _use_veed)}, _fqwork) or {}
+                                     _assets_for_gate, _fqwork) or {}
         finally:
             import shutil as _sh3
             _sh3.rmtree(_fqwork, ignore_errors=True)
     except Exception as _fqe:
         logger.warning(f"[avatar-lipsync] eval gate skipped: {_fqe}")
+
+    # ── HONOR THE GATE — BLOCK a bad delivery instead of shipping it ─────────────────────────────
+    # The gate is the examiner: a confident FAIL must FAIL the job with the REAL reason, not silently
+    # ship a broken take (or a plain talking-head when UGC+B-Roll was requested — see _eval_gate's
+    # b-roll-presence check). _eval_gate is fail-open (any INTERNAL error → deliver=True), so only a
+    # genuine, high-confidence fault reaches here. Raise BEFORE the reward-critic + learning log below,
+    # so a blocked take never rewards the personas or records qc_passed=True. _execute catches this and
+    # fires the failed callback carrying this reason — the desired "fail loudly with the real cause".
+    if _eval.get("deliver") is False:
+        _gate_reasons = (_eval.get("reasons") or [])[:3]
+        _set_lipsync_status(req.request_id, "failed", "QA: " + "; ".join(_gate_reasons)[:250])
+        raise RuntimeError("QA gate blocked delivery: " + "; ".join(_gate_reasons))
 
     # ── POST-RENDER VISUAL QA (grade + coach, NO retry) ──────────────────────────────────────────
     # The avatar-lipsync path produced its clip but nothing ever critiqued the OUTPUT — so no persona
@@ -6874,9 +6929,11 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
           + (f" · ⚠ {_axis_note}" if _axis_note else "")
           + (f" · UGC-BROLL: {_ugc_broll_note}" if _ugc_broll_note else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
-    # EVAL GATE verdict → flag the take as "needs review" with the failing reason NAMED (never drop).
-    if _eval.get("deliver") is False:
-        fb += " ⚠ EVAL (needs review): " + "; ".join((_eval.get("reasons") or [])[:2])
+    # A deliver=False take already RAISED above (hard-blocked), so it never reaches here. A PASS that
+    # still carries soft issues (semantic nits, spec drift) is annotated on the creative — same soft
+    # note the multi-clip path surfaces — so a shipped take honestly shows what QA saw.
+    if _eval.get("issues"):
+        fb += " ⚠ QA: " + "; ".join((_eval.get("issues") or [])[:2])
     # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend);
     # populated from what ACTUALLY ran (same signals as whats_changed).
     _voice_label = ("f5-tts (clone)" if voice_res.get("provider") == "fal-clone"
