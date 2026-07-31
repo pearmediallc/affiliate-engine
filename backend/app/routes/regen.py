@@ -4250,16 +4250,45 @@ async def _cast_library_avatar(intent: dict):
             (best_any.get("url") if best_any else None), best_any)
 
 
-async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
-    """Scan the tagged asset library for scenic B-ROLL clips matching the parsed intent. Mirrors
-    _cast_library_avatar's DB scan but collects clips tagged usable_as/kind == 'broll' with a url.
-    Ranked by vertical match (strong), then scene, preferring LOW face_score (b-roll should be
-    scenic, not a face). Read-only, never raises. Returns up to `limit` clip URLs, best first.
+async def _cl_cast_broll(vertical: str = "", scene: str = "") -> dict:
+    """SINGLE SOURCE OF TRUTH for library b-roll: ask Creative-Library (which owns asset_library AND
+    its S3 bucket) to cast + FRESH-PRESIGN the clips. Returns {'hooks': [...], 'interiors': [...]},
+    empty on any error. This is why AE never needs its own asset_tags copy: CL — the only side that
+    can presign its bucket — mints server-fetchable URLs on demand. Best-effort; never raises."""
+    base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
+    if not base:
+        return {"hooks": [], "interiors": []}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{base}/api/regen/cast-assets",
+                             headers={"x-regen-secret": CALLBACK_SECRET},
+                             json={"kind": "broll", "vertical": (vertical or ""), "scene": (scene or "")})
+            r.raise_for_status()
+            d = r.json() or {}
+            return {"hooks": list(d.get("hook_urls") or []), "interiors": list(d.get("interior_urls") or [])}
+    except Exception as e:
+        logger.warning(f"[cast-assets] CL resolver failed ({e}); falling back to local asset_tags")
+        return {"hooks": [], "interiors": []}
 
-    prefer_kind: when set (e.g. 'hook' for the oddly-satisfying scroll-stopper openers — leaf-blowing,
-    hedge-trimming), boost that kind AND return it FIRST regardless of vertical. Those satisfaction
-    clips are cross-vertical (tagged vertical=None), so the same-vertical hard-filter below would
-    otherwise drop them whenever the vertical has its own interior b-roll. Absent → today's behavior."""
+
+async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
+    """Cast scenic B-ROLL clips for the parsed intent. PRIMARY source is CL's asset-resolver (the one
+    store that holds these clips + can presign its bucket); the legacy asset_tags scan below is only a
+    fallback for when the resolver is unreachable. Read-only, never raises. Returns up to `limit` URLs.
+
+    prefer_kind='hook' → the oddly-satisfying openers (leaf-blow, hedge-trim); else interiors."""
+    # SINGLE SOURCE OF TRUTH first — kills the recurring "AE's store is empty / URL is stale" class of
+    # bug: CL casts from asset_library and hands back fresh, server-fetchable presigned URLs.
+    try:
+        _r = await _cl_cast_broll(intent.get("vertical") or "", intent.get("scene") or "")
+        _pool = _r["hooks"] if (prefer_kind == "hook") else (_r["interiors"] or _r["hooks"])
+        if _pool:
+            return _pool[:max(1, int(limit))]
+    except Exception as e:
+        logger.warning(f"[broll] resolver cast errored, using local asset_tags: {e}")
+
+    # ── LEGACY FALLBACK: AE's own asset_tags store (mirrors _cast_library_avatar's DB scan; collects
+    #    clips tagged usable_as/kind=='broll'. Usually EMPTY in prod — the resolver above is primary). ──
     want_scene = (intent.get("scene") or "").lower()
     want_vert = (intent.get("vertical") or "").lower()
     prefer_kind = (prefer_kind or "").lower()

@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "sqlite:///./affiliate_images.db"  # Default SQLite, override with DATABASE_URL env var for Postgres
 
+    # Creative-Library base URL — CL owns the asset_library + its S3 bucket, so AE resolves library
+    # assets (b-roll, etc.) by calling CL's /api/regen/cast-assets (single source of truth, fresh
+    # presigned URLs). Default is prod; override with CREATIVE_LIBRARY_URL for staging/local.
+    creative_library_url: str = "https://creative-library.onrender.com"
+
     # Auth / JWT.
     # SECRET_KEY is REQUIRED in env. There is no fallback default — that's the
     # whole point of a secret. Generate with:
