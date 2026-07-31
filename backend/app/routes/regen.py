@@ -1806,6 +1806,53 @@ async def creation_costs(request_id: str = "", _auth: bool = Depends(require_ser
         db.close()
 
 
+def _api_key_for(provider: str, model: str) -> str:
+    """Which API KEY / env a cost row bills against — so the ledger shows which key cost what."""
+    p = (provider or "").lower(); m = (model or "").lower()
+    if "gemini" in p or "gemini" in m or "google" in p:        return "GEMINI_API_KEY"
+    if "eleven" in p or "eleven" in m:                          return "ELEVENLABS_API_KEY"
+    if p in ("openai", "whisper") or "whisper" in p or "gpt" in m or "openai" in m: return "OPENAI_API_KEY"
+    if p in ("fal-clone", "veed", "falsync", "fal", "kling") or "fal" in p or "f5" in m or "veed" in m: return "FAL_API_KEY"
+    if p == "sync" or "sync.so" in p:                           return "sync.so (fal credit)"
+    if p in ("latentsync", "wav2lip", "replicate") or "replicate" in p: return "REPLICATE_API_TOKEN"
+    if "kie" in p or "seedance" in m or "kie" in m:             return "KIE_API_KEY"
+    return "—"
+
+
+@router.get("/finance/ledger")
+async def finance_ledger(_auth: bool = Depends(require_service_key)):
+    """FINANCE LEDGER: per provider+model — total $ spent, # generations produced (distinct request),
+    # calls, and the API KEY it bills against. Plus a per-key roll-up and grand total. Straight off the
+    creation_costs ledger (same rows the office cost pill sums), so it reflects real, reconciled rates."""
+    from ..database import SessionLocal
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        rows = db.execute(text(
+            "SELECT provider, COALESCE(model,'') AS model, "
+            "       SUM(COALESCE(cost_usd,0)) AS total_usd, "
+            "       COUNT(DISTINCT request_id) AS generations, "
+            "       COUNT(*) AS calls, MAX(created_at) AS last_used "
+            "FROM creation_costs GROUP BY provider, COALESCE(model,'') "
+            "ORDER BY SUM(COALESCE(cost_usd,0)) DESC")).fetchall()
+        items, gtotal, by_key = [], 0.0, {}
+        for r in rows:
+            prov, model = (r[0] or ""), (r[1] or "")
+            total, gens, calls = float(r[2] or 0), int(r[3] or 0), int(r[4] or 0)
+            key = _api_key_for(prov, model)
+            gtotal += total
+            items.append({"provider": prov, "model": model or None, "api_key": key,
+                          "total_usd": round(total, 4), "generations": gens, "calls": calls,
+                          "last_used": (str(r[5]) if r[5] else None)})
+            e = by_key.setdefault(key, {"api_key": key, "total_usd": 0.0, "calls": 0})
+            e["total_usd"] = round(e["total_usd"] + total, 4); e["calls"] += calls
+        return {"success": True, "grand_total_usd": round(gtotal, 4),
+                "by_key": sorted(by_key.values(), key=lambda x: -x["total_usd"]),
+                "items": items}
+    finally:
+        db.close()
+
+
 @router.get("/voices")
 async def list_voices(gender: str = "", age_band: str = "", _auth: bool = Depends(require_service_key)):
     """The full pickable voice catalog (Kokoro/OpenAI/Deepgram presets, casting-tagged),
