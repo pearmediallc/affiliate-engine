@@ -4511,6 +4511,29 @@ async def _cl_cast_broll(vertical: str = "", scene: str = "") -> dict:
         return {"hooks": [], "interiors": []}
 
 
+# Strong refs to fire-and-forget avatar-save tasks so the loop doesn't GC them mid-flight.
+_t2v_avatar_tasks: set = set()
+
+
+async def _save_t2v_avatar_to_cl(meta: dict) -> None:
+    """Best-effort: register a from-scratch T2V talking-head clip as a REUSABLE library avatar in
+    Creative-Library (which owns asset_library + its S3). CL fetches meta['url'] and copies it into its
+    own bucket. Same shared secret AE already uses for /cast-assets + /callback. Non-fatal — never
+    raises and never blocks the generation (it runs as a detached task)."""
+    base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
+    if not base or not meta.get("url"):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{base}/api/regen/save-t2v-avatar",
+                             headers={"x-regen-secret": CALLBACK_SECRET},
+                             json=meta)
+            r.raise_for_status()
+            logger.info(f"[t2v-avatar] saved reusable avatar → {(r.json() or {}).get('s3_key')}")
+    except Exception as e:
+        logger.warning(f"[t2v-avatar] save failed (non-fatal): {e}")
+
+
 async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
     """Cast scenic B-ROLL clips for the parsed intent. PRIMARY source is CL's asset-resolver (the one
     store that holds these clips + can presign its bucket); the legacy asset_tags scan below is only a
@@ -5318,6 +5341,31 @@ async def recipe_generate(req: RunRequest) -> list:
             # every provider unavailable AND nothing rendered → library fallback (never a bare error)
             return await _generate_library_fallback(req, prompt, aspect_ratio, seconds,
                                                     reasons=["no clip produced (check Kie/fal credits)"])
+        # ── Best-effort: save clip 0 as a REUSABLE T2V library avatar (non-fatal; never delays) ──────
+        # A real from-scratch talking-head render just produced a character. clip_paths[0] is pre-caption
+        # (the finish pass burns onto out_path, not the clips), so it's already caption-free — the ideal
+        # reusable avatar. Copy it to our public /uploads (survives the work-dir cleanup) and hand CL the
+        # URL + the render's own cast/scene metadata to index in asset_library. Detached task → the POST
+        # never blocks the stitch/finish/return. Any failure is swallowed.
+        try:
+            if is_talk and clip_paths and os.path.exists(clip_paths[0]):
+                import uuid as _uuid, shutil as _avshu
+                _av_name = f"t2v_avatar_{_uuid.uuid4().hex[:10]}.mp4"
+                _avshu.copy(clip_paths[0], os.path.join(UPLOAD_DIR, _av_name))
+                _av_meta = {
+                    "url": f"{AE_PUBLIC_URL}/api/v1/uploads/{_av_name}",
+                    "gender": (assets.get("gender") or ""),
+                    "age": (assets.get("age") or assets.get("age_band") or ""),
+                    "scene": (assets.get("scene_detail") or assets.get("scene") or ""),
+                    "vertical": (vertical or ""),
+                    "state": (assets.get("state") or ""),
+                    "character_desc": (assets.get("character_desc") or ""),
+                    "name": f"T2V avatar {req.request_id[:8]}",
+                }
+                _avt = asyncio.create_task(_save_t2v_avatar_to_cl(_av_meta))
+                _t2v_avatar_tasks.add(_avt); _avt.add_done_callback(_t2v_avatar_tasks.discard)
+        except Exception as _save_e:
+            logger.warning(f"[generate] t2v avatar auto-save skipped: {_save_e}")
         if len(clip_paths) == 1:
             import shutil; shutil.copy(clip_paths[0], out_path)
         else:
