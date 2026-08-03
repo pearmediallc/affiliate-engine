@@ -2232,11 +2232,19 @@ async def studio_route(payload: dict, background: BackgroundTasks,
     }
     _answered = [k for k, v in _factors.items() if v]
     _still = [k for k, v in _factors.items() if not v]
+    # ADVISORY ONLY — this is a keyword scan of the whole conversation. It tests word PRESENCE, so it
+    # can false-positive on the AD'S OWN SUBJECT MATTER (a home-insurance script contains "home"; a
+    # car ad contains "car"; "$29" in the copy looks like an offer). YOU are the better reader: use it
+    # as a hint to avoid re-asking, but if the scan flags a factor the user never actually SPECIFIED,
+    # trust your own judgment and ask. Duration is the one reliable signal.
     _brief_state = (
-        "BRIEF STATE — deterministic scan of the whole conversation, TRUST THIS over your own reading:\n"
-        f"  ALREADY ANSWERED (NEVER ask these again): {', '.join(_answered) or '(none yet)'}\n"
-        f"  STILL MISSING (ask ONLY these; if the list is empty, STOP asking and act/write NOW): "
-        f"{', '.join(_still) or '(none — enough to proceed, do NOT interview)'}\n\n")
+        "BRIEF STATE — keyword scan of the conversation (a HINT, NOT authoritative; it can false-positive "
+        "on the ad's own subject matter, so weigh it with your own reading):\n"
+        f"  LIKELY ALREADY GIVEN (don't re-ask unless it was only the ad's topic, not a real answer): "
+        f"{', '.join(_answered) or '(none yet)'}\n"
+        f"  LIKELY STILL MISSING (ask ONLY the ones genuinely unspecified; if truly nothing's missing, "
+        f"stop interviewing and confirm/act): {', '.join(_still) or '(seems enough — proceed)'}\n"
+        f"  Reliable regardless of the above: duration = {str(_brief_secs)+'s' if _brief_secs else 'NOT stated'}.\n\n")
     # PER-USER LONG-TERM MEMORY (best-effort; NEVER blocks or breaks chat). Inject what we've learned
     # about THIS user (scoped by user_id) so the router personalizes + pre-fills the brief instead of
     # re-asking what they've historically always chosen. Empty (no-op) when we know nothing about them.
