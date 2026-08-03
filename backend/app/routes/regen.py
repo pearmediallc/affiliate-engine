@@ -4692,6 +4692,8 @@ async def recipe_generate(req: RunRequest) -> list:
     try:
         name, out_path, url = _out_url(req, "genvideo")
         _avatar_plan = False   # FIX 1: set when the brain's plan routes this request to avatar-lipsync
+        _pscript = ""          # the office/user spoken script (set in the team pass below); ANY real
+                               # script forces the talking-head path so every clip gets its SPOKEN LINE
 
         # EVERYTHING goes through the creative office (nothing bypassed): the team refines the
         # prompt (anti-slop + no-on-screen-text) and the desks light up under this job_id.
@@ -4782,8 +4784,10 @@ async def recipe_generate(req: RunRequest) -> list:
         # Computed HERE (before the reroute) because the avatar-lipsync preference below depends on it.
         _spoken = (_vo_script or "").strip()
         is_talk = (bool(video_urls)
+                   or bool(_pscript)                       # a real office/user script → ALWAYS a talking head,
+                   or bool((assets.get("script") or "").strip())   # even if it's short (<20 words), so its
                    or bool(re.search(r"\b(talk|say|speak|character|spokesperson|person|host|ugc|voiceover|narrat)\b", prompt, re.I))
-                   or len(_spoken.split()) >= 20)
+                   or len(_spoken.split()) >= 20)          # SPOKEN LINE is guaranteed into every clip's prompt
 
         # TALKING-HEAD UGC PREFERS AVATAR-LIPSYNC. The plan's route=avatar_lipsync is the only signal
         # today, and the brain often routes a plainly-talking-head UGC ask to seedance — which then
@@ -4810,6 +4814,14 @@ async def recipe_generate(req: RunRequest) -> list:
         if _avatar_plan and _gen_path == "scratch":
             _avatar_plan = False
             logger.info("[generate] user chose scratch → t2v (avatar-lipsync reroute disabled)")
+        # #7 HONOR THE USER'S EXPLICIT ENGINE. If they picked a t2v engine (seedance / veo / …, anything
+        # that is NOT 'auto'/''), do NOT silently reroute to avatar-lipsync — that is exactly the
+        # "director/plan said avatar_lipsync but it ran t2v" mismatch, and it also spends t2v credits on
+        # a path the user didn't ask for. Only 'auto'/'' lets the brain pick the engine.
+        _user_engine = str(assets.get("engine") or "").strip().lower()
+        if _avatar_plan and _user_engine and _user_engine not in ("auto", "", "avatar", "avatar_lipsync", "avatar-lipsync"):
+            _avatar_plan = False
+            logger.info(f"[generate] user explicitly chose engine={_user_engine} → honoring t2v (avatar-lipsync reroute disabled)")
 
         # FIX C (Finance) + FIX B (preflight): before ANY paid attempt, the Finance seat records the
         # provider/credit decision. Talking-head plan → avatar-lipsync (funded, cheaper); if every t2v
@@ -5041,19 +5053,15 @@ async def recipe_generate(req: RunRequest) -> list:
         # a fixed seconds/15 that repeats. Non-talking (broll) keeps the seconds-based split.
         from ..services import realism_prompt_engine as _rpe
         _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=28) if is_talk else []
-        # TALKING-HEAD IDENTITY GUARD (t2v fallback). A synthetic talking head rendered as MULTIPLE
-        # independent t2v generations comes back with a DIFFERENT face per clip — Seedance re-rolls the
-        # character each generation and first-frame anchoring only softens the drift. When a talking-head
-        # UGC that WANTED avatar-lipsync (no reference video, not an explicit b-roll) has fallen through
-        # to t2v because no avatar could be cast, render ONE continuous clip so identity stays consistent
-        # within the single generation — even though that caps the spoken length at ~one clip. Trim
-        # _vo_script to match so captions/TTS describe only what actually renders. Scenic b-roll (many
-        # distinct scenes) and winner-clone (reference video) keep their multi-clip split.
-        if is_talk and not video_urls and not _asked_broll and len(_vo_chunks) > 1:
-            _vo_chunks = _vo_chunks[:1]
-            _vo_script = _vo_chunks[0]
-            logger.info("[generate] talking-head t2v fallback (no castable avatar) → capping to ONE "
-                        "continuous clip for face consistency (identity guard)")
+        # MULTI-CLIP TALKING-HEAD KEEPS ITS FULL SPLIT (reverted 2026-08-03). A prior "identity guard"
+        # (commit 15292317, 2026-07-29) capped talking-head t2v fallback to ONE clip on the theory that
+        # multi-clip Seedance drifts the face. In practice the proven 7/27-7/28 renders (2-4 clips,
+        # ~23-43s, full scripts, "stitched with frame-continuity") show the last-frame → next-clip
+        # reference_image handoff below (5114-5122) holds identity fine — and that cap silently dropped
+        # the back HALF of every ad (offer + CTA), e.g. a 20s script rendered 9.4s with the $/CTA cut.
+        # So we do NOT truncate here: render every script chunk as its own frame-continuity-stitched
+        # clip so the WHOLE script is spoken. Length is bounded by the seconds budget below (which keeps
+        # the leading chunks that fit), never by throwing the tail away.
         _per_list = None
         if _vo_chunks:
             # Size clips off the SCRIPT, not the requested `seconds`: render EVERY chunk (so the whole
