@@ -2207,7 +2207,9 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         "3) make_video — user wants to make/generate a video/creative/clip:\n"
         '   {"action":"make_video","source":"last_script|last_ad_copy|none","prompt":"...","seconds":15,'
         '"request_type":"ugc|broll","gender":"female|male","age_band":"under35|45-55|55plus",'
-        '"scene":"kitchen|porch|car|couch|office|walk|null"}\n'
+        '"age":"the EXACT age the user said, verbatim (e.g. \'35-40\', \'38\', \'late 30s\'); null if unstated",'
+        '"scene":"kitchen|porch|car|couch|office|walk|null",'
+        '"scene_detail":"the EXACT setting/action the user described, verbatim (e.g. \'walking her dog on a suburban sidewalk\'); null if unstated"}\n'
         "   If the user references a prior script (e.g. \"make a video from that script\"), set source=\"last_script\" "
         "   and set prompt to that script's spoken content. Otherwise source=\"none\" and prompt is the video prompt.\n"
         "   CARRY THE BRIEF. request_type/gender/age_band/scene are the format + casting + SETTING the user "
@@ -2217,6 +2219,12 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         "   car→car, couch/living room→couch, office→office, walk-and-talk→walk). These used to be dropped "
         "   here, so every request generated as UGC with no cast. Omit a field ONLY when the conversation "
         "   truly never indicated it.\n"
+        "   CRITICAL — NEVER LOSE THE USER'S EXACT WORDS: age_band/scene are coarse buckets used only as a "
+        "   fallback casting hint. You MUST ALSO fill `age` with the user's EXACT age phrase (e.g. '35-40', "
+        "   '38', 'late 30s') and `scene_detail` with the user's EXACT setting/action (e.g. 'walking her dog "
+        "   on a suburban sidewalk') — verbatim, never rounded to a bucket. If '35-40' has no matching "
+        "   age_band bucket, still set age='35-40'; if 'walking her dog' isn't one of the scene words, set "
+        "   scene='walk' AND scene_detail='walking her dog'. The office renders from age/scene_detail.\n"
         "4) make_image — user wants a still image/poster/photo:\n"
         '   {"action":"make_image","prompt":"..."}\n'
         "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
@@ -2314,12 +2322,23 @@ async def studio_route(payload: dict, background: BackgroundTasks,
                         else "office" if re.search(r"\b(office|desk)\b", _low)
                         else "walk" if re.search(r"\b(walk|walking|walk[- ]and[- ]talk)\b", _low)
                         else ""))
+            # #5/#6 FREE-TEXT age + scene travel ALONGSIDE the coarse enums so the office honors the
+            # user's EXACT ask ("35-40", "38", "walking her dog") instead of a 3-bucket / 7-word default.
+            # The enum is a fallback casting hint; the free-text is the source of truth downstream.
+            _age_free = str(out.get("age") or "").strip()
+            if not _age_free:
+                _am = re.search(r"\b(\d{2}\s*[-–to]{1,3}\s*\d{2}|\d{2}\s*\+|(?:early|mid|late)\s*(?:20|30|40|50|60)s|\d{2}\s*(?:years?|yrs?|yo))\b", _low)
+                if _am:
+                    _age_free = _am.group(1).strip()
+            _scene_free = str(out.get("scene_detail") or "").strip()
             return {"action": "make_video", "source": src,
                     "prompt": (out.get("prompt") or message).strip(), "seconds": _stated_secs,
                     "request_type": _rt if _rt in ("ugc", "broll") else None,
                     "gender": _gd if _gd in ("female", "male") else None,
                     "age_band": _ab if _ab in ("under35", "45-55", "55plus") else None,
-                    "scene": _sc if _sc in ("kitchen", "porch", "car", "couch", "office", "walk") else None}
+                    "age": _age_free or None,
+                    "scene": _sc if _sc in ("kitchen", "porch", "car", "couch", "office", "walk") else None,
+                    "scene_detail": _scene_free or None}
         if action == "make_image":
             return {"action": "make_image", "prompt": (out.get("prompt") or message).strip()}
         return {"action": "reply", "text": (out.get("text") or "Tell me what you'd like to make.").strip()}
@@ -3957,8 +3976,11 @@ async def recipe_full_ad(req: RunRequest) -> list:
             user_script=_verbatim_user_script(_ra),
             allow_rewrite=_rewrite_allowed(_ra),
             # SINGLE SOURCE OF TRUTH: requested cast/setting → office PLAN matches the render.
+            # #5/#6 free-text age/scene win over the enum (same contract as the t2v lane).
             cast_gender=(_ra.get("gender") or ""), cast_age_band=(_ra.get("age_band") or ""),
-            scene=(_ra.get("scene") or ""), geo=(_ra.get("state") or ""))
+            cast_age=(_ra.get("age") or ""),
+            scene=(_ra.get("scene") or ""), scene_detail=(_ra.get("scene_detail") or ""),
+            geo=(_ra.get("state") or ""))
         beats = (plan.get("beats") or [])[:4]   # cap 4 clips (~48s) to bound cost/time
         script = plan.get("script", transcript)
         if not beats:
@@ -4065,8 +4087,11 @@ async def recipe_from_assets(req: RunRequest) -> list:
             user_script=script,
             allow_rewrite=_rewrite_allowed(req.assets if isinstance(req.assets, dict) else {}),
             # SINGLE SOURCE OF TRUTH: requested cast/setting → office PLAN matches the render.
+            # #5/#6 free-text age/scene win over the enum (same contract as the t2v lane).
             cast_gender=(assets.get("gender") or ""), cast_age_band=(assets.get("age_band") or ""),
-            scene=(assets.get("scene") or ""), geo=(assets.get("state") or ""))
+            cast_age=(assets.get("age") or ""),
+            scene=(assets.get("scene") or ""), scene_detail=(assets.get("scene_detail") or ""),
+            geo=(assets.get("state") or ""))
         beats = plan.get("beats") or []
         if not beats:
             beats = [{"i": i, "line": s, "prompt": "", "request_type": "broll"}
@@ -4719,7 +4744,14 @@ async def recipe_generate(req: RunRequest) -> list:
                 # SINGLE SOURCE OF TRUTH: thread the requested cast/setting so the office PLAN matches
                 # the render (a man on a porch, not a defaulted woman 45+).
                 cast_gender=(assets.get("gender") or ""), cast_age_band=(assets.get("age_band") or ""),
-                scene=(assets.get("scene") or ""), geo=(assets.get("state") or ""),
+                # #5/#6 free-text age/scene win over the enum ("38"/"35-40", "walking her dog") so the
+                # office PLAN + character honor the exact ask, not a bucket. #9 from_scratch drops the
+                # "regenerate a losing ad" framing when there's no source clip/metrics.
+                cast_age=(assets.get("age") or ""),
+                scene=(assets.get("scene") or ""), scene_detail=(assets.get("scene_detail") or ""),
+                geo=(assets.get("state") or ""),
+                from_scratch=(bool(assets.get("from_scratch")) or _gen_path == "scratch"
+                              or not bool(req.context.get("metrics") if isinstance(req.context, dict) else None)),
                 # T2V PER-CLIP OWNS THE SPEECH. On this lane each clip appends its OWN authoritative
                 # `SPOKEN LINE FOR THIS CLIP`, so the composed beat prompt must NOT also render
                 # `They say exactly: "…"` — two speech instructions in one prompt fight each other.

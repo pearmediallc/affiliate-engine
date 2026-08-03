@@ -212,7 +212,8 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
                             has_real_character: bool = False,
                             has_winner_video: bool = False,
                             cast_gender: str = "", cast_age_band: str = "",
-                            scene: str = "", geo: str = "") -> dict:
+                            cast_age: str = "", scene: str = "", scene_detail: str = "",
+                            geo: str = "", from_scratch: bool = False) -> dict:
     """The leader. Sets the MASTER PLAN the rest of the team executes: the creative approach,
     which references to use where, the model routing intent, and — crucially — WHERE in the
     timeline we lip-sync a real character vs hard-cut to b-roll/map/product inserts.
@@ -232,11 +233,24 @@ async def creative_director(*, offer_desc: str, vertical: str, request_type: str
     lessons = learn.lessons_for_prompt(style=plan_route["style"], vertical=vertical)
     # REQUESTED CAST & SETTING: the plan MUST describe the character/setting we actually render (a man
     # on a porch, not a defaulted woman 45+). Injected so creative_director's approach/structure match.
+    # #5/#6 free-text age/scene win over the enum; #9 fresh-ad framing.
+    _age_txt = (cast_age or cast_age_band).strip()
+    _scene_txt = (scene_detail or scene).strip()
     _cast = ""
-    if cast_gender or cast_age_band or scene or geo:
-        _cast = ("REQUESTED CAST & SETTING (the plan MUST match this — do NOT default to a woman): "
-                 f"gender={cast_gender or 'unspecified'}, age={cast_age_band or 'unspecified'}"
-                 f"{(', region=' + geo) if geo else ''}{(', scene=' + scene) if scene else ''}.\n")
+    if cast_gender or _age_txt or _scene_txt or geo:
+        _cast = ("REQUESTED CAST & SETTING (the plan MUST match this EXACTLY — do NOT default to a woman "
+                 "45+ or an indoor kitchen): "
+                 f"gender={cast_gender or 'unspecified'}, age={_age_txt or 'unspecified'}"
+                 f"{(', region=' + geo) if geo else ''}{(', setting=' + _scene_txt) if _scene_txt else ''}.\n")
+    _fresh = ("THIS IS A FRESH AD FROM SCRATCH — there is NO prior 'losing' ad and no winner reference. "
+              "Do NOT frame the approach as regenerating / fixing / rescuing a loser; write the plan for a "
+              "brand-NEW ad built purely from the offer + requested cast.\n" if from_scratch else "")
+    # #7b for a fresh t2v ad, lock the plan's TEXT to the chosen engine so it stops proposing
+    # avatar_lipsync while the render actually runs t2v (the mismatch the user flagged).
+    _eng_lock = (f"PREFERRED ENGINE '{model}' is a text-to-video engine — plan the whole ad as continuous "
+                 "talking-head clips on THIS engine, stitched with frame-continuity; do NOT propose "
+                 "avatar_lipsync or route talking segments to a different engine.\n"
+                 if (from_scratch and str(model or "").lower() not in ("", "auto")) else "")
     from . import prompt_craft
     prompt = f"""{playbook}\n\n{lessons}\n\n{prompt_craft.UGC_AD_CRAFT}\n\nYou are the Creative Director — the leader of a direct-response video team. You
 decide the whole plan and delegate. Be concrete about REFERENCES, MODEL, and where we LIP-SYNC a
@@ -246,7 +260,7 @@ OFFER: {offer_desc}
 VERTICAL: {vertical}
 REQUEST TYPE: {request_type}
 PREFERRED MODEL (or 'Auto'): {model}
-{_cast}WINNING HOOK: {winner_hook[:300]}
+{_cast}{_fresh}{_eng_lock}WINNING HOOK: {winner_hook[:300]}
 WINNER STRUCTURE (reference): {winner_transcript[:900]}
 AVAILABLE REFERENCES: {json.dumps(refs)[:600]}
 HAVE REAL CHARACTER FOOTAGE: {has_real_character}   HAVE WINNER VIDEO: {has_winner_video}
@@ -268,8 +282,8 @@ Return STRICT JSON:
     # heuristic master plan: real character → lipsync body with b-roll inserts; else winner-clone
     technique = "lipsync" if has_real_character else ("hard_cut" if has_winner_video else "lipsync")
     _who = ((cast_gender or "real") + " talking person"
-            + (f", age {cast_age_band}" if cast_age_band else "")
-            + (f", in a {scene}" if scene else ""))
+            + (f", age {_age_txt}" if _age_txt else "")
+            + (f", {_scene_txt}" if _scene_txt else ""))
     return {
         "route": plan_route,
         "approach": f"Hook fast on the winning angle, then deliver the offer with a {_who} and cut to relevant inserts.",
@@ -564,7 +578,8 @@ async def character_manager(*, request_type: str, vertical: str,
                             avatar_hint: Optional[dict] = None,
                             entity_desc: str = "",
                             cast_gender: str = "", cast_age_band: str = "",
-                            scene: str = "", geo: str = "") -> str:
+                            cast_age: str = "", scene: str = "", scene_detail: str = "",
+                            geo: str = "") -> str:
     """Lock ONE character descriptor reused across every beat (identity consistency).
     If an entity_desc is already supplied (e.g. from a real Top-Avatar reference), keep it.
     The REQUESTED cast (cast_gender/cast_age_band/scene/geo) wins over any avatar_hint over the casting
@@ -576,10 +591,12 @@ async def character_manager(*, request_type: str, vertical: str,
     # requested cast wins → avatar_hint → default; normalize age band tokens to readable prose.
     gender = (cast_gender or hint.get("gender") or "").strip()
     gender = {"male": "man", "female": "woman"}.get(gender.lower(), gender)
-    age = (cast_age_band or hint.get("age") or "").strip().replace("plus", "+").replace("under", "under ")
+    # #5/#6 FREE-TEXT WINS over the lossy enum: the user's exact "38" / "35-40" and "walking her dog"
+    # (cast_age / scene_detail) are honored verbatim; age_band / scene are only a fallback casting hint.
+    age = (cast_age or cast_age_band or hint.get("age") or "").strip().replace("plus", "+").replace("under", "under ")
     region = (geo or hint.get("region") or "American").strip()
-    setting = (scene or "").strip()
-    if hint and not (cast_gender or cast_age_band or scene or geo):
+    setting = (scene_detail or scene or "").strip()
+    if hint and not (cast_gender or cast_age_band or cast_age or scene or scene_detail or geo):
         # legacy avatar_hint-only path (unchanged): deterministic descriptor from the hint
         return (f"a real, ordinary {region} {gender or 'woman'} aged {age or '45+'}, natural un-retouched "
                 f"skin with pores, minimal makeup, everyday casual clothes, believable candid demeanor")
@@ -929,8 +946,11 @@ async def run_creative_team(
     omit_spoken_line: bool = False,
     cast_gender: str = "",
     cast_age_band: str = "",
+    cast_age: str = "",
     scene: str = "",
+    scene_detail: str = "",
     geo: str = "",
+    from_scratch: bool = False,
 ) -> dict:
     """Run the full team (led by the Creative Director) and return an executable CreativePlan:
     {plan, strategy, script, entity_desc, beats:[...], critique}. Every step reports live to the
@@ -953,7 +973,8 @@ async def run_creative_team(
             model=model, winner_hook=winner_hook, winner_transcript=winner_transcript,
             available_references=available_references,
             has_real_character=has_real_character, has_winner_video=has_winner_video,
-            cast_gender=cast_gender, cast_age_band=cast_age_band, scene=scene, geo=geo)
+            cast_gender=cast_gender, cast_age_band=cast_age_band, cast_age=cast_age,
+            scene=scene, scene_detail=scene_detail, geo=geo, from_scratch=from_scratch)
         act.finish("director", job_id, ts_d, ok=True, detail=_summarize_master_plan(plan),
                    helpfulness=1.0 if plan.get("structure") else 0.5)
     except Exception as e:
@@ -997,7 +1018,7 @@ async def run_creative_team(
              character_manager(request_type=request_type, vertical=vertical,
                                avatar_hint=avatar_hint, entity_desc=entity_desc,
                                cast_gender=cast_gender, cast_age_band=cast_age_band,
-                               scene=scene, geo=geo),
+                               cast_age=cast_age, scene=scene, scene_detail=scene_detail, geo=geo),
              helpfulness=lambda c: 1.0 if c else 0.0),
     )
 
