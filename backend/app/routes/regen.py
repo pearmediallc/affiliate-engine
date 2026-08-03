@@ -2178,8 +2178,16 @@ async def studio_route(payload: dict, background: BackgroundTasks,
     # proposed a plan → fire make_video VERBATIM from the script already in the thread. The LLM prompt
     # below also does this by judgment; this guarantees it even if the model slips.
     _msg = message.strip(); _low = _msg.lower()
-    _quoted = re.findall(r'["“](.{60,}?)["”]', _msg, re.S)
-    _inline = (_quoted[0].strip() if _quoted else "")
+    # Extract the quoted script by PAIRING quotes sequentially (1st–2nd, 3rd–4th, …), then take the
+    # LONGEST paired segment. A naive `"..."` regex breaks when the scene line has a short inner quote
+    # (e.g. "golden hour"): it eats the script's OPENING quote as the inner quote's closing quote, so
+    # the script never becomes a match. Splitting on quote chars and taking alternate segments pairs
+    # them correctly → ["golden hour", "<the real script>"] → longest = the script.
+    _qparts = re.split(r'["“”]', _msg)
+    _quoted = [_qparts[i].strip() for i in range(1, len(_qparts), 2)]
+    _inline = max(_quoted, key=len) if _quoted else ""
+    if len(_inline) < 40:   # too short to be a script (a stray inner quote) → fall through
+        _inline = ""
     if not _inline:
         _body = re.sub(r'^\s*(?:make|create|generate|turn|use|render)\b.*?(?:script|video|this)\b[:\-\s]*',
                        '', _msg, flags=re.I).strip()
@@ -2203,8 +2211,12 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             t = (h.get("text") or "").strip()
             if t.startswith("Got it — here's what I'll make"):
                 continue
-            _pq = re.findall(r'["“](.{60,}?)["”]', t, re.S)
-            cand = (_pq[0].strip() if _pq else (t if (len(t.split()) >= 25 and t.count('.') >= 2) else ""))
+            # Pair quotes sequentially + take the longest paired segment (see confirm path) so a short
+            # inner scene quote ("golden hour") can't hijack the extraction.
+            _qp = re.split(r'["“”]', t)
+            _pqs = [_qp[i].strip() for i in range(1, len(_qp), 2)]
+            _best = max(_pqs, key=len) if _pqs else ""
+            cand = (_best if len(_best) >= 40 else (t if (len(t.split()) >= 25 and t.count('.') >= 2) else ""))
             if cand: _prior = cand; _src = t; break
         if _prior:
             # Carry the CAST + SETTING from the SAME message the script came from, so the render matches
