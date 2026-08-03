@@ -256,24 +256,58 @@ async def _prep_winner_clip(winner_url: str, work: str, max_sec: int = 12) -> st
         return None
 
 
+async def _openai_vision(frame_paths: list, prompt: str) -> dict:
+    """OpenAI GPT-4o(-mini) vision fallback for _gemini_vision (same STRICT-JSON contract)."""
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    if not frame_paths:
+        raise RuntimeError("no frames to analyze")
+    def _call() -> str:
+        from openai import OpenAI
+        oai = OpenAI(api_key=settings.openai_api_key)
+        content = [{"type": "text", "text": prompt}]
+        for fp in frame_paths:
+            with open(fp, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        resp = oai.chat.completions.create(
+            model="gpt-4o-mini", temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": content}])
+        return resp.choices[0].message.content or "{}"
+    return json.loads(await asyncio.to_thread(_call))
+
+
 async def _gemini_vision(frame_paths: list, prompt: str) -> dict:
-    """Send frames + a prompt to Gemini and get back STRICT JSON."""
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY not configured")
-    parts = [{"text": prompt}]
-    for fp in frame_paths:
-        with open(fp, "rb") as f:
-            parts.append({"inline_data": {"mime_type": "image/jpeg",
-                                          "data": base64.b64encode(f.read()).decode()}})
-    body = {"contents": [{"parts": parts}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={settings.gemini_api_key}"
-    async with httpx.AsyncClient(timeout=90) as c:
-        r = await c.post(url, json=body)
-        r.raise_for_status()
-        data = r.json()
-    _track_gemini_cost(data, "vision")
-    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+    """Vision → STRICT JSON. Gemini first, with an OpenAI GPT-4o-mini vision fallback so a Gemini outage /
+    missing key / quota / 5xx doesn't leave EVERY render flagged UNVERIFIED (the recurring 'vision QA
+    unavailable' failure). Raises only if BOTH providers fail."""
+    try:
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY not configured")
+        parts = [{"text": prompt}]
+        for fp in frame_paths:
+            with open(fp, "rb") as f:
+                parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                              "data": base64.b64encode(f.read()).decode()}})
+        body = {"contents": [{"parts": parts}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={settings.gemini_api_key}"
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+        _track_gemini_cost(data, "vision")
+        return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+    except Exception as ge:
+        try:
+            result = await _openai_vision(frame_paths, prompt)
+            logger.warning(f"_gemini_vision: Gemini failed ({ge}) — used OpenAI vision fallback")
+            return result
+        except Exception as oe:
+            logger.error(f"_gemini_vision: Gemini ({ge}) and OpenAI vision ({oe}) both failed")
+            raise ge
 
 
 # ── Clean state-map hook renderer (caption-free, correct geo) ─────────────────
@@ -4515,23 +4549,74 @@ async def _cl_cast_broll(vertical: str = "", scene: str = "") -> dict:
 _t2v_avatar_tasks: set = set()
 
 
-async def _save_t2v_avatar_to_cl(meta: dict) -> None:
+def _age_band_from(age: str) -> str:
+    """Bucket a raw age ('38', 'late 30s', '35-40') into under35|35-44|45-55|55plus (best-effort).
+    Returns '' when nothing usable is present. Already-bucketed input passes through unchanged."""
+    import re as _re
+    s = str(age or "").lower().strip()
+    if not s:
+        return ""
+    if s in ("under35", "35-44", "45-55", "55plus"):
+        return s
+    nums = [int(n) for n in _re.findall(r"\d{1,3}", s) if int(n) < 120]
+    n = (sum(nums) // len(nums)) if nums else None
+    if n is None:
+        if any(w in s for w in ("teen", "20s", "young", "college")): return "under35"
+        if "30s" in s: return "35-44"
+        if "40s" in s: return "45-55"
+        if any(w in s for w in ("50s", "60s", "senior", "elder", "older")): return "55plus"
+        return ""
+    if n < 35: return "under35"
+    if n < 45: return "35-44"
+    if n < 55: return "45-55"
+    return "55plus"
+
+
+async def _save_t2v_avatar_to_cl(local_path: str, meta: dict) -> None:
     """Best-effort: register a from-scratch T2V talking-head clip as a REUSABLE library avatar in
-    Creative-Library (which owns asset_library + its S3). CL fetches meta['url'] and copies it into its
-    own bucket. Same shared secret AE already uses for /cast-assets + /callback. Non-fatal — never
-    raises and never blocks the generation (it runs as a detached task)."""
+    Creative-Library (which owns asset_library + its S3). Uploads the FULL stitched clip to AE's DURABLE
+    S3 first (NOT ephemeral /uploads — which 404s when CL fetches it back on a different Render instance,
+    the likely cause of avatars silently not saving), falling back to /uploads only if S3 is unconfigured.
+    Then hands CL the URL + full cast/scene metadata to index. Same shared secret as /cast-assets +
+    /callback. Non-fatal — never raises, never blocks (detached task). Logs LOUDLY on every outcome so a
+    miss is diagnosable instead of silent."""
     base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
-    if not base or not meta.get("url"):
-        return
+    if not base:
+        logger.error("[t2v-avatar] ❌ no creative_library_url configured — cannot save avatar"); return
+    if not (local_path and os.path.exists(local_path)):
+        logger.error(f"[t2v-avatar] ❌ avatar source missing: {local_path}"); return
+    url = ""
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
+        from ..services.storage import StorageService
+        import uuid as _uuid
+        url = await asyncio.to_thread(StorageService.upload_file, local_path,
+                                      f"t2v-avatars/{_uuid.uuid4().hex[:12]}.mp4") or ""
+        if url:
+            logger.info(f"[t2v-avatar] durable S3 copy → {url}")
+    except Exception as e:
+        logger.warning(f"[t2v-avatar] S3 upload failed ({e}); falling back to /uploads")
+    if not url:
+        try:
+            import uuid as _uuid, shutil as _sh
+            nm = f"t2v_avatar_{_uuid.uuid4().hex[:10]}.mp4"
+            _sh.copy(local_path, os.path.join(UPLOAD_DIR, nm))
+            url = f"{AE_PUBLIC_URL}/api/v1/uploads/{nm}"
+            logger.info(f"[t2v-avatar] ephemeral /uploads copy → {url}")
+        except Exception as e:
+            logger.error(f"[t2v-avatar] ❌ could not stage avatar for save: {e}"); return
+    payload = {**meta, "url": url}
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(f"{base}/api/regen/save-t2v-avatar",
                              headers={"x-regen-secret": CALLBACK_SECRET},
-                             json=meta)
+                             json=payload)
             r.raise_for_status()
-            logger.info(f"[t2v-avatar] saved reusable avatar → {(r.json() or {}).get('s3_key')}")
+            _body = r.json() or {}
+            logger.info(f"[t2v-avatar] ✅ saved '{payload.get('name')}' "
+                        f"(gender={payload.get('gender')} age_band={payload.get('age_band')} "
+                        f"state={payload.get('state')}) → s3_key={_body.get('s3_key')} id={_body.get('id')}")
     except Exception as e:
-        logger.warning(f"[t2v-avatar] save failed (non-fatal): {e}")
+        logger.error(f"[t2v-avatar] ❌ save POST failed for '{payload.get('name')}' (url={url[:70]}): {e}")
 
 
 async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
@@ -5341,31 +5426,6 @@ async def recipe_generate(req: RunRequest) -> list:
             # every provider unavailable AND nothing rendered → library fallback (never a bare error)
             return await _generate_library_fallback(req, prompt, aspect_ratio, seconds,
                                                     reasons=["no clip produced (check Kie/fal credits)"])
-        # ── Best-effort: save clip 0 as a REUSABLE T2V library avatar (non-fatal; never delays) ──────
-        # A real from-scratch talking-head render just produced a character. clip_paths[0] is pre-caption
-        # (the finish pass burns onto out_path, not the clips), so it's already caption-free — the ideal
-        # reusable avatar. Copy it to our public /uploads (survives the work-dir cleanup) and hand CL the
-        # URL + the render's own cast/scene metadata to index in asset_library. Detached task → the POST
-        # never blocks the stitch/finish/return. Any failure is swallowed.
-        try:
-            if is_talk and clip_paths and os.path.exists(clip_paths[0]):
-                import uuid as _uuid, shutil as _avshu
-                _av_name = f"t2v_avatar_{_uuid.uuid4().hex[:10]}.mp4"
-                _avshu.copy(clip_paths[0], os.path.join(UPLOAD_DIR, _av_name))
-                _av_meta = {
-                    "url": f"{AE_PUBLIC_URL}/api/v1/uploads/{_av_name}",
-                    "gender": (assets.get("gender") or ""),
-                    "age": (assets.get("age") or assets.get("age_band") or ""),
-                    "scene": (assets.get("scene_detail") or assets.get("scene") or ""),
-                    "vertical": (vertical or ""),
-                    "state": (assets.get("state") or ""),
-                    "character_desc": (assets.get("character_desc") or ""),
-                    "name": f"T2V avatar {req.request_id[:8]}",
-                }
-                _avt = asyncio.create_task(_save_t2v_avatar_to_cl(_av_meta))
-                _t2v_avatar_tasks.add(_avt); _avt.add_done_callback(_t2v_avatar_tasks.discard)
-        except Exception as _save_e:
-            logger.warning(f"[generate] t2v avatar auto-save skipped: {_save_e}")
         if len(clip_paths) == 1:
             import shutil; shutil.copy(clip_paths[0], out_path)
         else:
@@ -5418,6 +5478,41 @@ async def recipe_generate(req: RunRequest) -> list:
                 _audio_state = "none"
                 logger.warning(f"[generate] audio requested but provider {produced.get('provider')} "
                                f"shipped SILENT video and no narratable script — delivering without audio")
+        # ── Best-effort: save the FULL stitched clip as a REUSABLE library avatar (non-fatal; never delays) ──
+        # out_path is NOW the COMPLETE character video (every clip stitched) WITH audio but BEFORE the
+        # caption finish pass below burns onto it — the ideal caption-free, full-length reusable avatar
+        # (captions get re-added per new script when it's re-lipsynced). Snapshot a copy NOW so the
+        # upcoming caption/trim passes don't alter the saved avatar, then hand it to CL with the render's
+        # FULL cast/scene metadata (gender + age + derived age_band + scene + scene_detail + vertical +
+        # state/geo + ethnicity + wardrobe + character_desc) so it's easy to pick/filter later. The save
+        # uploads to durable S3 + POSTs in a detached task → never blocks the finish/return.
+        try:
+            if is_talk and os.path.exists(out_path):
+                import uuid as _uuid, shutil as _avshu
+                _av_src = os.path.join(work, f"avatar_full_{_uuid.uuid4().hex[:8]}.mp4")
+                _avshu.copy(out_path, _av_src)   # caption-free FULL clip, frozen before the finish pass
+                _age_raw = str(assets.get("age") or assets.get("age_band") or "").strip()
+                _av_meta = {
+                    "gender": (assets.get("gender") or ""),
+                    "age": _age_raw,
+                    "age_band": (assets.get("age_band") or _age_band_from(_age_raw)),
+                    "scene": (assets.get("scene") or ""),
+                    "scene_detail": (assets.get("scene_detail") or assets.get("scene") or ""),
+                    "vertical": (vertical or assets.get("vertical") or ""),
+                    "state": (assets.get("state") or assets.get("state_code") or ""),
+                    "ethnicity": (assets.get("ethnicity") or ""),
+                    "wardrobe": (assets.get("wardrobe") or ""),
+                    "character_desc": (assets.get("character_desc")
+                                       or f"{_age_raw} {assets.get('gender') or ''}".strip()),
+                    "name": f"T2V avatar {req.request_id[:8]}",
+                }
+                _avt = asyncio.create_task(_save_t2v_avatar_to_cl(_av_src, _av_meta))
+                _t2v_avatar_tasks.add(_avt); _avt.add_done_callback(_t2v_avatar_tasks.discard)
+                logger.info(f"[generate] queued FULL-clip t2v avatar save '{_av_meta['name']}' "
+                            f"(gender={_av_meta['gender']} age_band={_av_meta['age_band']} "
+                            f"state={_av_meta['state'] or '—'} scene={_av_meta['scene_detail'][:40]})")
+        except Exception as _save_e:
+            logger.warning(f"[generate] t2v avatar auto-save skipped: {_save_e}")
         # ── FINISH PASS — captions (explicit user choice) + consumer-camera grade — ONE encode ──────
         # Captions: the t2v lane historically shipped clean footage (NO_TEXT). When the request asks
         # for captions, align the spoken script against the REAL output audio (whisper) and burn ASS —
