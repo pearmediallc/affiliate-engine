@@ -164,6 +164,29 @@ def _frame_to_public_url(video_path: str, t: float = 1.0) -> Optional[str]:
     return None
 
 
+def _speech_end_sec(path: str) -> Optional[float]:
+    """#4 End of the last speech in a clip (= start of the trailing silence), via ffmpeg silencedetect.
+    Used to trim the frozen/silent tail off a NON-final clip so clips butt-join cleanly instead of
+    showing the character standing idle for ~1s at each cut. CONSERVATIVE: only reports a trim point
+    when there's a clear ≥0.4s silence running to the very end, and keeps a 0.2s margin so the last
+    word is never clipped. Returns None (keep the full clip) on anything ambiguous."""
+    try:
+        import re as _re
+        p = subprocess.run(["ffmpeg", "-i", path, "-af", "silencedetect=noise=-40dB:d=0.4", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=60)
+        dur = _ffprobe_duration(path) or 0.0
+        starts = [float(m) for m in _re.findall(r"silence_start:\s*([0-9.]+)", p.stderr)]
+        ends = [float(m) for m in _re.findall(r"silence_end:\s*([0-9.]+)", p.stderr)]
+        if starts and dur:
+            last_start = starts[-1]
+            # trailing silence = the final silence_start has no silence_end after it (runs to EOF)
+            if (not ends or ends[-1] < last_start) and (dur - last_start) >= 0.4:
+                return round(min(dur, last_start + 0.2), 2)   # keep 0.2s so the last word lands fully
+    except Exception as e:
+        logger.warning(f"_speech_end_sec failed: {e}")
+    return None
+
+
 async def _select_references(video_path: str, work: str, offer_desc: str) -> list:
     """Vision-pick the BEST identity + product/proof frames from a video and serve them from
     the public /uploads dir as @Image references. This is what makes winner-clones look right —
@@ -5144,6 +5167,8 @@ async def recipe_generate(req: RunRequest) -> list:
                        assets)
         clip_paths = []
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
+        _identity_ref = None             # #1 char-lock: ONE stable identity frame from clip 0, reused as
+                                         # @Image1 on every later clip so the face can't drift down a chain
         try:
           for ci in range(n_clips):
             per_ci = _per_list[ci] if _per_list else per   # this clip's own duration (script-sized)
@@ -5151,15 +5176,22 @@ async def recipe_generate(req: RunRequest) -> list:
             act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per_ci}s · {aspect_ratio}")
             imgs = list(image_urls or [])
             cprompt = prompt
-            if ci > 0 and clip_paths:
-                _pd = await asyncio.to_thread(_ffprobe_duration, clip_paths[-1])
-                # Grab the ACTUAL final frame (as late as the decoder allows) so it can be handed to
-                # the next clip as its literal first frame — true editor-style continuation.
-                cont = _frame_to_public_url(clip_paths[-1], max(0.1, (_pd or per_ci) - 0.05))
-                if cont:
-                    imgs = [cont] + imgs
-                cprompt = (prompt + " Continue seamlessly from the previous shot — same character, "
-                           "wardrobe, setting and lighting; one continuous action, match-cut.")[:1900]
+            if ci > 0:
+                # #1 CHARACTER LOCK. Anchor EVERY continuation clip to the SAME stable identity frame
+                # captured from clip 0 (a clean early/mid talking frame — see below). The OLD code grabbed
+                # clip 0's LAST frame ((_pd-0.05)s) and served it as the next clip's first-frame — but that
+                # end-of-file extraction fails silently, so in practice clip 2 got NO reference_image at
+                # all (verified in the live Kie input) → Seedance generated a FRESH face. One shared
+                # @Image1 anchor, reused on every clip, stops the face/scene drifting down a chain.
+                # NOTE: no [:1900] cap here (it chopped 'Continue seamlessly' mid-word); the whole prompt
+                # is bounded to 6000 after the SPOKEN LINE is appended below.
+                if _identity_ref:
+                    imgs = [_identity_ref] + imgs
+                cprompt = (prompt +
+                           " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
+                           " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
+                           " person. Continue seamlessly from the previous shot — same character, setting"
+                           " and lighting; one continuous action, match-cut.")
             # THIS clip speaks ONLY its own chunk of the script, in sequence — never restart or repeat
             # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
             _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
@@ -5199,6 +5231,11 @@ async def recipe_generate(req: RunRequest) -> list:
             cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
             if cp and os.path.exists(cp):
                 clip_paths.append(cp)
+                # #1 Lock identity from a CLEAN early/mid frame of clip 0 (a stable talking frame — NOT
+                # the fragile last frame) → served as @Image1 for every subsequent clip.
+                if ci == 0 and _identity_ref is None:
+                    _identity_ref = _frame_to_public_url(cp, min(2.0, max(0.5, (per_ci or 8) * 0.4)))
+                    logger.info(f"[generate] character-lock ref {'captured' if _identity_ref else 'FAILED'} from clip 0")
         except _AllVideoProvidersDown as _pd_exc:
             if clip_paths:
                 logger.warning(f"[generate] t2v ran out mid-stitch ({_pd_exc}) — stitching the "
@@ -5226,8 +5263,14 @@ async def recipe_generate(req: RunRequest) -> list:
             norm = []
             for i, cp in enumerate(clip_paths):
                 npath = os.path.join(work, f"sd{i}.mp4")
+                # #4 Trim the frozen/silent tail off NON-final clips so they butt-join cleanly (the last
+                # clip keeps its full ending). Only trims a clear trailing silence, with a 0.2s margin.
+                _te = None if i == len(clip_paths) - 1 else await asyncio.to_thread(_speech_end_sec, cp)
+                _trim = ["-t", str(_te)] if _te else []
+                if _te:
+                    logger.info(f"[generate] clip {i+1}: trimmed idle tail → {_te}s (butt-join)")
                 await asyncio.to_thread(_ffmpeg,
-                    ["-i", cp, "-vf", f"scale={W2}:{H2}:force_original_aspect_ratio=increase,crop={W2}:{H2},fps=30",
+                    ["-i", cp, *_trim, "-vf", f"scale={W2}:{H2}:force_original_aspect_ratio=increase,crop={W2}:{H2},fps=30",
                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
                      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", npath], timeout=300)
                 norm.append(npath)

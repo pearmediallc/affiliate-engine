@@ -537,11 +537,18 @@ Return STRICT JSON: {{"diagnosis": "{diag_hint}", "lagging_metric": "hook_rate|h
 
 
 # ── 3. Director (scene / emotion / gesture per beat) ──────────────────────────
-async def director(*, script: str, request_type: str, vertical: str) -> list:
+async def director(*, script: str, request_type: str, vertical: str,
+                   scene: str = "", scene_detail: str = "") -> list:
     """Break the script into timed beats and direct each: scene, emotion, gesture, environment,
     and the ONE continuous action. Returns list of beat dicts."""
     clips = rpe.split_into_clips(script, max_words=30)
     from . import prompt_craft
+    # #2 SCENE COHERENCE: the Director USED to get no scene, so every beat's `environment` fell back to a
+    # generic "authentic lived-in interior" — which contradicted a "front porch"/outdoor subject and made
+    # the render's scene drift. Feed the requested setting so every beat's environment MATCHES it.
+    _setting = (scene_detail or scene or "").strip()
+    _setting_line = (f"SETTING — every beat's `environment` MUST be THIS exact place (do NOT invent an "
+                     f"indoor/kitchen scene when this is outdoors): {_setting}.\n" if _setting else "")
     prompt = f"""{_coach_pre('scene')}{prompt_craft.SEEDANCE_SHOT_CRAFT}
 
 You are the Director on a creative team. For each spoken beat below, direct the
@@ -550,6 +557,7 @@ two actions). Emotions and gestures must feel candid, not staged.
 When the line or scene implies locomotion (walking, entering, leaving, sitting down), the `action` MUST name that movement so the render matches it.
 
 REQUEST TYPE: {request_type}   VERTICAL: {vertical}
+{_setting_line}
 BEATS (in order):
 {json.dumps([{"i": i, "line": c} for i, c in enumerate(clips)])}
 
@@ -567,7 +575,7 @@ One object per input beat, same order."""
             "line": line,
             "emotion": d.get("emotion", "sincere, relaxed"),
             "gesture": d.get("gesture", "a small natural hand gesture"),
-            "environment": d.get("environment", "authentic lived-in interior with real clutter"),
+            "environment": d.get("environment", (_setting or "authentic lived-in interior with real clutter")),
             "action": d.get("action", "the speaker talks directly to camera with a natural gesture"),
         })
     return beats
@@ -1012,7 +1020,8 @@ async def run_creative_team(
     # 3+4) Director (needs the script) and Character Manager (independent) run CONCURRENTLY.
     beats, character = await asyncio.gather(
         _run("scene", job_id, "breaking script into beats",
-             director(script=script, request_type=request_type, vertical=vertical),
+             director(script=script, request_type=request_type, vertical=vertical,
+                      scene=scene, scene_detail=scene_detail),
              helpfulness=lambda b: 1.0 if b else 0.0),
         _run("character", job_id, "locking the character",
              character_manager(request_type=request_type, vertical=vertical,
