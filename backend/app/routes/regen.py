@@ -2188,24 +2188,55 @@ async def studio_route(payload: dict, background: BackgroundTasks,
     _wants_video = bool(re.search(r'\bvideo\b', _low) and re.search(r'\b(make|create|generate|turn|render|from\s+this)\b', _low))
     _is_go = bool(re.fullmatch(r"\s*(go|yes+|yep|yeah|ok(ay)?|sure|do it|make it|proceed|confirm|sounds good|perfect|let'?s go)[\s.!]*", _low))
     if _is_go:
-        _prior, _pdur = "", 0
+        _prior, _src, _pdur = "", "", 0
         _allhist = " ".join((h.get("text") or "") for h in history)
         _pm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _allhist, re.I); _pdur = int(_pm.group(1)) if _pm else 0
+        # Find the SCRIPT to speak. ONLY legit sources: a USER message, or an assistant message the
+        # office actually WROTE as a script (kind=='script'). NEVER a plain assistant reply — walking
+        # history newest-first and taking any 25-word/2-period text is how the avatar ended up reciting
+        # our OWN "Got it — here's what I'll make… reply go" confirmation verbatim. Belt-and-suspenders:
+        # also reject anything that starts with that confirmation signature.
         for h in reversed(history):
-            t = (h.get("text") or ""); _pq = re.findall(r'["“](.{60,}?)["”]', t, re.S)
-            cand = (_pq[0].strip() if _pq else (t.strip() if (len(t.split()) >= 25 and t.count('.') >= 2) else ""))
-            if cand: _prior = cand; break
+            _role = (h.get("role") or "user"); _kind = (h.get("kind") or "text")
+            if _role != "user" and _kind != "script":
+                continue
+            t = (h.get("text") or "").strip()
+            if t.startswith("Got it — here's what I'll make"):
+                continue
+            _pq = re.findall(r'["“](.{60,}?)["”]', t, re.S)
+            cand = (_pq[0].strip() if _pq else (t if (len(t.split()) >= 25 and t.count('.') >= 2) else ""))
+            if cand: _prior = cand; _src = t; break
         if _prior:
-            logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, {_pdur}s)")
+            # Carry the CAST + SETTING from the SAME message the script came from, so the render matches
+            # the brief (e.g. "denim jacket, suburban sidewalk") instead of a fabricated default persona
+            # (the "woman in a park with coffee" drift). Unset → AE casts from its defaults, as before.
+            _sl = _src.lower()
+            _g = ("female" if re.search(r'\b(woman|female|mom|mother|lady|girl|she|her)\b', _sl)
+                  else "male" if re.search(r'\b(man|male|guy|dad|father|he|his)\b', _sl) else None)
+            _am = re.search(r'\b(\d{2})\s*[-–]\s*(\d{2})\b', _src)
+            if _am:
+                _age = f"{_am.group(1)}-{_am.group(2)}"
+            else:
+                _am2 = re.search(r'\b(\d{2})\s*(?:years?\s*old|yo|y/?o)\b', _src, re.I)
+                _age = _am2.group(1) if _am2 else None
+            _scm = re.search(r'\bscenes?\b\s*[:\-]\s*(.+?)(?:\.\s|\bvertical\b|\bspeak\b|\bscript\b|["“]|$)',
+                             _src, re.I | re.S)
+            _scene_detail = (re.sub(r'\s+', ' ', _scm.group(1)).strip()[:300] if _scm else None)
+            logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, "
+                        f"{_pdur or 'auto'}s, gender={_g}, scene={'y' if _scene_detail else 'n'})")
+            # source='last_script' keeps allow_rewrite:false (verbatim) on the CL side; seconds 0 → AE
+            # auto-sizes from the (now correct) script instead of a forced crush.
             return {"action": "make_video", "source": "last_script", "prompt": _prior, "seconds": _pdur,
-                    "request_type": "ugc", "gender": None, "age_band": None, "age": None, "scene": None, "scene_detail": None}
+                    "request_type": "ugc", "gender": _g, "age_band": None, "age": _age,
+                    "scene": None, "scene_detail": _scene_detail}
     if _inline and len(_inline.split()) >= 15 and _wants_video:
         _sm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _msg, re.I); _secs = int(_sm.group(1)) if _sm else 0
-        logger.info(f"[studio/route] pasted-script → CONFIRM ({len(_inline.split())}w, {_secs}s)")
+        _shown = _secs or max(8, round(len(_inline.split()) / 2.5))   # tell the user the length UP FRONT
+        logger.info(f"[studio/route] pasted-script → CONFIRM ({len(_inline.split())}w, ~{_shown}s)")
         return {"action": "reply", "text":
-                ("Got it — here's what I'll make: a UGC video speaking your script **word-for-word**"
-                 + (f", ~{_secs} seconds" if _secs else " (I'll size it to the script)")
-                 + '. Reply **"go"** to make it, or tell me anything to change (character, age, setting, length) first.')}
+                (f'Got it — here\'s what I\'ll make: a UGC video speaking your script **word-for-word**, '
+                 f'**~{_shown} seconds** (sized to your script). Reply **"go"** to make it, or tell me '
+                 f'anything to change (character, age, setting, length) first.')}
     # Tune Studio scripts to the vertical's PROVEN converting DNA (same as the orbit/file-request
     # path). Detect the vertical from the caller's hint OR the message/history, then inject the
     # distilled style-DNA so a "write me a home insurance script" ask yields a curated, on-style
@@ -4574,49 +4605,56 @@ def _age_band_from(age: str) -> str:
 
 async def _save_t2v_avatar_to_cl(local_path: str, meta: dict) -> None:
     """Best-effort: register a from-scratch T2V talking-head clip as a REUSABLE library avatar in
-    Creative-Library (which owns asset_library + its S3). Uploads the FULL stitched clip to AE's DURABLE
-    S3 first (NOT ephemeral /uploads — which 404s when CL fetches it back on a different Render instance,
-    the likely cause of avatars silently not saving), falling back to /uploads only if S3 is unconfigured.
-    Then hands CL the URL + full cast/scene metadata to index. Same shared secret as /cast-assets +
-    /callback. Non-fatal — never raises, never blocks (detached task). Logs LOUDLY on every outcome so a
-    miss is diagnosable instead of silent."""
+    Creative-Library (which owns asset_library + its S3). Stages the FULL stitched clip in TWO fetchable
+    forms and hands CL whichever it can pull: (1) a PRESIGNED durable-S3 URL — AE's bucket is PRIVATE, so
+    a RAW object URL 403s when CL fetches it (this was silently killing every save); (2) the public
+    /uploads HTTP endpoint as a fallback. We POST with the presigned URL first and, on ANY failure,
+    retry with /uploads — so a fetch-back 403/404 no longer drops the avatar. Same shared secret as
+    /cast-assets + /callback. Non-fatal — never raises, never blocks (detached task). Logs LOUDLY on
+    every outcome so a miss is diagnosable instead of silent."""
     base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
     if not base:
         logger.error("[t2v-avatar] ❌ no creative_library_url configured — cannot save avatar"); return
     if not (local_path and os.path.exists(local_path)):
         logger.error(f"[t2v-avatar] ❌ avatar source missing: {local_path}"); return
-    url = ""
+    # Stage candidate fetch URLs in preference order: presigned durable S3 first, public /uploads second.
+    candidates = []   # list of (label, url)
     try:
         from ..services.storage import StorageService
         import uuid as _uuid
-        url = await asyncio.to_thread(StorageService.upload_file, local_path,
-                                      f"t2v-avatars/{_uuid.uuid4().hex[:12]}.mp4") or ""
-        if url:
-            logger.info(f"[t2v-avatar] durable S3 copy → {url}")
+        _key = f"t2v-avatars/{_uuid.uuid4().hex[:12]}.mp4"
+        if await asyncio.to_thread(StorageService.upload_file, local_path, _key):
+            _ps = await asyncio.to_thread(StorageService.presign_url, _key, 21600)  # 6h, plenty for CL to fetch
+            if _ps:
+                candidates.append(("s3-presigned", _ps)); logger.info(f"[t2v-avatar] staged durable S3 (presigned) → {_key}")
     except Exception as e:
-        logger.warning(f"[t2v-avatar] S3 upload failed ({e}); falling back to /uploads")
-    if not url:
-        try:
-            import uuid as _uuid, shutil as _sh
-            nm = f"t2v_avatar_{_uuid.uuid4().hex[:10]}.mp4"
-            _sh.copy(local_path, os.path.join(UPLOAD_DIR, nm))
-            url = f"{AE_PUBLIC_URL}/api/v1/uploads/{nm}"
-            logger.info(f"[t2v-avatar] ephemeral /uploads copy → {url}")
-        except Exception as e:
-            logger.error(f"[t2v-avatar] ❌ could not stage avatar for save: {e}"); return
-    payload = {**meta, "url": url}
+        logger.warning(f"[t2v-avatar] S3 stage failed ({e})")
     try:
-        async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(f"{base}/api/regen/save-t2v-avatar",
-                             headers={"x-regen-secret": CALLBACK_SECRET},
-                             json=payload)
-            r.raise_for_status()
-            _body = r.json() or {}
-            logger.info(f"[t2v-avatar] ✅ saved '{payload.get('name')}' "
-                        f"(gender={payload.get('gender')} age_band={payload.get('age_band')} "
-                        f"state={payload.get('state')}) → s3_key={_body.get('s3_key')} id={_body.get('id')}")
+        import uuid as _uuid, shutil as _sh
+        nm = f"t2v_avatar_{_uuid.uuid4().hex[:10]}.mp4"
+        _sh.copy(local_path, os.path.join(UPLOAD_DIR, nm))
+        candidates.append(("uploads", f"{AE_PUBLIC_URL}/api/v1/uploads/{nm}"))
     except Exception as e:
-        logger.error(f"[t2v-avatar] ❌ save POST failed for '{payload.get('name')}' (url={url[:70]}): {e}")
+        logger.warning(f"[t2v-avatar] /uploads stage failed ({e})")
+    if not candidates:
+        logger.error("[t2v-avatar] ❌ could not stage avatar for save (no S3, no /uploads)"); return
+    last_err = None
+    for label, url in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(f"{base}/api/regen/save-t2v-avatar",
+                                 headers={"x-regen-secret": CALLBACK_SECRET},
+                                 json={**meta, "url": url})
+                r.raise_for_status()
+                _body = r.json() or {}
+                logger.info(f"[t2v-avatar] ✅ saved '{meta.get('name')}' via {label} "
+                            f"(gender={meta.get('gender')} age_band={meta.get('age_band')} "
+                            f"state={meta.get('state')}) → s3_key={_body.get('s3_key')} id={_body.get('id')}")
+                return
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[t2v-avatar] save via {label} failed ({e}); trying next source")
+    logger.error(f"[t2v-avatar] ❌ save POST failed for '{meta.get('name')}' — all sources exhausted: {last_err}")
 
 
 async def _cast_library_broll(intent: dict, limit: int = 8, prefer_kind: str = None) -> list:
