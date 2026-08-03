@@ -100,6 +100,41 @@ async def _read_frame_b64(fp: str) -> Optional[dict]:
         return None
 
 
+async def _openai_json(prompt: str, *, temperature: float = 0.4,
+                       frames: Optional[list] = None) -> Optional[dict]:
+    """OpenAI GPT-4o-mini strict-JSON fallback (text, or text+frames for the vision Critic). This is
+    what keeps the vision QA ALIVE when Gemini is down / unfunded / missing its key — without it, a
+    Gemini failure left EVERY clip flagged 'UNVERIFIED — vision QA unavailable'. Returns None only if
+    OpenAI is also unavailable."""
+    key = getattr(settings, "openai_api_key", None)
+    if not key:
+        return None
+    def _call() -> str:
+        from openai import OpenAI
+        oai = OpenAI(api_key=key)
+        content: list = [{"type": "text", "text": prompt}]
+        for fp in (frames or []):
+            try:
+                with open(fp, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+            except Exception:
+                pass
+        resp = oai.chat.completions.create(
+            model="gpt-4o-mini", temperature=temperature,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": content}])
+        return resp.choices[0].message.content or "{}"
+    try:
+        out = json.loads(await asyncio.to_thread(_call))
+        logger.info("creative_team: Gemini unavailable — graded via OpenAI vision fallback")
+        return out
+    except Exception as e:
+        logger.warning(f"creative_team OpenAI fallback also failed ({e})")
+        return None
+
+
 async def _gemini_json(prompt: str, *, temperature: float = 0.4,
                        frames: Optional[list] = None, _retry: bool = True) -> Optional[dict]:
     """One strict-JSON call to Gemini (text, or text+frames for the vision Critic). Retries ONCE on
@@ -109,7 +144,7 @@ async def _gemini_json(prompt: str, *, temperature: float = 0.4,
     if not settings.gemini_api_key:
         _LLM_STATS["no_key"] += 1
         _LLM_STATS["fallback"] += 1
-        return None
+        return await _openai_json(prompt, temperature=temperature, frames=frames)
     parts: list = [{"text": prompt}]
     for fp in (frames or []):
         part = await _read_frame_b64(fp)
@@ -140,9 +175,9 @@ async def _gemini_json(prompt: str, *, temperature: float = 0.4,
             _LLM_STATS["calls"] -= 1   # the retry re-counts the call
             return await _gemini_json(prompt + "\n\nReturn ONLY valid JSON matching the requested shape.",
                                       temperature=temperature, frames=frames, _retry=False)
-        logger.warning(f"creative_team LLM call failed twice ({e}); using heuristic fallback")
+        logger.warning(f"creative_team LLM call failed twice ({e}); trying OpenAI vision fallback")
         _LLM_STATS["fallback"] += 1
-        return None
+        return await _openai_json(prompt, temperature=temperature, frames=frames)
 
 
 # ── Typed contracts + validation + sanitization ───────────────────────────────
