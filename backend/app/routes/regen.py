@@ -1074,16 +1074,32 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
         if frames:
             try:
                 tags = await _gemini_vision(frames,
-                    'These frames are from a creative-library reference clip. Return STRICT JSON for a '
-                    'reference index: {"role":"talking_head|map|broll|product|proof", '
+                    'These frames are from a creative-library reference clip (often B-ROLL: no talking '
+                    'head — just a scene/action used to intercut over a voiceover). Tag it precisely so a '
+                    'script can be matched to the RIGHT clip. Return STRICT JSON: '
+                    '{"role":"talking_head|map|broll|product|proof", '
                     '"age_band":"<one of: under35|35-44|45-55|55plus, or none>", '
                     '"gender":"<male|female|none>", "ethnicity":"<short or none>", '
-                    '"wardrobe":"<short or none>", "scene":"<setting in <=8 words>", '
+                    '"wardrobe":"<short or none>", '
+                    '"scene":"<the SPECIFIC setting + action, <=10 words, NAME THE ACTION CONCRETELY — '
+                    'e.g. \'pressure-washing a concrete driveway\', \'styling a wood dining table with '
+                    'flowers\', \'excavator demolishing a house roof\', \'trimming a tall hedge\'>", '
+                    '"description":"<1-2 full sentences: who/what is on screen and what happens>", '
+                    '"action":"<primary action snake_case: pressure_washing|hedge_trimming|lawn_mowing|'
+                    'paving|painting|tiling|demolition|digging|landscaping|decor_styling|table_setting|'
+                    'cleaning|driving|walking|none>", '
+                    '"indoor_outdoor":"<indoor|outdoor>", '
+                    '"geo":"<US|UK|other|unknown — infer from architecture, cars, signage>", '
+                    '"mood":"<satisfying|dramatic|cozy|aspirational|neutral>", '
+                    '"hook":<true if an attention-grabbing oddly-satisfying or dramatic OPENER '
+                    '(cleaning/transformation/demolition/build), false if a calm interior or scenic>, '
+                    '"keywords":["<up to 8 salient search terms: objects, materials, setting, action>"], '
                     '"style":"<ugc_handheld|cinematic|animated|studio, or none>", '
                     '"face_score":<0.0-1.0 how clean/front-facing a single talking face is; 0 if no face>, '
                     '"num_faces":<int count of distinct human faces clearly visible in frame; 0 if none>, '
                     '"num_people":<int>, '
-                    '"on_screen":"<key objects/proof e.g. document, phone, house, cash, or none>", '
+                    '"on_screen":"<key objects e.g. driveway, pressure washer, house, dining table, '
+                    'excavator, lawn, document, phone, cash, or none>", '
                     '"emotion":"<energy/expression in 1-2 words>"}')
             except Exception as e:
                 logger.warning(f"tag-asset vision failed: {e}")
@@ -1108,7 +1124,15 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
                 "num_faces": tags.get("num_faces"),
                 "character": tags.get("character") or ((f"{age_band} {gender}".strip()) or ""),
                 "scene": tags.get("scene") or "", "on_screen": tags.get("on_screen") or "",
-                "emotion": tags.get("emotion") or ""}
+                "emotion": tags.get("emotion") or "",
+                # ── rich b-roll index (for script→clip matching; additive, safe for other callers) ──
+                "description": tags.get("description") or "",
+                "action": tags.get("action") or "",
+                "indoor_outdoor": tags.get("indoor_outdoor") or "",
+                "geo": tags.get("geo") or "",
+                "mood": tags.get("mood") or "",
+                "hook": bool(tags.get("hook")),
+                "keywords": tags.get("keywords") or []}
         _asset_tag_put(s3_key, result)   # persist so the next call (preview/re-gen) is a DB read
         return {**result, "cached": False}
     except Exception as e:
