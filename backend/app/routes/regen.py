@@ -5185,11 +5185,13 @@ async def recipe_generate(req: RunRequest) -> list:
             # room), clamped to the model's ~15s/clip cap. 8-clip safety ceiling against a runaway split.
             n_clips = max(1, min(len(_vo_chunks), 8))
             def _clip_secs(_txt):
-                # 2.2 words/sec is a realistic conversational UGC pace INCLUDING pauses. The old 2.5
-                # was a read-aloud pace, so every clip was sized short and the delivery came back
-                # rushed / the tail clipped.
+                # Size the clip to Seedance's ACTUAL speaking pace. 2.2 w/s (+1s pad) sized clips far
+                # LONGER than the model's real delivery (~3.4 w/s), so a ~28-word chunk that Seedance
+                # speaks in ~7s got a 13s clip — and Seedance filled the ~6s gap with IMPROVISED GARBAGE
+                # speech (the "garbage after 6-7s" + audio drifting off the script). Match the real pace,
+                # no pad, so the clip ends when the words do and there's no room to improvise.
                 _w = len((_txt or "").split())
-                return max(6, min(15, _math.ceil(_w / 2.2) + 1))
+                return max(4, min(15, _math.ceil(_w / 3.4)))
             _per_list = [_clip_secs(c) for c in _vo_chunks[:n_clips]]
             # DURATION PRIORITY: Auto (no explicit length) → the whole script renders. An EXPLICIT length
             # is a CAP — keep only as many leading chunks as fit the budget (never cram the full script
