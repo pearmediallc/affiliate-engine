@@ -4302,19 +4302,20 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
         _order += [p for p in _base if p not in _order]
     else:
         _order = _base
-    # EDITOR-STYLE TRUE CONTINUATION. For a continuation clip (ci>0) the caller passes the PREVIOUS
-    # clip's real last frame as image_urls[0]. Only the fal lanes do genuine image-to-video — they
-    # take that frame as the LITERAL FIRST FRAME of this clip (so shot N+1 begins exactly where shot
-    # N ended, the way an editor cuts on a matching frame). Kie-Seedance has no first-frame input
-    # here; it only @-mentions the frame as a soft identity hint and RE-SYNTHESIZES a fresh person,
-    # which is the whole reason the seam looked "generated and patched". So for continuation clips we
-    # prefer the first-frame-capable fal lanes; Kie stays as a fallback if fal is down.
-    if is_continuation and (image_urls or [None])[0]:
+    # CONTINUITY vs AUDIO. The fal lanes do genuine first-frame image-to-video (a continuation clip
+    # begins exactly on the reference frame) — BUT fal is SILENT. Routing a TALKING continuation clip
+    # to fal is exactly what left clip 2 mute (clip 1 ran on Kie with audio; clip 2 fell to fal and had
+    # none). Now that the CHARACTER LOCK passes a clean identity reference image to Kie too (with an
+    # "identical person" instruction), Kie holds identity while keeping its NATIVE AUDIO — so a talking
+    # continuation clip STAYS on Kie. Only prefer fal's true i2v for a SILENT continuation (b-roll), where
+    # there is no audio to lose. Kie's identity anchor is a soft hint, but it now has one (it had none
+    # before), which beats a mute clip.
+    if is_continuation and (image_urls or [None])[0] and not generate_audio:
         _ff = [p for p in _order if p.startswith("fal-")]
         _rest = [p for p in _order if not p.startswith("fal-")]
         if _ff:
             _order = _ff + _rest
-            logger.info("[generate] continuation clip → first-frame image-to-video (fal) so it "
+            logger.info("[generate] SILENT continuation clip → first-frame image-to-video (fal) so it "
                         "continues from the previous clip's last frame, not a re-synthesized lookalike")
     for prov in _order:
         try:
