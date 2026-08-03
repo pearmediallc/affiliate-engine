@@ -2137,6 +2137,41 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         tag = f"[{kind}]" if kind and kind != "text" else ""
         lines.append(f"{role}{tag}: {txt}")
     hist_text = "\n".join(lines) or "(empty)"
+    # #5 CONFIRMATION HANDSHAKE (deterministic backstop). The parser was a dumb box: it re-ran the brief
+    # interview even when the user PASTED a full script — and separately we must never spend on a paid
+    # render until the user has CONFIRMED the plan. So: (1) a pasted script + make-video intent → RESTATE
+    # the plan and ask for a GO (no interview, no spend yet); (2) a bare "go/yes/make it" right after we
+    # proposed a plan → fire make_video VERBATIM from the script already in the thread. The LLM prompt
+    # below also does this by judgment; this guarantees it even if the model slips.
+    _msg = message.strip(); _low = _msg.lower()
+    _quoted = re.findall(r'["“](.{60,}?)["”]', _msg, re.S)
+    _inline = (_quoted[0].strip() if _quoted else "")
+    if not _inline:
+        _body = re.sub(r'^\s*(?:make|create|generate|turn|use|render)\b.*?(?:script|video|this)\b[:\-\s]*',
+                       '', _msg, flags=re.I).strip()
+        if len(_body.split()) >= 25 and (_body.count('.') + _body.count('!') + _body.count('?')) >= 2:
+            _inline = _body
+    _wants_video = bool(re.search(r'\bvideo\b', _low) and re.search(r'\b(make|create|generate|turn|render|from\s+this)\b', _low))
+    _is_go = bool(re.fullmatch(r"\s*(go|yes+|yep|yeah|ok(ay)?|sure|do it|make it|proceed|confirm|sounds good|perfect|let'?s go)[\s.!]*", _low))
+    if _is_go:
+        _prior, _pdur = "", 0
+        _allhist = " ".join((h.get("text") or "") for h in history)
+        _pm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _allhist, re.I); _pdur = int(_pm.group(1)) if _pm else 0
+        for h in reversed(history):
+            t = (h.get("text") or ""); _pq = re.findall(r'["“](.{60,}?)["”]', t, re.S)
+            cand = (_pq[0].strip() if _pq else (t.strip() if (len(t.split()) >= 25 and t.count('.') >= 2) else ""))
+            if cand: _prior = cand; break
+        if _prior:
+            logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, {_pdur}s)")
+            return {"action": "make_video", "source": "last_script", "prompt": _prior, "seconds": _pdur,
+                    "request_type": "ugc", "gender": None, "age_band": None, "age": None, "scene": None, "scene_detail": None}
+    if _inline and len(_inline.split()) >= 15 and _wants_video:
+        _sm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _msg, re.I); _secs = int(_sm.group(1)) if _sm else 0
+        logger.info(f"[studio/route] pasted-script → CONFIRM ({len(_inline.split())}w, {_secs}s)")
+        return {"action": "reply", "text":
+                ("Got it — here's what I'll make: a UGC video speaking your script **word-for-word**"
+                 + (f", ~{_secs} seconds" if _secs else " (I'll size it to the script)")
+                 + '. Reply **"go"** to make it, or tell me anything to change (character, age, setting, length) first.')}
     # Tune Studio scripts to the vertical's PROVEN converting DNA (same as the orbit/file-request
     # path). Detect the vertical from the caller's hint OR the message/history, then inject the
     # distilled style-DNA so a "write me a home insurance script" ask yields a curated, on-style
@@ -2180,6 +2215,28 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         f"{round(2.5 * _brief_secs)} words per script for a {_brief_secs}-second read; going over the "
         f"budget is a defect. Keep the hook (first sentence) and the CTA (last sentence) tight.\n"
     ) if _brief_secs > 0 else ""
+    # #5 BRIEF STATE (deterministic). Scan the WHOLE conversation for each brief factor and tell the
+    # model exactly what's ANSWERED vs MISSING, so it NEVER re-asks something already given (the loop)
+    # and stops interviewing once nothing's missing. The model still writes the questions; this just
+    # removes its unreliable re-extraction of the history.
+    _convo = _brief_secs_src.lower()
+    def _has(_rx): return bool(re.search(_rx, _convo, re.I))
+    _factors = {
+        "format": _has(r"\b(ugc|b-?roll|avatar|image|map)\b"),
+        "audience/age": _has(r"\b(\d{2}\s*[-–]\s*\d{2}|under\s*35|55\s*\+|[2-6]0s\b|late\s*[2-6]0s|young|senior|middle[- ]aged|adult|teen)\b"),
+        "setting/scene": _has(r"\b(kitchen|porch|car|driving|couch|sofa|living\s*room|office|desk|walk|outdoor|front\s*of|his\s*house|her\s*house|home|yard|street|park)\b"),
+        "hook/angle": _has(r"\b(personal\s*story|direct\s*question|question\s*to|neighbor|social\s*proof|shocking|\bstat\b|this\s*is\s*for\s*you)\b"),
+        "offer/numbers": _has(r"\$\s*\d|\b\d+\s*(?:dollars|/mo|a\s*month|per\s*month|percent|%)\b"),
+        "geo/state": _has(r"\b(nationwide|texas|california|florida|arizona|colorado|georgia|ohio|utah|nevada|new\s*york|\btx\b|\bca\b|\bfl\b|\baz\b|\bco\b|\bga\b|\boh\b|\but\b|\bnv\b|\bny\b)\b"),
+        "length/duration": _brief_secs > 0,
+    }
+    _answered = [k for k, v in _factors.items() if v]
+    _still = [k for k, v in _factors.items() if not v]
+    _brief_state = (
+        "BRIEF STATE — deterministic scan of the whole conversation, TRUST THIS over your own reading:\n"
+        f"  ALREADY ANSWERED (NEVER ask these again): {', '.join(_answered) or '(none yet)'}\n"
+        f"  STILL MISSING (ask ONLY these; if the list is empty, STOP asking and act/write NOW): "
+        f"{', '.join(_still) or '(none — enough to proceed, do NOT interview)'}\n\n")
     # PER-USER LONG-TERM MEMORY (best-effort; NEVER blocks or breaks chat). Inject what we've learned
     # about THIS user (scoped by user_id) so the router personalizes + pre-fills the brief instead of
     # re-asking what they've historically always chosen. Empty (no-op) when we know nothing about them.
@@ -2218,7 +2275,7 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         "   SIZE THE SCRIPT TO THE REQUESTED LENGTH (~2.5 words/second, 150 wpm): 15s ≈ 40 words, 20s ≈ 50, "
         "   30s ≈ 75, 45s ≈ 110, 60s ≈ 150. Set `seconds` to the chosen duration so it carries to the video "
         "   AND caps the word budget. Do not overrun the word budget.\n"
-        + _budget_line +
+        + _budget_line + _brief_state +
         "   DIVERSITY (mandatory): each script must use a DIFFERENT hook pattern (personal story | direct "
         "   question | shocking stat | neighbor / social-proof | 'this is for you if…') and FRESH phrasing "
         "   — never reuse the same opening sentence or the same sentence structure as a typical home-insurance "
@@ -2252,17 +2309,19 @@ async def studio_route(payload: dict, background: BackgroundTasks,
         '   {"action":"make_image","prompt":"..."}\n'
         "5) reply — conversational, a question, ambiguous, OR gathering the brief (see below):\n"
         '   {"action":"reply","text":"..."}\n\n'
-        "FOLLOW-UP BEFORE WRITING (MANDATORY — so scripts are SUPERB, not vague):\n"
-        "A bare topic/vertical request — e.g. 'need a home insurance script', 'make me a UGC video', "
-        "'write an ad for X' — where the user has NOT specified the format AND the length (duration) is "
-        "NOT enough to write. In that case you MUST return action 'reply' asking for the MISSING factors "
-        "below as a tight NUMBERED list (with the given options) — do NOT write the script yet. ALWAYS "
-        "include BOTH the LENGTH/duration question (it drives the word count and the video's seconds) AND "
-        "the STATE(S)/geo question (we target specific states — the user can answer 'none / nationwide'). Only "
-        "skip asking and write immediately if the user EXPLICITLY says 'just write it'/'you pick'/"
-        "'surprise me', OR is iterating on / editing an existing script, OR has already given format + "
-        "length earlier in the conversation. Ask ONLY the factors still missing; open with one friendly "
-        "line, then the numbered list.\n"
+        "USE JUDGMENT — YOU ARE A SMART ASSISTANT, NOT A FORM. Read what the user actually gave you and act:\n"
+        "• If the user PASTED a full script (or references one they already wrote) and wants a video → do "
+        "NOT interview. RESTATE the plan in one line and CONFIRM before spending: 'Here's what I'll make: "
+        "a <length> UGC video speaking your script word-for-word — go, or change anything?' (action=reply). "
+        "On the user's next 'go/yes/make it', return make_video (source=last_script, verbatim).\n"
+        "• If the user gave ENOUGH to write a great script (see BRIEF STATE — STILL MISSING is empty or only "
+        "minor) → WRITE it (or, for a video, RESTATE + confirm). Do NOT re-ask.\n"
+        "• ONLY run the numbered brief interview when the request is a genuinely BARE topic with too little "
+        "to work from (BRIEF STATE shows several core factors missing). Then ask ONLY the STILL-MISSING "
+        "factors as a tight numbered list — NEVER the ALREADY-ANSWERED ones. Length + state are the two you "
+        "most often need, but skip either if BRIEF STATE already has it.\n"
+        "The point: never make the user repeat themselves, and never spend on a render until they've "
+        "confirmed the plan. Trust BRIEF STATE above over your own re-reading of the history.\n"
         + _brief_checklist + "\n"
     )
     try:
