@@ -5583,9 +5583,40 @@ async def recipe_generate(req: RunRequest) -> list:
             with open(lst, "w") as f:
                 for n2 in norm:
                     f.write(f"file '{n2}'\n")
-            await asyncio.to_thread(_ffmpeg,
-                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
-                 "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", out_path], timeout=900)
+            # #6 SMOOTH TRANSITIONS — crossfade at each clip boundary (video xfade + audio acrossfade)
+            # instead of a hard cut, so the stitched clips flow like an edited UGC ad. The boundary sits
+            # between script sentences (a natural breath), so a short ~0.28s dissolve never clips a word.
+            # setup_mode='hardcut' forces the old behavior; ANY failure (e.g. a silent clip that breaks
+            # acrossfade, clips too short) falls back to the plain hard-cut concat — transitions never
+            # block delivery.
+            _want_xfade = str(assets.get("transition") or assets.get("setup_mode") or "").lower() not in ("hardcut", "hard_cut", "cut", "none")
+
+            def _stitch(_norm, _out, _lst):
+                if _want_xfade:
+                    try:
+                        _d = 0.28
+                        _durs = [(_ffprobe_duration(c) or 0) for c in _norm]
+                        if len(_norm) < 2 or any(x <= _d * 3 for x in _durs):
+                            raise RuntimeError("clips too short for a safe crossfade")
+                        _inp = []
+                        for c in _norm:
+                            _inp += ["-i", c]
+                        _vf = []; _af = []; _vp = "0:v"; _ap = "0:a"; _cum = _durs[0]
+                        for i in range(1, len(_norm)):
+                            _off = max(0.0, _cum - _d)
+                            _vf.append(f"[{_vp}][{i}:v]xfade=transition=fade:duration={_d}:offset={_off:.3f}[vx{i}]")
+                            _af.append(f"[{_ap}][{i}:a]acrossfade=d={_d}[ax{i}]")
+                            _vp = f"vx{i}"; _ap = f"ax{i}"; _cum = _cum + _durs[i] - _d
+                        _ffmpeg([*_inp, "-filter_complex", ";".join(_vf + _af), "-map", f"[{_vp}]", "-map", f"[{_ap}]",
+                                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+                                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", _out], timeout=900)
+                        logger.info(f"[generate] stitched {len(_norm)} clips with crossfade transitions")
+                        return
+                    except Exception as _xe:
+                        logger.warning(f"[generate] xfade stitch failed ({_xe}); hard-cut concat fallback")
+                _ffmpeg(["-f", "concat", "-safe", "0", "-i", _lst, "-c:v", "libx264", "-preset", "veryfast",
+                         "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", _out], timeout=900)
+            await asyncio.to_thread(_stitch, norm, out_path, lst)
         # ── AUDIO BACKSTOP (deterministic) + capability-honest recovery ──────────────────────────
         # A frame critic cannot hear, so a silent fallback clip would ship undetected. ffprobe the
         # REAL output: if audio was requested but the (silent fal) provider produced none, narrate the
