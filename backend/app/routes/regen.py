@@ -2254,8 +2254,6 @@ async def studio_route(payload: dict, background: BackgroundTasks,
     _is_go = bool(re.fullmatch(r"\s*(go|yes+|yep|yeah|ok(ay)?|sure|do it|make it|proceed|confirm|sounds good|perfect|let'?s go)[\s.!]*", _low))
     if _is_go:
         _prior, _src, _pdur = "", "", 0
-        _allhist = " ".join((h.get("text") or "") for h in history)
-        _pm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _allhist, re.I); _pdur = int(_pm.group(1)) if _pm else 0
         # Find the SCRIPT to speak. ONLY legit sources: a USER message, or an assistant message the
         # office actually WROTE as a script (kind=='script'). NEVER a plain assistant reply — walking
         # history newest-first and taking any 25-word/2-period text is how the avatar ended up reciting
@@ -2280,6 +2278,10 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             # the brief (e.g. "denim jacket, suburban sidewalk") instead of a fabricated default persona
             # (the "woman in a park with coffee" drift). Unset → AE casts from its defaults, as before.
             _sl = _src.lower()
+            # DURATION from the CURRENT prompt only (NOT the whole thread) — reading all history grabbed a
+            # stale "47 seconds" from an earlier turn and mis-sized the render + tripped a false QA flag.
+            _pm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _src, re.I)
+            _pdur = int(_pm.group(1)) if _pm else 0
             _g = ("female" if re.search(r'\b(woman|female|mom|mother|lady|girl|she|her)\b', _sl)
                   else "male" if re.search(r'\b(man|male|guy|dad|father|he|his)\b', _sl) else None)
             _am = re.search(r'\b(\d{2})\s*[-–]\s*(\d{2})\b', _src)
@@ -2288,13 +2290,23 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             else:
                 _am2 = re.search(r'\b(\d{2})\s*(?:years?\s*old|yo|y/?o)\b', _src, re.I)
                 _age = _am2.group(1) if _am2 else None
-            _scm = re.search(r'\bscenes?\b\s*[:\-]\s*(.+?)(?:\.\s|\bvertical\b|\bspeak\b|\bscript\b|["“]|$)',
+            # SCENE — accept "Scene:" OR "Setting(s):" (the multi-setup prompts use "Settings, one per
+            # clip: (1)… (2)…"). Without matching "Settings" the whole block fell into character_desc and
+            # the director defaulted to a generic kitchen instead of the requested locations.
+            _scm = re.search(r'\b(?:scenes?|settings?)\b\s*[,:\-]\s*(.+?)(?:\.\s|\bvertical\b|\bspeak\b|\bscript\b|["“]|$)',
                              _src, re.I | re.S)
-            _scene_detail = (re.sub(r'\s+', ' ', _scm.group(1)).strip()[:300] if _scm else None)
-            # CAST — the physical/wardrobe description (beard, hat, clothing) between "Cast:" and "Scene:".
-            # WITHOUT this the director invented a generic persona ("everyday t-shirt") and silently
-            # dropped the requested hat/beard/henley. Carried as character_desc → APPEARANCE LOCK downstream.
-            _cm = re.search(r'\bcast\b\s*[:\-]\s*(.+?)(?=\bscenes?\b\s*[:\-]|\bvertical\b\s*[:\-]|\bspeak\b|$)',
+            _scene_detail = (re.sub(r'\s+', ' ', _scm.group(1)).strip()[:400] if _scm else None)
+            # MULTI-SETUP: split "(1) …; (2) …" into a per-clip settings list so each clip renders a
+            # DIFFERENT location (not one setting reused). setup_mode='multi' when 2+ distinct settings.
+            _scene_vars = []
+            if _scene_detail:
+                _scene_vars = [re.sub(r'^[\s,;:–-]+|[\s,;:–-]+$', '', s).strip()
+                               for s in re.findall(r'\(\s*\d+\s*\)\s*([^()]+)', _scene_detail)]
+                _scene_vars = [s for s in _scene_vars if len(s) > 6]
+            _multi = len(_scene_vars) >= 2
+            # CAST — the physical/wardrobe description between "Cast:" and the next section (Scene/Settings/
+            # Vertical/Speak). WITHOUT this the director invented a generic persona and dropped the look.
+            _cm = re.search(r'\bcast\b\s*[:\-]\s*(.+?)(?=\bscenes?\b\s*[:\-]|\bsettings?\b\s*[,:\-]|\bvertical\b\s*[:\-]|\bspeak\b|$)',
                             _src, re.I | re.S)
             _char = (re.sub(r'\s+', ' ', _cm.group(1)).strip().rstrip('.').strip()[:300] if _cm else None)
             # VERTICAL (drives b-roll casting + script DNA) + STATE/geo (map hook), from the brief line.
@@ -2306,13 +2318,15 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             _state = (_stm.group(1).title() if _stm else None)
             logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, "
                         f"{_pdur or 'auto'}s, gender={_g}, scene={'y' if _scene_detail else 'n'}, "
-                        f"cast={'y' if _char else 'n'})")
+                        f"cast={'y' if _char else 'n'}, settings={len(_scene_vars)})")
             # source='last_script' keeps allow_rewrite:false (verbatim) on the CL side; seconds 0 → AE
             # auto-sizes from the (now correct) script instead of a forced crush.
             return {"action": "make_video", "source": "last_script", "prompt": _prior, "seconds": _pdur,
                     "request_type": "ugc", "gender": _g, "age_band": None, "age": _age,
                     "scene": None, "scene_detail": _scene_detail, "character_desc": _char,
-                    "vertical": _vert, "state": _state}
+                    "vertical": _vert, "state": _state,
+                    "scene_variations": (_scene_vars if _multi else None),
+                    "setup_mode": ("multi" if _multi else None)}
     if _inline and len(_inline.split()) >= 15 and _wants_video:
         _sm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _msg, re.I); _secs = int(_sm.group(1)) if _sm else 0
         _shown = _secs or max(8, round(len(_inline.split()) / 2.5))   # tell the user the length UP FRONT
@@ -5492,6 +5506,10 @@ async def recipe_generate(req: RunRequest) -> list:
         # single take. Default (multi-shot) keeps the stable clip-0 identity anchor + varied framing.
         _prev_last_ref = None
         _continuous_mode = str(assets.get("setup_mode") or "").lower() in ("continuous", "single", "single_frame")
+        # #C MULTI-SETUP: a per-clip list of DISTINCT locations (parsed from "Settings: (1)… (2)…"). When
+        # present, each clip renders a DIFFERENT background (same person) instead of one setting reused.
+        _scene_vars = [s.strip() for s in (assets.get("scene_variations") or []) if isinstance(s, str) and s.strip()]
+        _multi_scene = len(_scene_vars) >= 2 and not _continuous_mode
         try:
           for ci in range(n_clips):
             per_ci = _per_list[ci] if _per_list else per   # this clip's own duration (script-sized)
@@ -5499,6 +5517,11 @@ async def recipe_generate(req: RunRequest) -> list:
             act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per_ci}s · {aspect_ratio}")
             imgs = list(image_urls or [])
             cprompt = prompt
+            if ci == 0 and _multi_scene:
+                # multi-setup clip 0 gets its OWN location (not the whole "Settings (1)…(2)…" blob the
+                # director baked into `prompt`), so it doesn't blend every setting into one.
+                cprompt = prompt + (f" SETTING for THIS clip: {_scene_vars[0]}. The person films selfie-style"
+                                    " in this exact location.")
             if ci > 0:
                 # #1 CHARACTER LOCK. Anchor EVERY continuation clip to the SAME stable identity frame
                 # captured from clip 0 (a clean early/mid talking frame — see below). The OLD code grabbed
@@ -5525,7 +5548,17 @@ async def recipe_generate(req: RunRequest) -> list:
                     "a closer selfie framing, leaning in for emphasis",
                     "they turn a little and keep talking while moving naturally",
                 ]
-                if _continuous:
+                if _multi_scene:
+                    # #C TRUE MULTI-SETUP: SAME person, a DIFFERENT LOCATION this clip. @Image1 is a soft
+                    # identity hint (Seedance re-synthesizes), so the prompt drives a fully new background.
+                    _loc = _scene_vars[ci % len(_scene_vars)]
+                    cprompt = (prompt +
+                               " @Image1 is the EXACT SAME PERSON — identical face, hair, age and wardrobe as"
+                               f" @Image1; do NOT change the person. But this clip is a COMPLETELY DIFFERENT"
+                               f" LOCATION: {_loc}. Regenerate the ENTIRE background and setting for this new"
+                               " place — do NOT reuse the previous clip's background; the same person is now"
+                               " filming selfie-style here. Hard cut to this new location.")
+                elif _continuous:
                     cprompt = (prompt +
                                " @Image1 is the EXACT SAME PERSON — identical face, hair, skin, age and"
                                " wardrobe. Continue seamlessly from the previous shot — same character,"
