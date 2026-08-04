@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 GEMINI_MODEL = "gemini-2.5-flash"
+_EMBED_MODEL = "text-embedding-3-small"   # #8 stored next to each vector; comparisons must match model
 # CROSS-FAMILY semantic judge for the EVAL GATE — deliberately NOT Gemini (which grades in-flight),
 # so the final examiner can't self-grade its own family's output. Pinned here as one source of truth.
 EVAL_JUDGE_MODEL = "gpt-4o"
@@ -1159,18 +1160,21 @@ async def embed_text(payload: dict, _auth: bool = Depends(require_service_key)):
     {text} → {success, embedding:[...], dim}. Never raises → CL falls back to lexical matching."""
     text = (payload.get("text") or "").strip()
     if not text:
-        return {"success": False, "embedding": None}
+        return {"success": False, "embedding": None, "model": _EMBED_MODEL}
     try:
         def _call():
             from openai import OpenAI
             oai = OpenAI(api_key=settings.openai_api_key)
-            r = oai.embeddings.create(model="text-embedding-3-small", input=text[:8000])
+            r = oai.embeddings.create(model=_EMBED_MODEL, input=text[:8000])
             return r.data[0].embedding
         emb = await asyncio.to_thread(_call)
-        return {"success": True, "embedding": emb, "dim": len(emb)}
+        # RETURN THE MODEL: a vector only means anything vs a query from the SAME model. CL stores this
+        # tag next to the vector and refuses to compare across models — so swapping _EMBED_MODEL later
+        # can't silently score confident nonsense against old vectors (they fall back to lexical).
+        return {"success": True, "embedding": emb, "dim": len(emb), "model": _EMBED_MODEL}
     except Exception as e:
         logger.warning(f"[embed] failed: {e}")
-        return {"success": False, "embedding": None, "error": str(e)[:120]}
+        return {"success": False, "embedding": None, "model": _EMBED_MODEL, "error": str(e)[:120]}
 
 
 @router.get("/winners")
