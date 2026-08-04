@@ -2271,6 +2271,13 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             _cm = re.search(r'\bcast\b\s*[:\-]\s*(.+?)(?=\bscenes?\b\s*[:\-]|\bvertical\b\s*[:\-]|\bspeak\b|$)',
                             _src, re.I | re.S)
             _char = (re.sub(r'\s+', ' ', _cm.group(1)).strip().rstrip('.').strip()[:300] if _cm else None)
+            # VERTICAL (drives b-roll casting + script DNA) + STATE/geo (map hook), from the brief line.
+            _vm = re.search(r'\bvertical\b\s*[:\-]\s*([^\n.(]+)', _src, re.I)
+            _vert = (re.sub(r'\s+', ' ', _vm.group(1)).strip()[:60] if _vm else None)
+            _stm = re.search(r'\b(texas|california|florida|arizona|colorado|georgia|ohio|nevada|utah|'
+                             r'new\s*york|new\s*jersey|pennsylvania|michigan|illinois|virginia|arizona|'
+                             r'north\s*carolina|south\s*carolina|tennessee|missouri|indiana|washington)\b', _sl)
+            _state = (_stm.group(1).title() if _stm else None)
             logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, "
                         f"{_pdur or 'auto'}s, gender={_g}, scene={'y' if _scene_detail else 'n'}, "
                         f"cast={'y' if _char else 'n'})")
@@ -2278,7 +2285,8 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             # auto-sizes from the (now correct) script instead of a forced crush.
             return {"action": "make_video", "source": "last_script", "prompt": _prior, "seconds": _pdur,
                     "request_type": "ugc", "gender": _g, "age_band": None, "age": _age,
-                    "scene": None, "scene_detail": _scene_detail, "character_desc": _char}
+                    "scene": None, "scene_detail": _scene_detail, "character_desc": _char,
+                    "vertical": _vert, "state": _state}
     if _inline and len(_inline.split()) >= 15 and _wants_video:
         _sm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _msg, re.I); _secs = int(_sm.group(1)) if _sm else 0
         _shown = _secs or max(8, round(len(_inline.split()) / 2.5))   # tell the user the length UP FRONT
