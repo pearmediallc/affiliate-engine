@@ -5483,6 +5483,11 @@ async def recipe_generate(req: RunRequest) -> list:
         produced = {}                    # which t2v provider actually rendered (Kie / fal fallback)
         _identity_ref = None             # #1 char-lock: ONE stable identity frame from clip 0, reused as
                                          # @Image1 on every later clip so the face can't drift down a chain
+        # #5 TRUE i2v CONTINUOUS: in continuous mode, anchor each clip to the PREVIOUS clip's LAST frame
+        # (real frame-extension, motion carries forward) instead of clip-0's frame — a genuinely seamless
+        # single take. Default (multi-shot) keeps the stable clip-0 identity anchor + varied framing.
+        _prev_last_ref = None
+        _continuous_mode = str(assets.get("setup_mode") or "").lower() in ("continuous", "single", "single_frame")
         try:
           for ci in range(n_clips):
             per_ci = _per_list[ci] if _per_list else per   # this clip's own duration (script-sized)
@@ -5499,14 +5504,16 @@ async def recipe_generate(req: RunRequest) -> list:
                 # @Image1 anchor, reused on every clip, stops the face/scene drifting down a chain.
                 # NOTE: no [:1900] cap here (it chopped 'Continue seamlessly' mid-word); the whole prompt
                 # is bounded to 6000 after the SPOKEN LINE is appended below.
-                if _identity_ref:
+                if _continuous_mode and _prev_last_ref:
+                    imgs = [_prev_last_ref] + imgs        # #5 continue from the PREVIOUS clip's last frame
+                elif _identity_ref:
                     imgs = [_identity_ref] + imgs
                 # #4 MULTI-SHOT: keep the SAME person + setting, but make each continuation clip a NEW
                 # shot with a DIFFERENT angle + action — so the stitched video reads as real multi-shot
                 # UGC (like the reference, where the person moves, reframes, shows the surroundings)
                 # instead of every clip restarting from clip-0's identical pose/spot (the "same video
                 # replayed" tell). setup_mode='continuous' opts back into one seamless take.
-                _continuous = str(assets.get("setup_mode") or "").lower() in ("continuous", "single", "single_frame")
+                _continuous = _continuous_mode
                 _shot_beats = [
                     "a medium selfie shot, talking straight to camera",
                     "a slightly different angle — they gesture and shift their stance",
@@ -5581,6 +5588,13 @@ async def recipe_generate(req: RunRequest) -> list:
                 if ci == 0 and _identity_ref is None:
                     _identity_ref = _frame_to_public_url(cp, min(2.0, max(0.5, (per_ci or 8) * 0.4)))
                     logger.info(f"[generate] character-lock ref {'captured' if _identity_ref else 'FAILED'} from clip 0")
+                # #5 continuous: snapshot THIS clip's near-final frame so the NEXT clip extends from it
+                # (true i2v). Slightly inset from the very end (last frames are the most artefact-prone).
+                if _continuous_mode:
+                    _cpd = await asyncio.to_thread(_ffprobe_duration, cp)
+                    _nl = _frame_to_public_url(cp, max(0.1, (_cpd or per_ci or 6) - 0.2))
+                    if _nl:
+                        _prev_last_ref = _nl
         except _AllVideoProvidersDown as _pd_exc:
             if clip_paths:
                 logger.warning(f"[generate] t2v ran out mid-stitch ({_pd_exc}) — stitching the "
