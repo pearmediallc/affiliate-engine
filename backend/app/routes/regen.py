@@ -1151,6 +1151,28 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
         import shutil; shutil.rmtree(work, ignore_errors=True)
 
 
+@router.post("/embed")
+async def embed_text(payload: dict, _auth: bool = Depends(require_service_key)):
+    """#8 Embed text → a semantic vector (OpenAI text-embedding-3-small), so b-roll can be matched to a
+    script by MEANING, not shared keywords ('my roof got destroyed' ≈ 'excavator demolishing a roof').
+    CL calls this at ingest (to store each clip's vector) and at cast (to embed the script scene).
+    {text} → {success, embedding:[...], dim}. Never raises → CL falls back to lexical matching."""
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return {"success": False, "embedding": None}
+    try:
+        def _call():
+            from openai import OpenAI
+            oai = OpenAI(api_key=settings.openai_api_key)
+            r = oai.embeddings.create(model="text-embedding-3-small", input=text[:8000])
+            return r.data[0].embedding
+        emb = await asyncio.to_thread(_call)
+        return {"success": True, "embedding": emb, "dim": len(emb)}
+    except Exception as e:
+        logger.warning(f"[embed] failed: {e}")
+        return {"success": False, "embedding": None, "error": str(e)[:120]}
+
+
 @router.get("/winners")
 async def winners(vertical: str = "", limit: int = 12, _auth: bool = Depends(require_service_key)):
     """List competitor winners (scraper library) for a vertical — playable video_url + hook +
