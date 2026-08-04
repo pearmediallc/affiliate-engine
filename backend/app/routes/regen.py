@@ -5437,7 +5437,11 @@ async def recipe_generate(req: RunRequest) -> list:
         # into the per-clip prompt). Let the script's natural beats drive clip count + pacing instead of
         # a fixed seconds/15 that repeats. Non-talking (broll) keeps the seconds-based split.
         from ..services import realism_prompt_engine as _rpe
-        _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=28) if is_talk else []
+        # PACK to Seedance's REAL 15s/clip capacity (~3.4 words/sec ⇒ ~51 words). The old 28-word cap made
+        # ~8s clips — barely half the limit — so a script split into ~2× the clips it needs and each extra
+        # clip is another slow serial render. 46 words ≈ ~13.5s (safe margin under 15s); _clip_secs still
+        # sizes each clip to its EXACT words, so a fuller chunk has no empty tail to improvise garbage into.
+        _vo_chunks = _rpe.split_into_clips(_vo_script or prompt, max_words=46) if is_talk else []
         # MULTI-CLIP TALKING-HEAD KEEPS ITS FULL SPLIT (reverted 2026-08-03). A prior "identity guard"
         # (commit 15292317, 2026-07-29) capped talking-head t2v fallback to ONE clip on the theory that
         # multi-clip Seedance drifts the face. In practice the proven 7/27-7/28 renders (2-4 clips,
