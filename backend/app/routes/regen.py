@@ -5461,11 +5461,34 @@ async def recipe_generate(req: RunRequest) -> list:
                 # is bounded to 6000 after the SPOKEN LINE is appended below.
                 if _identity_ref:
                     imgs = [_identity_ref] + imgs
-                cprompt = (prompt +
-                           " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
-                           " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
-                           " person. Continue seamlessly from the previous shot — same character, setting"
-                           " and lighting; one continuous action, match-cut.")
+                # #4 MULTI-SHOT: keep the SAME person + setting, but make each continuation clip a NEW
+                # shot with a DIFFERENT angle + action — so the stitched video reads as real multi-shot
+                # UGC (like the reference, where the person moves, reframes, shows the surroundings)
+                # instead of every clip restarting from clip-0's identical pose/spot (the "same video
+                # replayed" tell). setup_mode='continuous' opts back into one seamless take.
+                _continuous = str(assets.get("setup_mode") or "").lower() in ("continuous", "single", "single_frame")
+                _shot_beats = [
+                    "a medium selfie shot, talking straight to camera",
+                    "a slightly different angle — they gesture and shift their stance",
+                    "they take a step and glance around, showing more of the setting behind them",
+                    "a closer selfie framing, leaning in for emphasis",
+                    "they turn a little and keep talking while moving naturally",
+                ]
+                if _continuous:
+                    cprompt = (prompt +
+                               " @Image1 is the EXACT SAME PERSON — identical face, hair, skin, age and"
+                               " wardrobe. Continue seamlessly from the previous shot — same character,"
+                               " setting and lighting; one continuous action, match-cut.")
+                else:
+                    _sb = _shot_beats[ci % len(_shot_beats)]
+                    cprompt = (prompt +
+                               " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
+                               " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
+                               " person. Same character and setting as @Image1, but this is a NEW SHOT with"
+                               f" a DIFFERENT camera angle and a different natural action — {_sb}. Do NOT"
+                               " restart from the same pose or spot as the previous clip; vary the framing"
+                               " and body movement so the stitched video reads as real multi-shot UGC, not"
+                               " one clip replayed. Hard cut to this new shot.")
             # THIS clip speaks ONLY its own chunk of the script, in sequence — never restart or repeat
             # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
             _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
