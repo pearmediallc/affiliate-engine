@@ -23,12 +23,14 @@ from typing import Optional
 # The anti-slop realism layer — appended for the "realistic" style. This is the core of what
 # makes generated footage read as a real phone/camcorder capture instead of an AI render.
 REALISM_LAYER = (
-    "Shot on a consumer phone/DV camcorder: handheld shake, natural autofocus hunting, exposure "
-    "pumping between sun and shade, slight lens breathing, mild rolling shutter, subtle digital "
-    "compression artifacts, light sensor noise, faded colors and soft contrast. No stabilization, "
-    "no cinematic camera moves, no modern color grading. Candid documentary realism, natural "
-    "imperfect off-center framing, believable unscripted body language, realistic skin texture "
-    "with pores, minimal makeup."
+    # Pin the CAPTURE DEVICE to a modern iPhone so quality reads CONSISTENT across every render
+    # (instead of a vague 'consumer phone/camcorder' that drifted between renders).
+    "Shot on an iPhone 15 Pro front camera (natural iPhone color science, ~4K sharpness downscaled): "
+    "handheld shake, natural autofocus hunting, exposure pumping between sun and shade, slight lens "
+    "breathing, mild rolling shutter, subtle digital compression artifacts, light sensor noise, "
+    "faded colors and soft contrast. No stabilization, no cinematic camera moves, no modern color "
+    "grading. Candid documentary realism, natural imperfect off-center framing, believable "
+    "unscripted body language, realistic skin texture with pores, minimal makeup."
 )
 
 STYLE_LAYERS = {

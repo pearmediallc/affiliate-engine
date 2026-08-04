@@ -4997,6 +4997,54 @@ def _mux_voice_keep_ambient(video_path: str, voice_audio: str, out_path: str,
     _ffmpeg(cmd, timeout=timeout)
 
 
+def _burn_disclaimers(video_path: str, caption_words: list, out_path: str, timeout: int = 600) -> bool:
+    """Burn the two compliance overlays every ad needs (small, bottom-centre):
+      • 'rates may vary' — WHILE a dollar amount is on screen (from the caption word timings).
+      • 'AI GENERATED CONTENT' — the LAST 3 seconds.
+    Shared by BOTH lanes (t2v + avatar/lipsync) so every video gets them. Best-effort — the caller
+    swaps in `out_path` only on success; any failure keeps the original video."""
+    try:
+        dur = _ffprobe_duration(video_path) or 0.0
+        try:
+            _W, _H = _ffprobe_dims(video_path)
+        except Exception:
+            _W, _H = 1080, 1920
+        H = int(_H or 1920)
+        fs = max(14, int(H * 0.016))          # small
+        col = "white@0.9"; bw = max(1, int(H * 0.0015)); bc = "black@0.65"
+        filters = []
+        # 1) rates may vary — during $ mention windows (word carries the '$' after the caption fix)
+        wins = []
+        for w in (caption_words or []):
+            if "$" in str(w.get("word") or ""):
+                s = float(w.get("start") or 0); e = float(w.get("end") or s) + 2.5
+                wins.append((s, e))
+        wins.sort()
+        merged = []
+        for s, e in wins:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        if merged:
+            en = "+".join(f"between(t\\,{s:.2f}\\,{e:.2f})" for s, e in merged)
+            filters.append(f"drawtext=text='rates may vary':x=(w-text_w)/2:y=h-text_h-{int(H*0.055)}:"
+                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='{en}'")
+        # 2) AI GENERATED CONTENT — very bottom, last 3s
+        if dur > 3.2:
+            filters.append(f"drawtext=text='AI GENERATED CONTENT':x=(w-text_w)/2:y=h-text_h-{int(H*0.02)}:"
+                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:"
+                           f"enable='gte(t\\,{dur - 3.0:.2f})'")
+        if not filters:
+            return False
+        _ffmpeg(["-i", video_path, "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-y", out_path], timeout=timeout)
+        return os.path.exists(out_path)
+    except Exception as e:
+        logger.warning(f"[disclaimers] burn skipped: {e}")
+        return False
+
+
 async def _mux_tts_voiceover(req: "RunRequest", video_path: str, vo_script: str, work: str) -> bool:
     """Capability-honest recovery: when audio was requested but the clip came from a SILENT provider
     (fal fallback), speak the VO script with TTS and mux it on — so a credits-out fallback still ships
@@ -5602,6 +5650,15 @@ async def recipe_generate(req: RunRequest) -> list:
                 cprompt = (cprompt + f" APPEARANCE LOCK — the person MUST look EXACTLY like this and it must"
                            f" NOT be genericized or substituted: {_cast}. Keep this exact face, facial hair,"
                            f" headwear and clothing identical on every clip.")[:6000]
+            # HANDS-FREE past ~20s — a real UGC person can't hold a selfie at arm's length for 20s+. Once
+            # the ad crosses ~18s, prop the phone so BOTH hands are free (more believable + naturally varies
+            # the framing). Talking-head only (a propped shot still needs the face to camera).
+            _clip_start = sum(_per_list[:ci]) if _per_list else ci * (per or 8)
+            if is_talk and _clip_start >= 18 and not _continuous_mode:
+                cprompt = (cprompt + " The phone is now PROPPED on a stand or surface at chest/eye height —"
+                           " the person is NO LONGER holding it at arm's length; BOTH hands are free (resting"
+                           " naturally or gesturing) while they talk to the propped camera. Locked-off static"
+                           " framing, no selfie arm in shot.")[:6000]
             # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
             beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": _chunk}
@@ -5844,6 +5901,14 @@ async def recipe_generate(req: RunRequest) -> list:
                                          {**assets, "captions": _caps_burned}, work)
         except Exception as _qe:
             logger.warning(f"[generate] eval gate skipped: {_qe}")
+        # COMPLIANCE OVERLAYS ('rates may vary' on $ mentions + 'AI GENERATED CONTENT' last 3s) — burned
+        # AFTER the eval gate so QA doesn't flag the intentional overlay as residual captions.
+        try:
+            _disc = os.path.join(work, "disc.mp4")
+            if await asyncio.to_thread(_burn_disclaimers, out_path, (_cwords if _caps_burned else []), _disc):
+                import shutil as _shd; _shd.move(_disc, out_path)
+        except Exception as _de:
+            logger.warning(f"[generate] disclaimer overlay skipped: {_de}")
         _ae_persist(out_path, name)   # durable AE S3 copy (both buckets)
         # Cost = the rate of the provider that ACTUALLY produced the clip (not always Kie).
         _with_input = bool(video_urls or image_urls)
@@ -6345,6 +6410,14 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
     args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "192k", out_path]
     await asyncio.to_thread(_ffmpeg, args, 300)
+    # COMPLIANCE OVERLAYS — same 'rates may vary' ($ mentions) + 'AI GENERATED CONTENT' (last 3s) as the
+    # t2v lane, so EVERY delivered video carries them (avatar/lipsync included).
+    try:
+        _disc = out_path.rsplit(".", 1)[0] + "_disc.mp4"
+        if await asyncio.to_thread(_burn_disclaimers, out_path, (cap_words or []), _disc):
+            import shutil as _shd; _shd.move(_disc, out_path)
+    except Exception as _de:
+        logger.warning(f"[lipsync] disclaimer overlay skipped: {_de}")
     _ae_persist(out_path, out_name)
     return {"recipe": "Avatar Lipsync", "video_url": out_url, "script": script,
             "captions_burned": bool(ass_path), "scrubbed_original_captions": bool(delogo),

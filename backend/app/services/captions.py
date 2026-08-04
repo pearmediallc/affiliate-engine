@@ -315,7 +315,27 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
             end = start + 0.5
         text = " ".join(str(w["word"]) for w in c).replace("\n", " ").strip().upper()
         text = re.sub(r"\s+", " ", text)
-        return {"start": start, "end": end, "style": style, "text": text}
+        return {"start": start, "end": end, "style": style, "text": text, "words": list(c)}
+
+    # ACTIVE-WORD HIGHLIGHT (karaoke): the word being spoken RIGHT NOW turns yellow, the rest of the
+    # line stays white — the TikTok/reels look. One Dialogue line per word, each visible from that
+    # word's start to the next word's start (continuous, no flicker); the last holds to the line end.
+    _HI, _RESET = r"{\c&H0000FFFF&}", r"{\c&H00FFFFFF&}"   # ASS BGR: yellow active word, reset to white
+
+    def _hl_lines(cwords, cstart, cend, style):
+        out = []
+        n = len(cwords)
+        _prev_end = cstart
+        for j, wj in enumerate(cwords):
+            ws = float(wj.get("start") or _prev_end)
+            we = (float(cwords[j + 1].get("start") or ws) if j + 1 < n else cend)
+            ws = max(_prev_end, min(ws, cend)); we = max(ws + 0.05, min(we, cend)); _prev_end = we
+            toks = []
+            for m, wm in enumerate(cwords):
+                tok = re.sub(r"\s+", " ", str(wm.get("word") or "").replace("\n", " ").strip().upper())
+                toks.append((_HI + tok + _RESET) if m == j else tok)
+            out.append(f"Dialogue: 0,{_fmt(ws)},{_fmt(we)},{style},,0,0,0,,{' '.join(toks)}")
+        return out
 
     chunks, i, buf = [], 0, []
     while i < len(words):
@@ -353,8 +373,8 @@ def build_ass(words: list, out_ass_path: str, per_line: int = 3, play_w: int = 1
             end = c["start"] + 0.35
         if c["style"] == "Cta":                          # spoken CTA → animated highlighted button
             lines.extend(_cta_button_lines(c["text"], c["start"], end, play_w, play_h, marginv, k))
-        else:
-            lines.append(f"Dialogue: 0,{_fmt(c['start'])},{_fmt(end)},{c['style']},,0,0,0,,{c['text']}")
+        else:                                            # per-word active-word highlight (yellow)
+            lines.extend(_hl_lines(c["words"], c["start"], end, c["style"]))
     with open(out_ass_path, "w") as f:
         f.write(header + "\n".join(lines) + "\n")
     return out_ass_path
