@@ -1103,6 +1103,13 @@ async def tag_asset(url: str = Form(...), kind: str = Form("broll"), vertical: s
                     '"emotion":"<energy/expression in 1-2 words>"}')
             except Exception as e:
                 logger.warning(f"tag-asset vision failed: {e}")
+        # The model occasionally returns a JSON ARRAY (e.g. one object per frame) instead of a single
+        # object — coerce to the first dict so `tags.get(...)` never throws "'list' object has no
+        # attribute 'get'" (which 500'd the whole ingest for that clip).
+        if isinstance(tags, list):
+            tags = next((t for t in tags if isinstance(t, dict)), {})
+        if not isinstance(tags, dict):
+            tags = {}
         has_caps = _boxes_area(await _detect_caption_boxes(frames)) > 0.03 if frames else False
         role = tags.get("role") or kind
         face = float(tags.get("face_score") or 0)
