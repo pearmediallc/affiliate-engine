@@ -4385,11 +4385,9 @@ async def recipe_from_assets(req: RunRequest) -> list:
             except Exception as e:
                 logger.warning(f"from_assets voiceover failed (continuing silent): {e}")
         if vo_path and os.path.exists(vo_path):
-            # loop/trim video to the voiceover length so narration is never cut off
-            await asyncio.to_thread(_ffmpeg,
-                ["-stream_loop", "-1", "-i", stitched, "-i", vo_path, "-map", "0:v", "-map", "1:a",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
-                 "-c:a", "aac", "-b:a", "192k", "-shortest", out_path], timeout=600)
+            # loop/trim video to the voiceover length so narration is never cut off; KEEP the b-roll's
+            # own ambience low under the VO (#7) so it doesn't sound like a dry studio read.
+            await asyncio.to_thread(_mux_voice_keep_ambient, stitched, vo_path, out_path, 0.22, True)
         else:
             import shutil; shutil.copy(stitched, out_path)
 
@@ -4937,6 +4935,26 @@ async def _generate_library_fallback(req: "RunRequest", prompt: str, aspect_rati
     raise _AllVideoProvidersDown(
         "All video providers are unavailable and no library footage exists to fall back on. "
         + _note() + " Top up Kie.ai or fal credits, or add tagged library clips.")
+
+
+def _mux_voice_keep_ambient(video_path: str, voice_audio: str, out_path: str,
+                            ambient_vol: float = 0.22, loop_video: bool = False, timeout: int = 600) -> None:
+    """#7 AMBIENT BED. Mux a TTS/voice track onto video but KEEP the video's OWN audio (scene ambience —
+    grill sizzle, birds, street, room tone) at LOW volume UNDER the voice, so the ad doesn't sound like a
+    dry studio booth. The voice stays primary (normalize=0 keeps levels; ambient is ducked to ~0.22).
+    Falls back to voice-only when the source has no usable audio track. Best-effort caller wraps errors."""
+    _loop = ["-stream_loop", "-1"] if loop_video else []
+    if _probe_audio(video_path) is True:                     # source has real ambience → keep it low
+        fc = (f"[0:a]volume={ambient_vol}[amb];"
+              f"[1:a][amb]amix=inputs=2:duration=first:normalize=0[aout]")   # voice(1:a) drives duration
+        cmd = [*_loop, "-i", video_path, "-i", voice_audio, "-filter_complex", fc,
+               "-map", "0:v", "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", out_path]
+    else:                                                    # silent source → just the voice (unchanged)
+        cmd = [*_loop, "-i", video_path, "-i", voice_audio, "-map", "0:v", "-map", "1:a",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "192k", "-shortest", out_path]
+    _ffmpeg(cmd, timeout=timeout)
 
 
 async def _mux_tts_voiceover(req: "RunRequest", video_path: str, vo_script: str, work: str) -> bool:
