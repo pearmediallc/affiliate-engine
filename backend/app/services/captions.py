@@ -61,7 +61,7 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-def _relabel_with_script(timed: list, script: str) -> list:
+def _relabel_with_script(timed: list, script: str, glyph_only: bool = False) -> list:
     """Keep the aligner's TIMINGS but make the caption TEXT the exact SCRIPT tokens, so the burn
     reads as WRITTEN ("$31", not Whisper's transcribed "thirty one"). Whisper/Deepgram transcribe
     the AUDIO, which drops glyphs the voice can't pronounce (the "$"); the script is ground truth.
@@ -74,7 +74,7 @@ def _relabel_with_script(timed: list, script: str) -> list:
     tokens = [w for w in re.split(r"\s+", (script or "").strip()) if w]
     if not tokens or not timed:
         return timed
-    if len(tokens) == len(timed):                      # clean 1:1 — exact per-word timing kept
+    if len(tokens) == len(timed) and not glyph_only:   # clean 1:1 — exact per-word timing kept
         return [{"word": tok, "start": t.get("start", 0), "end": t.get("end", 0)}
                 for tok, t in zip(tokens, timed)]
     a = [_norm(t.get("word", "")) for t in timed]
@@ -85,6 +85,13 @@ def _relabel_with_script(timed: list, script: str) -> list:
             for k in range(j2 - j1):
                 t = timed[i1 + k]
                 out.append({"word": tokens[j1 + k], "start": t.get("start", 0), "end": t.get("end", 0)})
+        elif glyph_only:
+            # GLYPH-ONLY (native/model audio that may NOT say our exact words): do NOT inject unsaid
+            # script tokens on a mismatch — keep what the voice actually said. Only the normalized-equal
+            # spans above get the written form back (so "$51" is restored where whisper heard "51",
+            # without risking captions that don't match improvised speech).
+            for t in timed[i1:i2]:
+                out.append({"word": t.get("word", ""), "start": t.get("start", 0), "end": t.get("end", 0)})
         else:                                          # local spread only (e.g. "$31" <-> "thirty one")
             seg = timed[i1:i2] or timed[max(0, i1 - 1):i1] or timed
             s, e = float(seg[0].get("start") or 0), float(seg[-1].get("end") or 0)
@@ -98,7 +105,7 @@ def _relabel_with_script(timed: list, script: str) -> list:
     return out or timed
 
 
-def align(audio_path: str, text: str) -> tuple:
+def align(audio_path: str, text: str, glyph_only: bool = False) -> tuple:
     """Word timings that are NEVER empty. Returns (words, method).
     Real aligners first (their timings track the actual voice, so captions stay on the beat);
     even-split only as a last resort — it is approximate and WILL feel off-pace.
@@ -113,7 +120,7 @@ def align(audio_path: str, text: str) -> tuple:
         out = fn()
         if out:
             if not from_script and (text or "").strip():   # transcription path → script text wins
-                out = _relabel_with_script(out, text)
+                out = _relabel_with_script(out, text, glyph_only=glyph_only)
             logger.info(f"captions: aligned via {name} ({len(out)} words)")
             return out, name
     dur = audio_duration(audio_path)

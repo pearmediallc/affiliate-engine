@@ -5623,12 +5623,14 @@ async def recipe_generate(req: RunRequest) -> list:
                 from ..services import captions as cap
                 _cap_audio = os.path.join(work, "capaudio.wav")
                 await asyncio.to_thread(_ffmpeg, ["-i", out_path, "-vn", "-ac", "1", "-ar", "16000", "-y", _cap_audio], 120)
-                # When the provider generated its OWN speech (native audio), it never says our words
-                # verbatim — forcing our script onto it made the aligner produce nonsense. Pass an
-                # empty text so captions come from the REAL transcript. Only our own TTS (which does
-                # speak the script) is aligned against the script text.
-                _cap_text = (_vo_script or prompt) if _audio_state == "tts" else ""
-                _cwords, _cmethod = await asyncio.to_thread(lambda: cap.align(_cap_audio, _cap_text))
+                # Captions read as WRITTEN ("$51", not whisper's "51"). TTS speaks our script verbatim →
+                # full relabel. NATIVE/model audio may not say our exact words → GLYPH-ONLY relabel: only
+                # normalized-equal spans get the written form back (restores "$"/"%"), unsaid words are
+                # never injected (that was the old "forcing script produced nonsense" failure).
+                _cap_text = _vo_script or prompt
+                _glyph_only = (_audio_state != "tts")
+                _cwords, _cmethod = await asyncio.to_thread(
+                    lambda: cap.align(_cap_audio, _cap_text, glyph_only=_glyph_only))
                 if _cwords:
                     _cw, _ch = await asyncio.to_thread(_video_dims, out_path)
                     _ass = cap.build_ass(_cwords, os.path.join(work, f"cap_{req.request_id[:8]}.ass"),
