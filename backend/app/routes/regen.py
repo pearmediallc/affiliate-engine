@@ -2265,13 +2265,20 @@ async def studio_route(payload: dict, background: BackgroundTasks,
             _scm = re.search(r'\bscenes?\b\s*[:\-]\s*(.+?)(?:\.\s|\bvertical\b|\bspeak\b|\bscript\b|["“]|$)',
                              _src, re.I | re.S)
             _scene_detail = (re.sub(r'\s+', ' ', _scm.group(1)).strip()[:300] if _scm else None)
+            # CAST — the physical/wardrobe description (beard, hat, clothing) between "Cast:" and "Scene:".
+            # WITHOUT this the director invented a generic persona ("everyday t-shirt") and silently
+            # dropped the requested hat/beard/henley. Carried as character_desc → APPEARANCE LOCK downstream.
+            _cm = re.search(r'\bcast\b\s*[:\-]\s*(.+?)(?=\bscenes?\b\s*[:\-]|\bvertical\b\s*[:\-]|\bspeak\b|$)',
+                            _src, re.I | re.S)
+            _char = (re.sub(r'\s+', ' ', _cm.group(1)).strip().rstrip('.').strip()[:300] if _cm else None)
             logger.info(f"[studio/route] user confirmed → make_video VERBATIM ({len(_prior.split())}w, "
-                        f"{_pdur or 'auto'}s, gender={_g}, scene={'y' if _scene_detail else 'n'})")
+                        f"{_pdur or 'auto'}s, gender={_g}, scene={'y' if _scene_detail else 'n'}, "
+                        f"cast={'y' if _char else 'n'})")
             # source='last_script' keeps allow_rewrite:false (verbatim) on the CL side; seconds 0 → AE
             # auto-sizes from the (now correct) script instead of a forced crush.
             return {"action": "make_video", "source": "last_script", "prompt": _prior, "seconds": _pdur,
                     "request_type": "ugc", "gender": _g, "age_band": None, "age": _age,
-                    "scene": None, "scene_detail": _scene_detail}
+                    "scene": None, "scene_detail": _scene_detail, "character_desc": _char}
     if _inline and len(_inline.split()) >= 15 and _wants_video:
         _sm = re.search(r'(\d{1,3})\s*(?:s\b|sec|second)', _msg, re.I); _secs = int(_sm.group(1)) if _sm else 0
         _shown = _secs or max(8, round(len(_inline.split()) / 2.5))   # tell the user the length UP FRONT
@@ -5468,6 +5475,14 @@ async def recipe_generate(req: RunRequest) -> list:
                              "lead-in, no dead air in the opening." if ci == 0 else "")
                 cprompt = (cprompt + f' SPOKEN LINE FOR THIS CLIP — say ONLY this, word for word, and do '
                            f'NOT repeat any earlier line: "{_chunk}".' + _hookrule)[:6000]
+            # CAST LOCK — the user gave an EXACT character (wardrobe/appearance). Force it VERBATIM so the
+            # director's generic persona ("everyday t-shirt and shorts") can't override the requested look
+            # (e.g. a brown cowboy hat + salt-and-pepper beard + charcoal henley silently dropped).
+            _cast = (assets.get("character_desc") or assets.get("wardrobe") or "").strip()
+            if _cast:
+                cprompt = (cprompt + f" APPEARANCE LOCK — the person MUST look EXACTLY like this and it must"
+                           f" NOT be genericized or substituted: {_cast}. Keep this exact face, facial hair,"
+                           f" headwear and clothing identical on every clip.")[:6000]
             # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
             beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": _chunk}
