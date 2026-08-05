@@ -5012,36 +5012,25 @@ def _burn_disclaimers(video_path: str, caption_words: list, out_path: str, timeo
         H = int(_H or 1920)
         fs = max(14, int(H * 0.016))          # small
         col = "white@0.9"; bw = max(1, int(H * 0.0015)); bc = "black@0.65"
-        filters = []
-        # 1) rates may vary — during $ mention windows (word carries the '$' after the caption fix)
-        wins = []
-        for w in (caption_words or []):
-            if "$" in str(w.get("word") or ""):
-                s = float(w.get("start") or 0); e = float(w.get("end") or s) + 2.5
-                wins.append((s, e))
-        wins.sort()
-        merged = []
-        for s, e in wins:
-            if merged and s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
-        if merged:
-            en = "+".join(f"between(t\\,{s:.2f}\\,{e:.2f})" for s, e in merged)
-            filters.append(f"drawtext=text='rates may vary':x=(w-text_w)/2:y=h-text_h-{int(H*0.055)}:"
-                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='{en}'")
-        # 2) AI GENERATED CONTENT — very bottom, last 3s
-        if dur > 3.2:
-            filters.append(f"drawtext=text='AI GENERATED CONTENT':x=(w-text_w)/2:y=h-text_h-{int(H*0.02)}:"
-                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:"
-                           f"enable='gte(t\\,{dur - 3.0:.2f})'")
-        if not filters:
-            return False
+        # BOTH disclaimers at the VERY END — last ~4s, stacked ('rates may vary' just above 'AI
+        # GENERATED CONTENT'). (Was: 'rates may vary' during $ windows — moved per request.)
+        _t = max(0.0, dur - 4.0) if dur > 4.5 else 0.0
+        filters = [
+            f"drawtext=text='rates may vary':x=(w-text_w)/2:y=h-text_h-{int(H*0.058)}:"
+            f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='gte(t\\,{_t:.2f})'",
+            f"drawtext=text='AI GENERATED CONTENT':x=(w-text_w)/2:y=h-text_h-{int(H*0.02)}:"
+            f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='gte(t\\,{_t:.2f})'",
+        ]
         _ffmpeg(["-i", video_path, "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-y", out_path], timeout=timeout)
-        return os.path.exists(out_path)
+        ok = os.path.exists(out_path) and (_ffprobe_duration(out_path) or 0) > 0
+        if not ok:
+            logger.error("[disclaimers] burn produced no valid output — REQUIRED overlays missing")
+        return ok
     except Exception as e:
-        logger.warning(f"[disclaimers] burn skipped: {e}")
+        # Compliance overlay is REQUIRED — fail LOUD (error, not warning) so a missing 'AI GENERATED
+        # CONTENT' stamp is visible in logs instead of silently shipping without it.
+        logger.error(f"[disclaimers] burn FAILED (overlays missing on this video): {e}")
         return False
 
 
@@ -5593,13 +5582,6 @@ async def recipe_generate(req: RunRequest) -> list:
                 # instead of every clip restarting from clip-0's identical pose/spot (the "same video
                 # replayed" tell). setup_mode='continuous' opts back into one seamless take.
                 _continuous = _continuous_mode
-                _shot_beats = [
-                    "a medium selfie shot, talking straight to camera",
-                    "a slightly different angle — they gesture and shift their stance",
-                    "they take a step and glance around, showing more of the setting behind them",
-                    "a closer selfie framing, leaning in for emphasis",
-                    "they turn a little and keep talking while moving naturally",
-                ]
                 if _multi_scene:
                     # #C TRUE MULTI-SETUP: SAME person, a DIFFERENT LOCATION this clip. @Image1 is a soft
                     # identity hint (Seedance re-synthesizes), so the prompt drives a fully new background.
@@ -5616,15 +5598,29 @@ async def recipe_generate(req: RunRequest) -> list:
                                " wardrobe. Continue seamlessly from the previous shot — same character,"
                                " setting and lighting; one continuous action, match-cut.")
                 else:
-                    _sb = _shot_beats[ci % len(_shot_beats)]
+                    # CAMERA BRAIN — choose the shot from what the BEAT NEEDS, not a mechanical rotation.
+                    # A reveal/number line earns a slow push-in; the CTA wants a steady locked-off medium;
+                    # right after the hook, switch to a non-selfie "someone-else-filming" angle; otherwise
+                    # a natural fresh handheld angle. It only changes the camera when it serves the story.
+                    _bt = (_vo_chunks[ci] if ci < len(_vo_chunks) else "").lower()
+                    if re.search(r"\b(tap|click|link|below|enter your|check your|sign up|visit|get your|see what)\b", _bt):
+                        _sb = ("a STEADY, locked-off medium shot — phone propped or held still, calm and "
+                               "direct to camera for the call-to-action")
+                    elif re.search(r"[$%]|\b\d{2,}\b", _bt):
+                        _sb = "a slow, subtle PUSH-IN toward the face on this reveal, holding steady for emphasis"
+                    elif ci == 1:
+                        _sb = ("a NON-SELFIE angle — as if someone nearby is filming them from a few feet away, "
+                               "a natural medium UGC shot (no selfie arm)")
+                    else:
+                        _sb = (["a slightly different natural handheld angle, easing the framing",
+                                "an over-the-shoulder or side-profile UGC angle taking in their surroundings",
+                                "a closer eye-level framing, leaning in a touch"][ci % 3])
                     cprompt = (prompt +
                                " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
                                " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
-                               " person. Same character and setting as @Image1, but this is a NEW SHOT with"
-                               f" a DIFFERENT camera angle and a different natural action — {_sb}. Do NOT"
-                               " restart from the same pose or spot as the previous clip; vary the framing"
-                               " and body movement so the stitched video reads as real multi-shot UGC, not"
-                               " one clip replayed. Hard cut to this new shot.")
+                               " person. Same character and setting as @Image1. Camera for THIS beat: "
+                               f"{_sb}. Do NOT restart from the same pose or spot as the previous clip. Hard "
+                               "cut to this new shot.")
             # THIS clip speaks ONLY its own chunk of the script, in sequence — never restart or repeat
             # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
             _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
