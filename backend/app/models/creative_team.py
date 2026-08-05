@@ -67,6 +67,10 @@ class LipsyncJob(Base):
     script = Column(Text, nullable=True)
     status = Column(String, nullable=False, default="polling", index=True)   # polling | done | failed
     error = Column(Text, nullable=True)
+    # Curated JSON of the ASSEMBLY assets (ugc_broll/captions flags, b-roll URLs, caption style,
+    # vertical, variation index, script) so the restart resumer can re-run the FULL delivery — b-roll
+    # composite + caption burn + QA gate — not just a raw talking-head. Nullable: old rows resume raw.
+    assets_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

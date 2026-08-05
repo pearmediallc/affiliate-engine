@@ -84,6 +84,9 @@ _REQUIRED_COLUMNS = [
     ("creative_decisions", "cost_usd", "DOUBLE PRECISION"),
     ("creative_decisions", "roi", "DOUBLE PRECISION"),
     ("creative_decisions", "roi_updated_at", "TIMESTAMP"),
+    # LipsyncJob — persisted assembly assets so a restart resumes the COMPLETE delivery (b-roll
+    # composite + caption burn + QA gate), not a raw talking-head. Nullable so old 'polling' rows work.
+    ("lipsync_jobs", "assets_json", "TEXT"),
 ]
 
 

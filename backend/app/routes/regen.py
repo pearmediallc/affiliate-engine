@@ -6216,7 +6216,8 @@ def _strip_no_face(text: str) -> str:
 
 
 # ── Durable lip-sync resume (long renders survive an AE restart) ──────────────
-def _persist_lipsync(request_id, provider, job, audio_url, char_url, callback_url, out_name, script=""):
+def _persist_lipsync(request_id, provider, job, audio_url, char_url, callback_url, out_name, script="",
+                     assets_json=None):
     try:
         from ..database import SessionLocal
         from ..models.creative_team import LipsyncJob
@@ -6225,10 +6226,13 @@ def _persist_lipsync(request_id, provider, job, audio_url, char_url, callback_ur
             row = db.query(LipsyncJob).filter(LipsyncJob.id == request_id).first()
             if row:
                 row.provider, row.provider_job, row.status, row.error = provider, job, "polling", None
+                # refresh the finalize inputs so a resume re-composites from THIS submit, not a stale one
+                row.audio_url, row.char_url, row.out_name, row.script = audio_url, char_url, out_name, script
+                row.assets_json = assets_json
             else:
                 db.add(LipsyncJob(id=request_id, provider=provider, provider_job=job, audio_url=audio_url,
                                   char_url=char_url, callback_url=callback_url, out_name=out_name,
-                                  script=script, status="polling"))
+                                  script=script, status="polling", assets_json=assets_json))
             db.commit()
         finally:
             db.close()
@@ -6570,12 +6574,53 @@ async def _resume_one_lipsync(row):
         if not result:
             logger.warning(f"[resume] lipsync {rid} still processing; will retry on next restart")
             return
-        async with _LIPSYNC_HEAVY_SEM:   # one heavy download/composite at a time — stay under the 2GB box
-            variant = await _produce_lipsync_variant(rid, row["out_name"] or f"regen_avatar_lipsync_{rid[:8]}.mp4", result, row.get("script") or "")
-        await _callback(row["callback_url"], {"request_id": rid, "status": "ready", "variants": [variant]})
-        act.end_job(rid, ok=True)
-        _set_lipsync_status(rid, "done")
-        logger.info(f"[resume] lipsync {rid} RECOVERED + delivered")
+        _out = row.get("out_name") or f"regen_avatar_lipsync_{rid[:8]}.mp4"
+        # Read the persisted assembly assets. A UGC+B-Roll or CAPTIONED job MUST be re-assembled on
+        # resume (b-roll composite + caption burn + QA gate) — shipping the raw talking-head is the
+        # exact regression this fixes. A plain, caption-less Avatar Lipsync keeps the raw variant path.
+        _assets = None
+        try:
+            import json as _json
+            _raw_a = row.get("assets_json")
+            if _raw_a:
+                _assets = _json.loads(_raw_a)
+        except Exception:
+            _assets = None
+        _needs_full = bool(_assets and (_assets.get("ugc_broll") or _assets.get("captions")))
+        if _needs_full:
+            _vo_url = row.get("audio_url")
+            if not _vo_url:
+                # Old / truncated checkpoint that lacks the VO we need to re-composite. Do NOT ship a
+                # raw talking-head for a UGC+B-Roll/captioned ask — FAIL loudly so Retry re-runs fresh.
+                _err = "resumed UGC+B-Roll checkpoint lacks assets to re-composite; needs a fresh render"
+                logger.error(f"[resume] lipsync {rid}: {_err}")
+                await _callback(row.get("callback_url"), {"request_id": rid, "status": "failed", "error": _err})
+                act.end_job(rid, ok=False, error=_err)
+                _set_lipsync_status(rid, "failed", _err)
+                return
+            _vo_local = await _download_to_temp(_vo_url, ".mp3")
+            _vo_sec = await asyncio.to_thread(_audio_seconds, _vo_local)
+            # NOTE: do NOT wrap this in _LIPSYNC_HEAVY_SEM — _finalize_lipsync_delivery acquires it
+            # itself; wrapping here would double-acquire Semaphore(1) and deadlock.
+            _fin = await _finalize_lipsync_delivery(
+                rid, result, out_name=_out, script=(row.get("script") or _assets.get("script") or ""),
+                vo_audio=_vo_local, vo_sec=_vo_sec, assets=_assets,
+                ugc_broll=bool(_assets.get("ugc_broll")), vertical=(_assets.get("vertical") or None),
+                vidx=int(_assets.get("variation_index") or 1), req=None)
+            variant = _fin["variant"]
+            await _callback(row.get("callback_url"), {"request_id": rid, "status": "ready", "variants": [variant]})
+            act.end_job(rid, ok=True)
+            logger.info(f"[resume] lipsync {rid} RECOVERED + delivered (full UGC/caption assembly)")
+        else:
+            # Plain, caption-less Avatar Lipsync (or a pre-assets old row) → raw variant, EXACTLY as
+            # before. Serialize the heavy download/re-encode on the sem; this branch never calls the
+            # finalizer, so there is no double-acquire.
+            async with _LIPSYNC_HEAVY_SEM:   # one heavy download/composite at a time — stay under the 2GB box
+                variant = await _produce_lipsync_variant(rid, _out, result, row.get("script") or "")
+            await _callback(row.get("callback_url"), {"request_id": rid, "status": "ready", "variants": [variant]})
+            act.end_job(rid, ok=True)
+            _set_lipsync_status(rid, "done")
+            logger.info(f"[resume] lipsync {rid} RECOVERED + delivered")
     except Exception as e:
         logger.error(f"[resume] lipsync {rid} failed: {e}")
         try:
@@ -6595,7 +6640,8 @@ async def resume_pending_lipsync():
         try:
             rows = db.query(LipsyncJob).filter(LipsyncJob.status == "polling").all()
             pending = [{"id": r.id, "provider": r.provider, "provider_job": r.provider_job,
-                        "callback_url": r.callback_url, "out_name": r.out_name, "script": r.script} for r in rows]
+                        "callback_url": r.callback_url, "out_name": r.out_name, "script": r.script,
+                        "audio_url": r.audio_url, "assets_json": r.assets_json} for r in rows]
         finally:
             db.close()
     except Exception as e:
@@ -6806,9 +6852,63 @@ def _snap_to_silence(t: float, centers: list, tol: float = 1.2) -> float:
     return round(best, 2) if abs(best - t) <= tol else t
 
 
+# Words that carry NEGATIVE / emotionally-heavy weight in these verticals. When the VO says them we'd
+# rather show b-roll (the damage, the bill) than a fixed-expression talking head holding a smile through
+# "storm destroyed everything". Lowercase; matched on the caption word STEM (punctuation stripped).
+_HEAVY_EMOTION_WORDS = {
+    "storm", "storms", "hail", "damage", "damaged", "damages", "destroy", "destroyed", "destroying",
+    "tore", "torn", "tear", "flood", "flooded", "flooding", "crack", "cracked", "cracking", "ruin",
+    "ruined", "wreck", "wrecked", "worried", "worry", "worries", "stress", "stressed", "stressful",
+    "overpay", "overpaying", "overpaid", "expensive", "costly", "denied", "deny", "denial", "disaster",
+    "disasters", "leak", "leaks", "leaking", "leaked", "broke", "broken", "collapse", "collapsed",
+    "fear", "afraid", "scared", "nightmare", "devastated", "devastating", "loss", "losing", "struggle",
+    "struggling", "drowning", "buried", "emergency", "hurricane", "tornado", "wildfire", "burned",
+    "burning", "shattered", "mold", "rot", "rotting", "ripped", "smashed", "flames",
+}
+
+
+def _heavy_emotion_spans(cap_words: list, T: float) -> list:
+    """From caption word timings, return (start,end) spans covering runs of emotionally-heavy / negative
+    words (storm, damage, overpaying, denied…). Nearby heavy words merge into one span; each is padded
+    slightly and kept OFF the final ~12% so the CTA still lands on the real person. Pure math; on any
+    malformed input returns [] (caller keeps today's neutral windows)."""
+    if not cap_words or T <= 3:
+        return []
+    hits = []
+    try:
+        for w in cap_words:
+            tok = re.sub(r"[^a-z0-9]", "", str(w.get("word") or "").lower())
+            if tok and tok in _HEAVY_EMOTION_WORDS:
+                s = float(w.get("start") or 0.0)
+                e = float(w.get("end") or s)
+                if e > s:
+                    hits.append((s, e))
+    except Exception:
+        return []
+    if not hits:
+        return []
+    hits.sort()
+    spans, cs, ce = [], hits[0][0], hits[0][1]
+    for s, e in hits[1:]:
+        if s - ce <= 1.4:                      # same heavy beat → extend the covering span
+            ce = max(ce, e)
+        else:
+            spans.append((cs, ce)); cs, ce = s, e
+    spans.append((cs, ce))
+    _cta = 0.88 * T                            # keep the CTA on the face
+    out = []
+    for s, e in spans:
+        s = max(0.0, s - 0.3)
+        e = min(_cta, e + 0.5)
+        if e - s >= 1.5:
+            out.append((round(s, 2), round(e, 2)))
+    return out
+
+
 async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: dict,
                              layout: str, work: str, req: "RunRequest",
-                             hook_urls: list = None, interior_urls: list = None) -> tuple:
+                             hook_urls: list = None, interior_urls: list = None,
+                             cap_words: list = None) -> tuple:
     """Intercut satisfaction/interior b-roll over the lip-synced talking-head, keeping ONE continuous
     VO. Returns (composited_path | None, status) — status is surfaced in the variant feedback so a live
     run REVEALS exactly what happened (cast counts / bail reason) without needing server logs. The
@@ -6825,6 +6925,24 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
         b_windows = [(0.0, min(6.0, 0.32 * T)), (0.55 * T, 0.72 * T)]
     else:                                                      # rit: face cold-open → satisfaction mid
         b_windows = [(min(4.0, 0.22 * T), 0.62 * T)]
+    # HEAVY-LINE PRIORITY (additive) — cover the emotionally-heavy lines with b-roll so the fixed-
+    # expression talking head is NOT on screen while the VO says the painful words (storm/damage/
+    # overpaying/denied…). Lead the cutaways with the heavy spans (from the caption word timings),
+    # then fill any remaining window with today's neutral placement. No heavy words → b_windows is
+    # untouched → EXACT old behavior. Keeps the same cutaway COUNT; the snap-to-silence below still
+    # lands every cut on a beat (never mid-word).
+    _n_windows = len(b_windows)
+    _heavy = _heavy_emotion_spans(cap_words, T)
+    if _heavy:
+        _picked = [(float(s), float(e)) for s, e in _heavy[:_n_windows]]
+        for w in b_windows:
+            if len(_picked) >= _n_windows:
+                break
+            if all(w[1] <= h[0] or w[0] >= h[1] for h in _picked):    # no overlap with a heavy pick
+                _picked.append((float(w[0]), float(w[1])))
+        b_windows = sorted(_picked)[:_n_windows]
+        logger.info(f"[ugc-broll] heavy-line bias: {len(_heavy)} heavy span(s) → cutaways "
+                    + ", ".join(f"{s:.1f}-{e:.1f}s" for s, e in b_windows))
     # BEAT ALIGNMENT — snap every cut point (except the 0.0 cold-open start) to the nearest VO silence
     # gap, so a cutaway lands on a sentence/beat boundary and never mid-word. Sync-safe: face segments
     # are still cut at these (now beat-aligned) times against the same continuous VO, and total = T.
@@ -6955,6 +7073,167 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     if os.path.exists(out):
         return out, f"composited {layout} · {nbroll} b-roll window(s) · src={_src} hooks={nh} interiors={ni}"
     return None, "no output file"
+
+
+async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo_audio, vo_sec,
+                                     assets, ugc_broll=False, vertical=None, vidx=1, req=None):
+    """POST-LIP-SYNC ASSEMBLY, shared by the fresh render AND the restart resumer so BOTH deliver the
+    SAME complete video: caption alignment → b-roll composite (UGC+B-Roll, heavy-line biased) →
+    produce/persist the variant → VEED styled captions → never-abrupt tail hold → final QA gate.
+    Returns a dict: {variant, eval, broll_applied, ugc_broll_note, cap_words, cap_method, cap_err,
+    use_veed, ass_path, seconds} — the caller annotates the variant with its own richer context.
+
+    MEMORY BULKHEAD: the heavy download/composite/QA runs under _LIPSYNC_HEAVY_SEM so concurrent
+    UGC+B-Roll renders can't stack multiple 14-clip composites in RAM and OOM the 2GB box. The sem is
+    acquired HERE and NOWHERE ELSE per delivery — callers MUST NOT wrap this call in the sem (that
+    would double-acquire Semaphore(1) → deadlock).
+
+    RAISES on a QA-gate block (deliver=False) with the real reason, exactly as the fresh path did — the
+    caller turns that into the failed callback so Retry/redispatch can re-run the job fully."""
+    a = assets if isinstance(assets, dict) else {}
+    _want_broll = bool(ugc_broll or a.get("ugc_broll"))
+    seconds = max(1, int(round(vo_sec)))
+    async with _LIPSYNC_HEAVY_SEM:   # ONE heavy assembly at a time — stay under the 2GB box
+        # 3b) CAPTIONS (optional) — aligned FIRST so the word timings also bias b-roll cutaways toward
+        # the emotionally-heavy lines. Default = ffmpeg ASS (free, our words). "veed" = VEED via fal.
+        _cap_words, _cap_method, _cap_err = [], "", ""
+        _cap_style = (a.get("caption_style") or "").lower()
+        if not _cap_style:
+            try:
+                from ..services import creative_tuner as ctun
+                from ..database import SessionLocal as _SL
+                _cdb = _SL()
+                try:
+                    _cap_pref = ctun.governed_preference(_cdb, "caption_place", vertical or None)
+                finally:
+                    _cdb.close()
+                if _cap_pref:
+                    _cap_style = _cap_pref
+            except Exception:
+                pass
+        _use_veed = bool(a.get("captions")) and ((_cap_style or "clean") == "veed") and bool(settings.fal_key)
+        if a.get("captions"):
+            try:
+                from ..services import captions as cap
+                _log_model_call(request_id, "captions", ("veed" if _use_veed else "whisper+ass"),
+                                {"style": (_cap_style or "clean"), "script": (script or "")[:400]})
+                _cap_words, _cap_method = await asyncio.to_thread(lambda: cap.align(vo_audio, script))
+                if _cap_words and not _use_veed:
+                    _track_cost(request_id, "captions", f"{_cap_method}+ffmpeg", cost_usd=0.004,
+                                note=f"{_cap_method} word timings + ffmpeg burn (TikTok style, CTA button)")
+            except Exception as e:
+                _cap_err = str(e)[:160]
+                logger.error(f"captions FAILED for {request_id}: {e}")
+        if a.get("captions") and not _cap_words:
+            _cap_err = _cap_err or "every aligner returned no words"
+            logger.error(f"captions requested but NOT burned for {request_id}: {_cap_err}")
+
+        # ── UGC-BROLL COMPOSITE (optional) — intercut b-roll over the talking-head, one continuous VO.
+        # Best-effort: on any shortfall `result` is untouched and we ship the plain talking-head (the
+        # eval gate below then BLOCKS a UGC+B-Roll job that silently degraded).
+        _ugc_broll_note = ""
+        _broll_applied = False
+        if _want_broll:
+            try:
+                _fm = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
+                _ub_work = tempfile.mkdtemp()   # NOT cleaned here — the composite lives in it until the variant reads it
+                _ub_intent = {"vertical": (vertical or ""), "scene": (a.get("scene") or ""),
+                              "gender": (a.get("gender") or ""), "age_band": (a.get("age_band") or "")}
+                _ub_layout = "ham" if (vidx % 2 == 1) else "rit"
+                _ub_hooks = a.get("broll_hook_urls") if isinstance(a, dict) else None
+                _ub_inter = a.get("broll_interior_urls") if isinstance(a, dict) else None
+                _ub, _ub_status = await _compose_ugc_broll(_fm, vo_audio, float(vo_sec), _ub_intent, _ub_layout,
+                                                           _ub_work, req, hook_urls=_ub_hooks,
+                                                           interior_urls=_ub_inter, cap_words=_cap_words)
+                _ugc_broll_note = _ub_status or ""
+                if _ub and os.path.exists(_ub):
+                    result = {"local_path": _ub}
+                    _broll_applied = True
+                    logger.info(f"[ugc-broll] {_ub_status} ({vo_sec:.0f}s)")
+                else:
+                    logger.info(f"[ugc-broll] no composite ({_ub_status}) — delivering the plain talking-head")
+            except Cancelled:
+                raise
+            except Exception as _ube:
+                _ugc_broll_note = f"error: {str(_ube)[:80]}"
+                logger.warning(f"[ugc-broll] composite failed ({_ube}) — plain talking-head")
+
+        # 4) SAVE — normalize + persist (the subtitle is built in here, sized to the real frame)
+        variant = await _produce_lipsync_variant(request_id, out_name, result, script,
+                                                 cap_words=(None if _use_veed else _cap_words),
+                                                 vertical=(vertical or None),
+                                                 kinetic=_want_broll)
+        ass_path = variant.get("captions_burned")
+
+        # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
+        if _use_veed:
+            try:
+                from ..services import captions as cap
+                srt_path = cap.build_srt(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.srt")) if _cap_words else None
+                srt_text = open(srt_path).read() if srt_path else None
+                veed_url = await asyncio.to_thread(lambda: cap.veed_subtitles(
+                    variant["video_url"], preset=(a.get("caption_preset") or "glide"), srt_text=srt_text))
+                capped = await _download_to_temp(veed_url, ".mp4")
+                import shutil
+                shutil.move(capped, os.path.join(UPLOAD_DIR, out_name))
+                _ae_persist(os.path.join(UPLOAD_DIR, out_name), out_name)
+                _track_cost(request_id, "captions", "veed(fal)", units=seconds, unit_type="min",
+                            cost_usd=round(seconds / 60 * 0.10, 4), note="VEED styled")
+            except Exception as e:
+                logger.warning(f"VEED captions failed, keeping base video: {e}")
+        _set_lipsync_status(request_id, "done")
+
+        # ── NEVER AN ABRUPT STOP (reject-if-cut) — hold the last frame so the WHOLE narration plays ──
+        try:
+            _final = os.path.join(UPLOAD_DIR, out_name)
+            _vdur = await asyncio.to_thread(_stream_duration, _final, "v")
+            _adur = await asyncio.to_thread(_stream_duration, _final, "a")
+            if _vdur and _adur and (_adur - _vdur) > 0.15:
+                _hold = _final.rsplit(".", 1)[0] + "_hold.mp4"
+                await asyncio.to_thread(_ffmpeg, [
+                    "-i", _final,
+                    "-vf", f"tpad=stop_mode=clone:stop_duration={_adur - _vdur + 0.1:.2f}",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                    "-c:a", "copy", _hold], 400)
+                if os.path.exists(_hold):
+                    import shutil as _sh5
+                    _sh5.move(_hold, _final)
+                    _ae_persist(_final, out_name)
+                    logger.warning(f"[avatar-lipsync] {request_id}: video {_vdur:.1f}s < audio {_adur:.1f}s "
+                                   f"→ held last frame to cover the full narration (no truncation)")
+        except Exception as _ce:
+            logger.warning(f"[avatar-lipsync] tail-extend check skipped: {_ce}")
+
+        # ── EVAL GATE (global examiner on the delivered file) — PERSISTED via _record_qc + lessons ──
+        _eval = {}
+        try:
+            _fqwork = tempfile.mkdtemp()
+            try:
+                # Carry the b-roll signal so the gate can BLOCK a UGC+B-Roll job that silently degraded
+                # to a plain talking-head (_broll_applied is True only when the composite swapped in).
+                _assets_for_gate = {**a, "captions": bool(ass_path or _use_veed),
+                                    "_ugc_broll_requested": _want_broll,
+                                    "_broll_applied": _broll_applied}
+                _eval = await _eval_gate(request_id, os.path.join(UPLOAD_DIR, out_name), script,
+                                         _assets_for_gate, _fqwork) or {}
+            finally:
+                import shutil as _sh3
+                _sh3.rmtree(_fqwork, ignore_errors=True)
+        except Exception as _fqe:
+            logger.warning(f"[avatar-lipsync] eval gate skipped: {_fqe}")
+
+    # ── HONOR THE GATE — BLOCK a bad delivery instead of shipping it (sem already released) ──────────
+    # A confident FAIL must FAIL the job with the REAL reason (or a plain talking-head when UGC+B-Roll
+    # was requested — see _eval_gate's b-roll-presence check). Fail-open on internal error → only a
+    # genuine, high-confidence fault reaches here. The caller catches this and fires the failed callback.
+    if _eval.get("deliver") is False:
+        _gate_reasons = (_eval.get("reasons") or [])[:3]
+        _set_lipsync_status(request_id, "failed", "QA: " + "; ".join(_gate_reasons)[:250])
+        raise RuntimeError("QA gate blocked delivery: " + "; ".join(_gate_reasons))
+
+    return {"variant": variant, "eval": _eval, "broll_applied": _broll_applied,
+            "ugc_broll_note": _ugc_broll_note, "cap_words": _cap_words, "cap_method": _cap_method,
+            "cap_err": _cap_err, "use_veed": _use_veed, "ass_path": ass_path, "seconds": seconds}
 
 
 async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> list:
@@ -7533,8 +7812,30 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     _log_model_call(req.request_id, "lipsync", (prefer or f"auto ({quality})"),
                     {"video": char_url, "audio": audio_url, "prefer": prefer, "quality": quality,
                      "seconds": seconds})
+    # PERSIST THE ASSEMBLY ASSETS on the checkpoint so a restart can re-run the FULL delivery (b-roll
+    # composite + captions + QA gate) via _finalize_lipsync_delivery — not just a raw talking-head.
+    # Curated + size-guarded JSON: only the URLs/flags the finalizer needs. Old rows (no blob) resume raw.
+    import json as _json
+    _assets_blob = {
+        "ugc_broll": bool(ugc_broll or a.get("ugc_broll")),
+        "captions": bool(a.get("captions")),
+        "caption_style": a.get("caption_style"),
+        "caption_preset": a.get("caption_preset"),
+        "vertical": (vertical or None),
+        "scene": a.get("scene"), "gender": a.get("gender"), "age_band": a.get("age_band"),
+        "seconds": a.get("seconds"), "resolution": a.get("resolution"),
+        "variation_index": _vidx,
+        "broll_hook_urls": a.get("broll_hook_urls"),
+        "broll_interior_urls": a.get("broll_interior_urls"),
+        "script": script,
+    }
+    try:
+        _assets_json = _json.dumps(_assets_blob)[:200000]
+    except Exception:
+        _assets_json = None
     sub = await asyncio.to_thread(lambda: lip_sync.submit_relipsync(char_url, audio_url, prefer, quality=quality))
-    _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url, name, script)
+    _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url, req.callback_url,
+                     name, script, assets_json=_assets_json)
     result = None
     try:
         for _ in range(150):   # ~10 min; a restart mid-poll is recovered by resume_pending_lipsync()
@@ -7553,7 +7854,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
             sub = await asyncio.to_thread(
                 lambda: lip_sync.submit_relipsync(char_url, audio_url, _alt, quality=quality))
             _persist_lipsync(req.request_id, sub["provider"], sub["job"], audio_url, char_url,
-                             req.callback_url, name, script)
+                             req.callback_url, name, script, assets_json=_assets_json)
             for _ in range(150):
                 await asyncio.sleep(4)
                 stt, res = await asyncio.to_thread(lambda: lip_sync.poll_relipsync(sub["provider"], sub["job"]))
@@ -7597,40 +7898,6 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
       except Exception as _moe:
         logger.warning(f"[avatar-lipsync] mouth-region composite skipped: {_moe}")
 
-    # ── UGC-BROLL COMPOSITE (optional) ─────────────────────────────────────────────────────────────
-    # For a "UGC + B-Roll" ask, intercut satisfaction/interior b-roll over this lip-synced talking-head
-    # while the VO (out_audio) plays straight through — the library format (open on oddly-satisfying
-    # b-roll with captions already running, then the character cuts in and CONTINUES in lip-sync). The
-    # layout VARIES per generation (ham = b-roll cold-open, rit = face cold-open) via the variation
-    # index, so a batch isn't identical. Swap `result` to the composite BEFORE captions so the existing
-    # kinetic-caption burn runs over the whole thing (opener included). Best-effort: on any shortfall
-    # `result` is untouched and we ship the plain talking-head.
-    _ugc_broll_note = ""   # surfaced on the creative's feedback so a live run reveals what the composite did
-    _broll_applied = False   # True ONLY if the composite actually swapped in b-roll — fed to the QA gate
-    if ugc_broll or (isinstance(a, dict) and a.get("ugc_broll")):
-        try:
-            _fm = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
-            _ub_work = tempfile.mkdtemp()   # NOT cleaned here — the composite lives in it until variant reads it
-            _ub_intent = {"vertical": (vertical or ""), "scene": (a.get("scene") or ""),
-                          "gender": (a.get("gender") or ""), "age_band": (a.get("age_band") or "")}
-            _ub_layout = "ham" if (_vidx % 2 == 1) else "rit"
-            _ub_hooks = a.get("broll_hook_urls") if isinstance(a, dict) else None
-            _ub_inter = a.get("broll_interior_urls") if isinstance(a, dict) else None
-            _ub, _ub_status = await _compose_ugc_broll(_fm, out_audio, float(vo_sec), _ub_intent, _ub_layout,
-                                                       _ub_work, req, hook_urls=_ub_hooks, interior_urls=_ub_inter)
-            _ugc_broll_note = _ub_status or ""
-            if _ub and os.path.exists(_ub):
-                result = {"local_path": _ub}
-                _broll_applied = True   # real b-roll composite shipped — the QA gate's presence check passes
-                logger.info(f"[ugc-broll] {_ub_status} ({vo_sec:.0f}s)")
-            else:
-                logger.info(f"[ugc-broll] no composite ({_ub_status}) — delivering the plain talking-head")
-        except Cancelled:
-            raise
-        except Exception as _ube:
-            _ugc_broll_note = f"error: {str(_ube)[:80]}"
-            logger.warning(f"[ugc-broll] composite failed ({_ube}) — plain talking-head")
-
     # Corrected 2026 rates (see _lipsync_projected_usd): VEED = $0.40 per MINUTE of output ($0.0067/s),
     # NOT $0.07/s — the old model was 10x high and made the office show ~$2.17 for a 31s clip instead of
     # ~$0.21. sync/falsync = $0.70/min; Replicate LatentSync/Wav2Lip are per-prediction; kling bills in
@@ -7639,129 +7906,23 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     _track_cost(req.request_id, "lipsync", sub["provider"], units=seconds, unit_type="sec",
                 cost_usd=_lip_cost, note=f"lip-sync via {sub['provider']}")
 
-    # 3b) CAPTIONS (optional). Default = ffmpeg ASS (free, our exact words). style="veed" = VEED via fal.
-    _cap_words, _cap_method, _cap_err = [], "", ""
-    # GATED self-correction (caption_place brain): only when the user did NOT pin a caption_style
-    # AND an ADMIN-APPROVED rule prefers a method do we bias veed/ffmpeg. No active rule → None →
-    # exact current behavior. Wrapped so it can never break the render.
-    _cap_style = (a.get("caption_style") or "").lower()
-    if not _cap_style:
-        try:
-            from ..services import creative_tuner as ctun
-            from ..database import SessionLocal as _SL
-            _cdb = _SL()
-            try:
-                _cap_pref = ctun.governed_preference(_cdb, "caption_place", vertical or None)  # 'veed'|'ffmpeg'|None
-            finally:
-                _cdb.close()
-            if _cap_pref:
-                _cap_style = _cap_pref
-        except Exception:
-            pass
-    _use_veed = bool(a.get("captions")) and ((_cap_style or "clean") == "veed") and bool(settings.fal_key)
-    if a.get("captions"):
-        try:
-            from ..services import captions as cap
-            _log_model_call(req.request_id, "captions", ("veed" if _use_veed else "whisper+ass"),
-                            {"style": (_cap_style or "clean"), "script": (script or "")[:400]})
-            # align() NEVER comes back empty: ElevenLabs FA → Whisper word-timestamps (real timings
-            # off the actual voice, so the pace is right) → Deepgram → even-split.
-            _cap_words, _cap_method = await asyncio.to_thread(lambda: cap.align(out_audio, script))
-            if _cap_words and not _use_veed:
-                _track_cost(req.request_id, "captions", f"{_cap_method}+ffmpeg", cost_usd=0.004,
-                            note=f"{_cap_method} word timings + ffmpeg burn (TikTok style, CTA button)")
-        except Exception as e:
-            _cap_err = str(e)[:160]
-            logger.error(f"captions FAILED for {req.request_id}: {e}")
-    if a.get("captions") and not _cap_words:
-        _cap_err = _cap_err or "every aligner returned no words"
-        logger.error(f"captions requested but NOT burned for {req.request_id}: {_cap_err}")
-
-    # 4) SAVE — normalize + persist to BOTH buckets (subtitle is built in here, sized to the real frame)
-    variant = await _produce_lipsync_variant(req.request_id, name, result, script,
-                                             cap_words=(None if _use_veed else _cap_words),
-                                             vertical=(vertical or None),
-                                             kinetic=bool(ugc_broll or (isinstance(a, dict) and a.get("ugc_broll"))))
-    ass_path = variant.get("captions_burned")
-
-    # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
-    if _use_veed:
-        try:
-            from ..services import captions as cap
-            srt_path = cap.build_srt(_cap_words, os.path.join(UPLOAD_DIR, f"cap_{req.request_id[:8]}.srt")) if _cap_words else None
-            srt_text = open(srt_path).read() if srt_path else None
-            veed_url = await asyncio.to_thread(lambda: cap.veed_subtitles(
-                variant["video_url"], preset=(a.get("caption_preset") or "glide"), srt_text=srt_text))
-            capped = await _download_to_temp(veed_url, ".mp4")
-            import shutil
-            shutil.move(capped, os.path.join(UPLOAD_DIR, name))
-            _ae_persist(os.path.join(UPLOAD_DIR, name), name)
-            _track_cost(req.request_id, "captions", "veed(fal)", units=seconds, unit_type="min",
-                        cost_usd=round(seconds / 60 * 0.10, 4), note="VEED styled")
-        except Exception as e:
-            logger.warning(f"VEED captions failed, keeping base video: {e}")
-    _set_lipsync_status(req.request_id, "done")
-
-    # ── NEVER AN ABRUPT STOP (reject-if-cut) ──────────────────────────────────────────────────────
-    # The synced video should span the full padded VO (the 0.45s tail lives in the audio fed to the
-    # provider), but a provider can hand back video a beat SHORTER than its audio — which chops the
-    # final word. ffprobe BOTH streams of the DELIVERED file; if the video is shorter, freeze-hold the
-    # last frame to cover the audio so the WHOLE narration always plays. Runs before the final QA so
-    # QA sees the corrected file. Best-effort: never truncate, never hard-fail, no resolution change.
-    try:
-        _final = os.path.join(UPLOAD_DIR, name)
-        _vdur = await asyncio.to_thread(_stream_duration, _final, "v")
-        _adur = await asyncio.to_thread(_stream_duration, _final, "a")
-        if _vdur and _adur and (_adur - _vdur) > 0.15:
-            _hold = _final.rsplit(".", 1)[0] + "_hold.mp4"
-            await asyncio.to_thread(_ffmpeg, [
-                "-i", _final,
-                "-vf", f"tpad=stop_mode=clone:stop_duration={_adur - _vdur + 0.1:.2f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                "-c:a", "copy", _hold], 400)
-            if os.path.exists(_hold):
-                import shutil as _sh5
-                _sh5.move(_hold, _final)
-                _ae_persist(_final, name)
-                logger.warning(f"[avatar-lipsync] {req.request_id}: video {_vdur:.1f}s < audio {_adur:.1f}s "
-                               f"→ held last frame to cover the full narration (no truncation)")
-    except Exception as _ce:
-        logger.warning(f"[avatar-lipsync] tail-extend check skipped: {_ce}")
-
-    # ── EVAL GATE (global examiner on the delivered file) — PERSISTED via _record_qc + lessons ───
-    # This lane never ran the final examiner, so nothing was written to creative_decisions for an
-    # avatar job and /learn/decisions came back []. The gate wraps final-video QA (so it runs once)
-    # and adds the objective faithfulness/never-abrupt/residual-caption/spec/cast checks + a
-    # cross-family semantic judge. Pass the RESOLVED captions flag (whether we actually burned any).
-    # Fail-open on INTERNAL error (deliver defaults True), but a confident FAIL now BLOCKS delivery below.
-    _eval = {}
-    try:
-        _fqwork = tempfile.mkdtemp()
-        try:
-            # Carry the b-roll signal so the gate can BLOCK a UGC+B-Roll job that silently degraded to a
-            # plain talking-head (_broll_applied is set True only when the composite actually swapped in).
-            _assets_for_gate = {**a, "captions": bool(ass_path or _use_veed),
-                                "_ugc_broll_requested": bool(ugc_broll or (isinstance(a, dict) and a.get("ugc_broll"))),
-                                "_broll_applied": _broll_applied}
-            _eval = await _eval_gate(req.request_id, os.path.join(UPLOAD_DIR, name), script,
-                                     _assets_for_gate, _fqwork) or {}
-        finally:
-            import shutil as _sh3
-            _sh3.rmtree(_fqwork, ignore_errors=True)
-    except Exception as _fqe:
-        logger.warning(f"[avatar-lipsync] eval gate skipped: {_fqe}")
-
-    # ── HONOR THE GATE — BLOCK a bad delivery instead of shipping it ─────────────────────────────
-    # The gate is the examiner: a confident FAIL must FAIL the job with the REAL reason, not silently
-    # ship a broken take (or a plain talking-head when UGC+B-Roll was requested — see _eval_gate's
-    # b-roll-presence check). _eval_gate is fail-open (any INTERNAL error → deliver=True), so only a
-    # genuine, high-confidence fault reaches here. Raise BEFORE the reward-critic + learning log below,
-    # so a blocked take never rewards the personas or records qc_passed=True. _execute catches this and
-    # fires the failed callback carrying this reason — the desired "fail loudly with the real cause".
-    if _eval.get("deliver") is False:
-        _gate_reasons = (_eval.get("reasons") or [])[:3]
-        _set_lipsync_status(req.request_id, "failed", "QA: " + "; ".join(_gate_reasons)[:250])
-        raise RuntimeError("QA gate blocked delivery: " + "; ".join(_gate_reasons))
+    # ── POST-LIP-SYNC ASSEMBLY (shared with the restart resumer) ─────────────────────────────────
+    # b-roll composite (UGC+B-Roll) → caption burn → produce/persist the variant → VEED captions →
+    # never-abrupt tail hold → final QA gate, extracted into _finalize_lipsync_delivery so the resume
+    # path delivers the SAME complete video (not a raw talking-head). It acquires _LIPSYNC_HEAVY_SEM
+    # internally — do NOT wrap this call in the sem (that would double-acquire Semaphore(1) → deadlock).
+    # A QA-gate FAIL raises inside the helper → _execute fires the failed callback with the real reason.
+    _fin = await _finalize_lipsync_delivery(
+        req.request_id, result, out_name=name, script=script, vo_audio=out_audio, vo_sec=vo_sec,
+        assets=a, ugc_broll=ugc_broll, vertical=(vertical or None), vidx=_vidx, req=req)
+    variant = _fin["variant"]
+    _eval = _fin["eval"]
+    _ugc_broll_note = _fin["ugc_broll_note"]
+    _cap_words = _fin["cap_words"]
+    _cap_method = _fin["cap_method"]
+    _cap_err = _fin["cap_err"]
+    _use_veed = _fin["use_veed"]
+    ass_path = _fin["ass_path"]
 
     # ── POST-RENDER VISUAL QA (grade + coach, NO retry) ──────────────────────────────────────────
     # The avatar-lipsync path produced its clip but nothing ever critiqued the OUTPUT — so no persona
