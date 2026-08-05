@@ -4514,6 +4514,18 @@ def _is_provider_unavailable(exc: Exception) -> bool:
     return bool(_VIDEO_UNAVAILABLE_RE.search(str(exc) or ""))
 
 
+def _clip_inaccessible(exc: Exception) -> bool:
+    """True when an avatar/reference-clip failure is caused by an UNREACHABLE source URL (expired
+    presign / 403 / inaccessible), NOT a real model or provider fault. Used to fail a talking-head job
+    LOUDLY ('re-dispatch') instead of silently swapping in a different synthetic t2v character — which is
+    exactly what dropped the user's chosen avatar when its S3 presign had expired (sync.so '422: the
+    provided video URL is inaccessible', veed 'Error downloading file', S3 403 Forbidden)."""
+    s = str(exc or "").lower()
+    return any(m in s for m in (
+        "inaccessible", "403", "forbidden", "accessdenied", "access denied",
+        "error downloading", "downloading file", "url is not accessible", "expired"))
+
+
 class _AllVideoProvidersDown(RuntimeError):
     """Every configured text-to-video provider is unavailable (credits/quota/billing/5xx)."""
 
@@ -4674,7 +4686,8 @@ async def _cast_library_avatar(intent: dict):
             s += 1
         return s
 
-    best_lip = best_lip_s = best_any = best_any_s = None
+    best_lip = best_any = None
+    best_lip_key = best_any_key = None
     best_lip_s = -1e9
     best_any_s = -1e9
     for row in rows:
@@ -4687,11 +4700,20 @@ async def _cast_library_avatar(intent: dict):
         lip = (t.get("usable_as") == "avatar_lipsync") and bool(t.get("max_talk_sec"))
         s = _score(t, lip)
         if s > best_any_s:
-            best_any_s, best_any = s, t
+            best_any_s, best_any, best_any_key = s, t, (row.s3_key or None)
         if lip and s > best_lip_s:
-            best_lip_s, best_lip = s, t
-    return ((best_lip.get("url") if best_lip else None), best_lip,
-            (best_any.get("url") if best_any else None), best_any)
+            best_lip_s, best_lip, best_lip_key = s, t, (row.s3_key or None)
+    # RE-PRESIGN FRESH: the `url` stored in tags_json was presigned at INGEST time with a 1-hour expiry,
+    # so days later it 403s (dead) — the EXACT staleness _cast_library_broll already fixes with _fresh().
+    # A stale avatar URL silently killed the whole lip-sync (voice-clone extract, footage extend, veed and
+    # sync.so all 403'd) → the plan fell back to t2v and invented a NEW character, dropping the chosen
+    # avatar. AssetTag.s3_key is the durable handle, so mint a FRESH, long-lived presigned URL per pick;
+    # fall back to the stored url only when no key/presign is available.
+    from ..services.storage import StorageService
+    def _fresh(key, stored):
+        return (StorageService.presign_url(key, expires=604800) or stored) if key else stored
+    return ((_fresh(best_lip_key, best_lip.get("url")) if best_lip else None), best_lip,
+            (_fresh(best_any_key, best_any.get("url")) if best_any else None), best_any)
 
 
 async def _cl_cast_broll(vertical: str = "", scene: str = "") -> dict:
@@ -5425,6 +5447,17 @@ async def recipe_generate(req: RunRequest) -> list:
                 except Cancelled:
                     raise
                 except Exception as _e:
+                    # INACCESSIBLE-CLIP GUARD: when the failure is the chosen clip URL being unreachable
+                    # (expired presign / 403 / inaccessible) — NOT a real model/provider fault — do NOT
+                    # silently fall through to t2v, which invents a brand-new AI character and drops the
+                    # user's chosen avatar. The clip is already freshly presigned at cast time, so a
+                    # re-fetch would 403 again; fail LOUD with the real reason so the job can be
+                    # re-dispatched. Genuine model failures still fall back to t2v (unchanged).
+                    if _clip_inaccessible(_e):
+                        raise RuntimeError(
+                            f"avatar clip URL expired/inaccessible — re-dispatch to re-presign the clip "
+                            f"(chosen avatar: {_cast_url}). Refusing to silently swap in a different AI "
+                            f"character. Underlying error: {str(_e)[:200]}")
                     logger.error(f"[generate] plan avatar-lipsync failed ({_e}) — falling back to t2v")
                     out = None
                 if out:
