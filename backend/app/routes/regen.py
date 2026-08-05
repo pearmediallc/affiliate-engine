@@ -4004,6 +4004,39 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
         except Exception as e:
             logger.warning(f"[eval-gate] b-roll presence check errored: {e}")
 
+        # ── 1g. ASPECT (STRUCTURAL, HARD) — a vertical UGC ad MUST ship ~9:16 portrait. A landscape /
+        # 16:9 file means the source aspect leaked through — never deliver it. Objective + reliable, so
+        # this is deliver-blocking. Tolerance ±0.20 on the 1.778 (16/9) height/width target.
+        aspect_ok = None
+        try:
+            _aw, _ah = await asyncio.to_thread(_video_dims, final_path)
+            if _aw and _ah:
+                _ar = _ah / _aw
+                aspect_ok = abs(_ar - (16.0 / 9.0)) <= 0.20
+                checks.append(("aspect", aspect_ok))
+                if not aspect_ok:
+                    reasons.append(f"aspect: final {_aw}x{_ah} (h/w {_ar:.2f}) is not 9:16 portrait")
+        except Exception as e:
+            logger.warning(f"[eval-gate] aspect check errored: {e}")
+
+        # ── 1h. STRUCTURAL FAULTS from the holistic QA — block ONLY on the hard structural problems the
+        # A/B/C fixes address (first shot isn't the talking head; garbled/residual on-screen text), NOT
+        # on subjective low scores (that would spin the fresh-render loop forever). TIGHT keyword match
+        # on fqa's issues so an artifact like "warped hands" never trips this (that is the semantic
+        # judge's job). A clean render post-A/B/C has none of these, so this is a backstop, not a churn.
+        structural_ok = None
+        try:
+            _struct_pats = ("first shot", "not a talking head", "starts on b-roll",
+                            "garbled", "gibberish", "residual", "burned-in", "foreign text",
+                            "warped text", "mirrored text", "double caption", "two sets of caption")
+            _hits = [i for i in fqa_issues if any(p in i.lower() for p in _struct_pats)]
+            if _hits:
+                structural_ok = False
+                checks.append(("structural", False))
+                reasons.append("structural: " + "; ".join(_hits[:2])[:200])
+        except Exception as e:
+            logger.warning(f"[eval-gate] structural check errored: {e}")
+
         # ── 2. SEMANTIC JUDGE — CROSS-FAMILY (OpenAI gpt-4o), one-line rubrics, booleans only ─────
         real_ok = arti_ok = lip_ok = None
         judge_engine = "none"
@@ -4048,6 +4081,7 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
         # never over-block) — so broll_present stays None (→ pass) for non-UGC+B-Roll callers.
         deliver = bool((faithful is not False) and (not_abrupt is not False)
                        and (no_residual is not False) and (broll_present is not False)
+                       and (aspect_ok is not False) and (structural_ok is not False)
                        and (not hard_artifact))
 
         verdict = {
@@ -4083,6 +4117,8 @@ async def _eval_gate(request_id: str, final_path: str, script: str, assets: dict
             if hard_artifact:        _fails.append(("visible-artifact", "hard visual artifact (eyes/hands/warp/text)"))
             if cast_ok is False:     _fails.append(("cast-mismatch", "on-camera person is the wrong gender"))
             if spec_ok is False:     _fails.append(("spec-mismatch", "duration/resolution off the request"))
+            if aspect_ok is False:   _fails.append(("aspect-not-9x16", "final video is not 9:16 portrait (landscape leaked through)"))
+            if structural_ok is False: _fails.append(("structural-fault", "first-shot / on-screen-text structural defect"))
             for _dim, _detail in _fails:
                 learn.record_lesson("eval", trigger=_dim, reason=_detail[:500],
                                     rule=f"Avoid: {_dim}", job_id=request_id)
@@ -6454,13 +6490,21 @@ def _clean_script(s: str) -> str:
     return re.sub(r"\s*\n\s*", " ", s).strip()
 
 
+# ONE PORTRAIT 9:16 CANVAS for every UGC deliverable — the talking head, every b-roll clip, the
+# caption burn AND the stitch all render at THIS size. Real library footage is often 16:9 landscape;
+# inheriting its aspect is exactly what shipped a 1280x720 landscape ad. Force portrait everywhere
+# (center-crop to FILL, never letterbox). 720x1280 keeps the full source height on a landscape crop.
+_V9x16 = (720, 1280)
+
+
 async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None, kinetic=False):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
     out_path = os.path.join(UPLOAD_DIR, out_name)
     out_url = f"{AE_PUBLIC_URL}/api/v1/uploads/{out_name}"
-    w, h = await asyncio.to_thread(_video_dims, src)
+    w, h = await asyncio.to_thread(_video_dims, src)   # SOURCE dims — delogo boxes are in these coords
+    cw, ch = _V9x16                                     # the forced portrait 9:16 delivery canvas
 
     # ── SCRUB THE ORIGINAL'S BURNED-IN CAPTIONS ───────────────────────────────────────────────
     # We re-use REAL editor creatives, and editors burn captions in CapCut. Lip-sync only changes
@@ -6521,17 +6565,20 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
             # UGC-BROLL uses the reference RED-BOX kinetic captions (1-2 words, numbers/keywords boxed
             # red); everything else keeps the standard TikTok caption style. Same word timings.
             _capf = os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass")
-            ass_path = (cap.build_kinetic_ass(cap_words, _capf, play_w=w, play_h=h) if kinetic
-                        else cap.build_ass(cap_words, _capf, play_w=w, play_h=h))
-            logger.info(f"[captions] burning {len(cap_words)} words onto {w}x{h}"
+            ass_path = (cap.build_kinetic_ass(cap_words, _capf, play_w=cw, play_h=ch) if kinetic
+                        else cap.build_ass(cap_words, _capf, play_w=cw, play_h=ch))
+            logger.info(f"[captions] burning {len(cap_words)} words onto {cw}x{ch}"
                         + (" (kinetic red-box)" if kinetic else ""))
         except Exception as e:
             logger.error(f"[captions] build failed: {e}")
 
     args = ["-i", src]
-    vf = delogo + (f"ass={ass_path}" if (ass_path and os.path.exists(ass_path)) else "")
-    if vf:
-        args += ["-vf", vf.rstrip(",")]     # scrub the old captions, then burn ours — one pass
+    # FORCE the portrait 9:16 canvas (Task A): blur any source captions (delogo, in SOURCE coords)
+    # FIRST, then center-crop-to-FILL to the canvas, then burn OUR captions — one pass. Never inherit
+    # the (often landscape) source aspect; that is what shipped a 1280x720 landscape ad.
+    _crop = f"scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch}"
+    vf = delogo + _crop + "," + (f"ass={ass_path}" if (ass_path and os.path.exists(ass_path)) else "")
+    args += ["-vf", vf.rstrip(",")]     # scrub the old captions, crop to portrait, then burn ours
     args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "192k", out_path]
     await asyncio.to_thread(_ffmpeg, args, 300)
@@ -6798,11 +6845,19 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
         if take < 0.4:
             break
         seg = os.path.join(work, f"{tag}_{len(seg_paths):03d}.mp4")
+        # RESIDUAL-TEXT SCRUB (Task C): fill-crop already pushes edge text off-frame; additionally BLUR
+        # the bottom caption band so a b-roll clip's own burned-in text can't bleed under OUR caption.
+        # Our kinetic captions render over this band on the composite, so the blur reads as depth, not
+        # a bar. bandH = bottom ~30% (covers the ~11%-from-bottom caption placement).
+        _bandH = max(2, int(H * 0.30)); _bandY = H - _bandH
+        _fc = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+               f"fps=30,setpts=PTS-STARTPTS,split=2[bv][bb];"
+               f"[bb]crop={W}:{_bandH}:0:{_bandY},boxblur=12:2[band];"
+               f"[bv][band]overlay=0:{_bandY}[outv]")
         try:
             await asyncio.to_thread(_ffmpeg,
                 ["-ss", f"{off:.2f}", "-i", src, "-t", f"{take:.2f}", "-an",
-                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,"
-                        f"crop={W}:{H},fps=30,setpts=PTS-STARTPTS",
+                 "-filter_complex", _fc, "-map", "[outv]",
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                  "-pix_fmt", "yuv420p", "-threads", "2", seg], 300)
         except Exception as se:
@@ -6916,9 +6971,10 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     the b-roll opener. LIBRARY b-roll ONLY (our own assets — never stock). `layout` ∈ {'ham','rit'}."""
     if not (face_path and os.path.exists(face_path) and vo_audio and os.path.exists(vo_audio) and T > 3):
         return None, "skipped: missing face/vo or T<=3"
-    W, H = await asyncio.to_thread(_ffprobe_dims, face_path)
-    if not (W and H):
-        return None, "skipped: no face dims"
+    # FORCE the ONE portrait 9:16 canvas for EVERY segment — face, b-roll AND the stitch (Task A). The
+    # source face clip is often 16:9 landscape; inheriting its dims is what shipped a landscape
+    # composite with native-aspect b-roll cut in. Each segment center-crops to FILL this size below.
+    W, H = _V9x16
 
     # 1) b-roll windows (seconds). Opener capped so a short ad never spends half its length off-face.
     if layout == "ham":                                       # satisfaction cold-open → face → insert
@@ -6951,6 +7007,12 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
         b_windows = [((s if s <= 0.3 else _snap_to_silence(s, _sil)), _snap_to_silence(e, _sil))
                      for (s, e) in b_windows]
     b_windows = _clean_windows(b_windows, T)
+    # HOOK GUARD (Task B) — the FIRST shot must be the real talking head: NO b-roll cutaway inside the
+    # opening window. Push any window that would start before _HOOK_GUARD to begin there (drop it if
+    # that leaves it too short). The heavy-line cutaway bias for the REST of the timeline is untouched.
+    _HOOK_GUARD = 2.5
+    b_windows = [(max(s, _HOOK_GUARD), e) for (s, e) in b_windows
+                 if e - max(s, _HOOK_GUARD) >= 1.5]
     if not b_windows:
         return None, "skipped: no windows"
     segs = _partition_timeline(b_windows, T)
@@ -7386,7 +7448,10 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # and_write + critic) and does NOT go through run_creative_team, so the office short-circuit
     # never protects it. A job carrying allow_rewrite:false must be verbatim even if the caller
     # didn't ALSO set script_mode="verbatim" — otherwise the avatar rewrites the user's script.
-    verbatim = bool(base) and (_script_mode_pin == "verbatim" or not _rewrite_allowed(a))
+    # script_mode in {verbatim, reuse} ALSO means speak-as-given: a "reuse" ask with a base script
+    # present (the reuse→verbatim normalization above only fires when base is EMPTY) was slipping
+    # through and getting rewritten into a PAS ad (Task E) — honor it here too.
+    verbatim = bool(base) and (_script_mode_pin in ("verbatim", "reuse") or not _rewrite_allowed(a))
     # SCRIPT axis: ask the writer for the index-th DISTINCT script (a different hook AND angle). Only
     # applies when we're actually writing — a verbatim user script can't be rewritten, so the script
     # axis degrades to varying the HOOK only (handled after the script is finalized, below).
