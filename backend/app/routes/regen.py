@@ -572,11 +572,18 @@ def _pick_caption_y(boxes: list, est_h: float = 0.22) -> float:
 
 
 async def _download_to_temp(url: str, suffix: str = ".mp4") -> str:
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
-        r = await c.get(url); r.raise_for_status(); data = r.content
+    # STREAM to disk in chunks — do NOT buffer the whole file in RAM (the old `data = r.content`).
+    # A single video is many MB; loading several at once (b-roll composite = 14 clips, or the
+    # startup resume of N in-flight jobs) pushed the 2GB box past its limit → OOM kill → restart →
+    # resume re-downloads the same files → OOM again (a crash-loop). Chunked streaming caps resident
+    # memory to one 256KB chunk per active download regardless of file size.
     fd, path = tempfile.mkstemp(suffix=suffix); os.close(fd)
-    with open(path, "wb") as f:
-        f.write(data)
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as c:
+        async with c.stream("GET", url) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                async for chunk in r.aiter_bytes(262144):
+                    f.write(chunk)
     return path
 
 async def _transcribe_file(path: str) -> str:
@@ -6541,6 +6548,13 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
             "_local_path": out_path}
 
 
+# On a 2GB box, resuming many in-flight lip-syncs AT ONCE (each downloads a fal output and, for
+# UGC+B-Roll, composites 14 b-roll clips) blew past memory → OOM → the SAME resume re-fired on every
+# restart (crash-loop). Serialize the HEAVY download/composite step so only one runs at a time; the
+# cheap status polling below still overlaps freely.
+_LIPSYNC_HEAVY_SEM = asyncio.Semaphore(1)
+
+
 async def _resume_one_lipsync(row):
     from ..services import lip_sync
     from ..services import creative_team_activity as act
@@ -6556,7 +6570,8 @@ async def _resume_one_lipsync(row):
         if not result:
             logger.warning(f"[resume] lipsync {rid} still processing; will retry on next restart")
             return
-        variant = await _produce_lipsync_variant(rid, row["out_name"] or f"regen_avatar_lipsync_{rid[:8]}.mp4", result, row.get("script") or "")
+        async with _LIPSYNC_HEAVY_SEM:   # one heavy download/composite at a time — stay under the 2GB box
+            variant = await _produce_lipsync_variant(rid, row["out_name"] or f"regen_avatar_lipsync_{rid[:8]}.mp4", result, row.get("script") or "")
         await _callback(row["callback_url"], {"request_id": rid, "status": "ready", "variants": [variant]})
         act.end_job(rid, ok=True)
         _set_lipsync_status(rid, "done")
