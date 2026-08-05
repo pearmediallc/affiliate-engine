@@ -6622,6 +6622,43 @@ async def _diversify_hook(script: str, index: int, total: int, offer_value: str,
         return script
 
 
+# ── ROTATING HOOK-PATTERN BANK ──────────────────────────────────────────────────────────────────
+# Distinct OPENING patterns for clip 0 / the first line. The writer opens each generation with a
+# DIFFERENT one so a batch (or a day) of ads doesn't lead with the same hook. Each entry is a short
+# instruction shaping ONLY how the first sentence is delivered — the offer/body stay intact.
+_HOOK_PATTERNS = [
+    ("pattern_interrupt_question", "Open with an unexpected, pattern-interrupt QUESTION that stops the scroll (e.g. 'Why does nobody tell you this?') — never a greeting or the product name."),
+    ("bold_claim_number", "Open with a BOLD, specific claim built around a NUMBER or dollar figure in the very first sentence (e.g. 'I cut my bill by $1,200 in one call')."),
+    ("audience_callout", "Open by CALLING OUT the exact target audience in the first three words (e.g. 'Homeowners over 50 — listen up')."),
+    ("before_after_tease", "Open by TEASING a before/after transformation: name the 'before' pain first, then hint at the payoff without revealing how yet."),
+    ("myth_bust", "Open by BUSTING a common myth the audience believes (e.g. 'Everyone thinks X — and it's costing them')."),
+    ("personal_confession", "Open with a raw first-person CONFESSION that feels unscripted (e.g. 'I almost didn't do this…', 'I was skeptical too')."),
+    ("urgent_warning", "Open with an URGENT, time-sensitive warning or stakes (e.g. 'Stop before you renew…')."),
+    ("curiosity_gap", "Open with a CURIOSITY GAP — imply a surprising result or secret without explaining it, forcing the viewer to keep watching."),
+    ("relatable_frustration", "Open by naming a RELATABLE everyday frustration in the audience's own words, then pivot to the fix."),
+    ("direct_result_upfront", "Open by stating the RESULT/payoff up front in one punchy line, then back into how it happened."),
+    ("social_proof_lead", "Open with SOCIAL PROOF — what everyone / thousands of people are already doing (e.g. 'Everyone in my neighborhood is switching')."),
+    ("contrarian_take", "Open with a CONTRARIAN take that challenges conventional wisdom so the viewer stops to react."),
+]
+
+
+def _pick_hook_pattern(request_id: str) -> tuple:
+    """Rotate through _HOOK_PATTERNS so consecutive generations open differently. DETERMINISTIC per
+    request (a retry of the SAME request re-picks the SAME hook — never random), and never fixed at
+    index 0. A sequential integer request id rotates 1:1 through the bank (no consecutive repeats);
+    a non-numeric id falls back to a stable hash. Returns (index, name, instruction)."""
+    import hashlib
+    rid = str(request_id or "")
+    digits = re.sub(r"\D", "", rid)
+    if digits:
+        n = int(digits[-9:])                       # serial id → clean 0,1,2,… rotation
+    else:
+        n = int(hashlib.sha1(rid.encode()).hexdigest()[:8], 16)
+    idx = n % len(_HOOK_PATTERNS)
+    name, instr = _HOOK_PATTERNS[idx]
+    return idx, name, instr
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # UGC-BROLL ASSEMBLER
 # The real library UGC-BROLL format (S2-TX-UGC-BROLL-HAM / -RIT): ONE continuous first-person voice,
@@ -6727,6 +6764,33 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
     return out if os.path.exists(out) else None
 
 
+def _vo_silence_centers(vo_audio: str) -> list:
+    """Centers (sec) of the silence gaps in the VO — the natural sentence/beat boundaries. b-roll cut
+    points are snapped to these so a cutaway lands in a pause and never mid-word. Pure read; on any
+    failure returns [] (caller keeps the un-snapped windows)."""
+    try:
+        p = subprocess.run(["ffmpeg", "-i", vo_audio, "-af", "silencedetect=noise=-32dB:d=0.18", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=90)
+        starts = [float(m) for m in re.findall(r"silence_start:\s*([0-9.]+)", p.stderr)]
+        ends = [float(m) for m in re.findall(r"silence_end:\s*([0-9.]+)", p.stderr)]
+        centers = []
+        for i, s in enumerate(starts):
+            e = ends[i] if i < len(ends) else None
+            centers.append(round(((s + e) / 2.0) if e is not None else s, 2))
+        return sorted(c for c in centers if c > 0.2)
+    except Exception as e:
+        logger.warning(f"[ugc-broll] VO silence scan failed: {e}")
+        return []
+
+
+def _snap_to_silence(t: float, centers: list, tol: float = 1.2) -> float:
+    """Snap a cut time to the nearest VO silence center within `tol` seconds; else keep it as-is."""
+    if not centers:
+        return t
+    best = min(centers, key=lambda c: abs(c - t))
+    return round(best, 2) if abs(best - t) <= tol else t
+
+
 async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: dict,
                              layout: str, work: str, req: "RunRequest",
                              hook_urls: list = None, interior_urls: list = None) -> tuple:
@@ -6746,6 +6810,13 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
         b_windows = [(0.0, min(6.0, 0.32 * T)), (0.55 * T, 0.72 * T)]
     else:                                                      # rit: face cold-open → satisfaction mid
         b_windows = [(min(4.0, 0.22 * T), 0.62 * T)]
+    # BEAT ALIGNMENT — snap every cut point (except the 0.0 cold-open start) to the nearest VO silence
+    # gap, so a cutaway lands on a sentence/beat boundary and never mid-word. Sync-safe: face segments
+    # are still cut at these (now beat-aligned) times against the same continuous VO, and total = T.
+    _sil = await asyncio.to_thread(_vo_silence_centers, vo_audio)
+    if _sil:
+        b_windows = [((s if s <= 0.3 else _snap_to_silence(s, _sil)), _snap_to_silence(e, _sil))
+                     for (s, e) in b_windows]
     b_windows = _clean_windows(b_windows, T)
     if not b_windows:
         return None, "skipped: no windows"
@@ -6806,20 +6877,58 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     if len(seg_files) < 2:                                    # need at least one face + one b-roll
         return None, "too few segments"
 
-    # 4) concat all segments (re-encode → identical params) then mux the CONTINUOUS VO as the audio.
-    listf = os.path.join(work, "compose_list.txt")
-    with open(listf, "w") as f:
-        for s in seg_files:
-            f.write("file '%s'\n" % s.replace("'", "'\\''"))
+    # 4) STITCH the segments, then mux the CONTINUOUS VO as the audio. Prefer a short cross-dissolve at
+    #    each boundary (reads as an intentional edit, not a jump-cut); fall back to a clean hard-cut
+    #    concat. The crossfade is SYNC-SAFE by construction: boundaries were snapped to VO silence
+    #    (nothing is spoken across the dissolve) AND each non-final segment is frozen-padded by the fade
+    #    length, which xfade then consumes — so the timeline stays == T and the VO keeps lip-sync. A
+    #    duration sanity-check gates it: any drift → the hard-cut concat (also clean, boundaries on-beat).
     silent = os.path.join(work, "compose_silent.mp4")
-    try:
-        await asyncio.to_thread(_ffmpeg,
-            ["-f", "concat", "-safe", "0", "-i", listf, "-an",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-             "-pix_fmt", "yuv420p", "-threads", "2", silent], 600)
-    except Exception as ce:
-        logger.warning(f"[ugc-broll] compose concat failed: {ce}")
-        return None, "concat failed"
+    _stitched = False
+    _XF = 0.22
+    if len(seg_files) >= 2:
+        try:
+            durs = [await asyncio.to_thread(_ffprobe_duration, s) for s in seg_files]
+            if all(d and d > _XF + 0.3 for d in durs):
+                inputs, fc, n = [], [], len(seg_files)
+                for s in seg_files:
+                    inputs += ["-i", s]
+                for i in range(n):
+                    if i < n - 1:                      # freeze-pad the tail so the dissolve doesn't shorten the timeline
+                        fc.append(f"[{i}:v]tpad=stop_mode=clone:stop_duration={_XF},format=yuv420p[p{i}]")
+                    else:
+                        fc.append(f"[{i}:v]format=yuv420p[p{i}]")
+                prev, off = "p0", durs[0]
+                for i in range(1, n):
+                    out_lbl = "vout" if i == n - 1 else f"vx{i}"
+                    fc.append(f"[{prev}][p{i}]xfade=transition=fade:duration={_XF}:offset={off:.3f}[{out_lbl}]")
+                    prev = out_lbl
+                    off += durs[i]
+                await asyncio.to_thread(_ffmpeg,
+                    inputs + ["-filter_complex", ";".join(fc), "-map", "[vout]",
+                              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                              "-pix_fmt", "yuv420p", "-threads", "2", silent], 600)
+                _od = await asyncio.to_thread(_ffprobe_duration, silent)
+                if _od and abs(_od - T) <= 0.4:
+                    _stitched = True
+                    logger.info(f"[ugc-broll] cross-dissolve stitch ({n} segs, {_XF}s) dur={_od:.2f}~T={T:.2f}")
+                else:
+                    logger.info(f"[ugc-broll] xfade dur={_od} != T={T:.2f} — hard-cut concat")
+        except Exception as _xe:
+            logger.warning(f"[ugc-broll] xfade stitch failed ({_xe}); hard-cut concat")
+    if not _stitched:
+        listf = os.path.join(work, "compose_list.txt")
+        with open(listf, "w") as f:
+            for s in seg_files:
+                f.write("file '%s'\n" % s.replace("'", "'\\''"))
+        try:
+            await asyncio.to_thread(_ffmpeg,
+                ["-f", "concat", "-safe", "0", "-i", listf, "-an",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", "yuv420p", "-threads", "2", silent], 600)
+        except Exception as ce:
+            logger.warning(f"[ugc-broll] compose concat failed: {ce}")
+            return None, "concat failed"
     out = os.path.join(work, "ugc_broll.mp4")
     try:
         await asyncio.to_thread(_ffmpeg,
@@ -6989,6 +7098,16 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # axis degrades to varying the HOOK only (handled after the script is finalized, below).
     _script_directive = (_script_axis_directive(_vidx, _vtot)
                          if (_diversify and _axis_eff == "script" and not verbatim) else "")
+    # ROTATING HOOK BANK — shape clip 0 / the first line with a DIFFERENT opening pattern each
+    # generation (rotates by request id → deterministic per request, never random, never fixed at
+    # index 0). Only when we're WRITING; a verbatim user script keeps the user's own hook untouched.
+    _hook_directive = ""
+    if not verbatim:
+        _hidx, _hname, _hinstr = _pick_hook_pattern(req.request_id)
+        _hook_directive = f"OPENING HOOK PATTERN #{_hidx} ({_hname}) — {_hinstr}"
+        logger.info(f"[hook-bank] {req.request_id} → pattern #{_hidx} '{_hname}'")
+        act.tick(req.request_id, f"hook pattern: {_hname}")
+    _write_directive = " ".join(x for x in [_script_directive, _hook_directive] if x).strip()
     script = base or brief
     offer_desc = " ".join(x for x in [
         brief,
@@ -7003,7 +7122,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
         from ..services import creative_team as team
         _strategy, script = await team.strategize_and_write(
             offer_desc=offer_desc, vertical=(vertical or "home_insurance"), request_type="ugc",
-            variation_directive=_script_directive)
+            variation_directive=_write_directive)
         script = (script or base or brief).strip()
         # Critic pass — score the opening hook; rewrite only if weak (guards against slop)
         try:
@@ -7029,7 +7148,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
                 f"Vertical: {vertical or 'direct-response'}. ~{seconds}s (~{int(seconds * 2.6)} words). "
                 + (f'Base: "{base[:1000]}". ' if base else "") + (f'Brief: "{brief[:500]}". ' if brief else "")
                 + (f'Must say {offer_value}. ' if offer_value else "")
-                + (_script_directive + " " if _script_directive else "")
+                + (_write_directive + " " if _write_directive else "")
                 + 'Hook hard in the first line, no stage directions. Return JSON {"script":"..."}.')
             script = (d.get("script") or script).strip()
         except Exception:
