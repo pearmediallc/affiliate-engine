@@ -5566,8 +5566,28 @@ async def recipe_generate(req: RunRequest) -> list:
         # present, each clip renders a DIFFERENT background (same person) instead of one setting reused.
         _scene_vars = [s.strip() for s in (assets.get("scene_variations") or []) if isinstance(s, str) and s.strip()]
         _multi_scene = len(_scene_vars) >= 2 and not _continuous_mode
-        try:
-          for ci in range(n_clips):
+        _identity_ref_b = None           # #3 SECOND identity ref: a wider / side, NON-selfie frame from
+                                         # clip 0 → served as @Image2 on changed-angle continuation shots.
+        # #1 PERFORMANCE DIRECTOR — map THIS beat's spoken copy to an emotion + ONE subtle micro-gesture so
+        # the arc follows the SCRIPT (pain → discovery → CTA), not a random rotation. Rendered through
+        # _emotion_cue so it lands as physical face/body cues, never the bare adjective.
+        def _beat_performance(_txt, _idx, _n):
+            _t = (_txt or "").lower()
+            _cta  = re.search(r"\b(tap|click|link|below|visit|sign up|get your|check|enter your|see if|see what)\b", _t)
+            _pain = re.search(r"storm|damage|worried|worry|stress|overpay|expensive|denied|hassle|flood|crack|leak|broke|struggl|afford|\bold\b|bill", _t)
+            _disc = re.search(r"found|turns out|actually|surprised|only|saved|save|cover|approv|easy|fast|quick|simple|realiz", _t)
+            if _cta:  return "confident, warm", "open hand toward camera, relaxed nod"
+            if _pain: return "frustrated, concerned", "slight head shake, glancing away"
+            if _disc: return "surprised, relieved", "eyebrows lift, small nod"
+            if _idx == 0:       return "worried, concerned", "slight head shake, glancing away"
+            if _idx >= _n - 1:  return "confident, warm", "open hand toward camera, relaxed nod"
+            return "surprised, hopeful", "eyebrows lift, small nod"
+
+        async def _render_one(ci):
+            """Render ONE clip end-to-end (setup → prompt → eval loop) → (ci, clip_path, per_ci). Thread-safe
+            for #4 parallel rendering of INDEPENDENT clips: it only READS the shared identity refs (captured
+            from clip 0 BEFORE the pool launches) and mutates no cross-clip state. Continuous/i2v clips keep
+            the sequential caller (they chain off _prev_last_ref, a real data dependency)."""
             per_ci = _per_list[ci] if _per_list else per   # this clip's own duration (script-sized)
             await _abort_if_cancelled(req, f"seedance clip {ci+1}/{n_clips}")
             act.tick(req.request_id, f"Seedance clip {ci+1}/{n_clips} · {per_ci}s · {aspect_ratio}")
@@ -5597,6 +5617,7 @@ async def recipe_generate(req: RunRequest) -> list:
                 # instead of every clip restarting from clip-0's identical pose/spot (the "same video
                 # replayed" tell). setup_mode='continuous' opts back into one seamless take.
                 _continuous = _continuous_mode
+                _angle_shot = False           # #3 set True only for changed-angle shots (then feed Image B)
                 if _multi_scene:
                     # #C TRUE MULTI-SETUP: SAME person, a DIFFERENT LOCATION this clip. @Image1 is a soft
                     # identity hint (Seedance re-synthesizes), so the prompt drives a fully new background.
@@ -5631,16 +5652,33 @@ async def recipe_generate(req: RunRequest) -> list:
                     elif ci == 1:
                         _sb = ("follow shot / over-the-shoulder — as if someone nearby films them from a few feet "
                                "away, a natural non-selfie medium UGC shot (no selfie arm)")
+                        _angle_shot = True          # #3 changed angle → also feed Image B (@Image2)
                     else:
+                        _rot = ci % 3
                         _sb = (["handheld shot, easing to a slightly different natural angle",
                                 "side tracking shot taking in their surroundings",
-                                "slow zoom in, leaning to a closer eye-level framing"][ci % 3])
+                                "slow zoom in, leaning to a closer eye-level framing"][_rot])
+                        _angle_shot = (_rot == 1)   # #3 side-tracking = changed angle → Image B (@Image2)
                     cprompt = (prompt +
                                " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
                                " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
                                " person. Same character and setting as @Image1. Camera for THIS beat: "
                                f"{_sb}. Do NOT restart from the same pose or spot as the previous clip. Hard "
                                "cut to this new shot.")
+                # #3 SECOND REFERENCE (Image B): on a changed-angle shot, also pass the wider / side frame
+                # from clip 0 as @Image2 so the model has a non-selfie angle to match (front A + angle B).
+                if _angle_shot and _identity_ref_b and not _continuous and not _multi_scene:
+                    imgs = ([imgs[0], _identity_ref_b] + imgs[1:]) if imgs else [_identity_ref, _identity_ref_b]
+                    cprompt += (" @Image2 shows the SAME person from a wider, non-selfie angle — match THAT"
+                                " camera framing for this shot while keeping the identical face from @Image1.")
+                # #2 PER-CLIP NEGATIVE (clip 0 EXCLUDED — it may legitimately be the selfie / arm's-length hook).
+                # Continuation clips must not reuse the selfie arm, repeat the previous framing, or bake in text.
+                if _continuous_mode:
+                    _avoid = "Avoid: selfie arm or arm's-length phone-in-hand framing, on-screen text or captions."
+                else:
+                    _avoid = ("Avoid: selfie arm or arm's-length phone-in-hand framing, repeating the previous"
+                              " clip's exact pose or framing, on-screen text or captions.")
+                cprompt = (cprompt + " " + _avoid)[:6000]
             # THIS clip speaks ONLY its own chunk of the script, in sequence — never restart or repeat
             # earlier lines. First clip must speak from the very first frame (no silent hook lead-in).
             _chunk = _vo_chunks[ci] if ci < len(_vo_chunks) else ""
@@ -5675,6 +5713,12 @@ async def recipe_generate(req: RunRequest) -> list:
                            " the person is NO LONGER holding it at arm's length; BOTH hands are free (resting"
                            " naturally or gesturing) while they talk to the propped camera. Locked-off static"
                            " framing, no selfie arm in shot.")[:6000]
+            # #1 PERFORMANCE line (talking beats only — a face cue is meaningless on faceless b-roll):
+            # subtle emotion + micro-gesture derived from THIS clip's copy, rendered as physical cues.
+            if is_talk:
+                _emo, _ges = _beat_performance(_chunk, ci, n_clips)
+                cprompt = (cprompt + " Performance (subtle and natural, no theatrical or exaggerated motion): "
+                           f"{_rpe._emotion_cue(_emo, _ges)}.")[:6000]
             # Route EACH clip through the vision eval loop: the Critic grades the rendered clip,
             # coaches the faulted persona + folds the fix into the prompt, and retries (bounded).
             beat = {"i": ci, "prompt": cprompt, "shot_type": ("talking_head" if is_talk else "broll"), "line": _chunk}
@@ -5695,20 +5739,74 @@ async def recipe_generate(req: RunRequest) -> list:
                     is_continuation=_cont)
 
             cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
-            if cp and os.path.exists(cp):
-                clip_paths.append(cp)
-                # #1 Lock identity from a CLEAN early/mid frame of clip 0 (a stable talking frame — NOT
-                # the fragile last frame) → served as @Image1 for every subsequent clip.
-                if ci == 0 and _identity_ref is None:
-                    _identity_ref = _frame_to_public_url(cp, min(2.0, max(0.5, (per_ci or 8) * 0.4)))
-                    logger.info(f"[generate] character-lock ref {'captured' if _identity_ref else 'FAILED'} from clip 0")
-                # #5 continuous: snapshot THIS clip's near-final frame so the NEXT clip extends from it
-                # (true i2v). Slightly inset from the very end (last frames are the most artefact-prone).
+            return ci, cp, per_ci
+
+        # ── ORCHESTRATION ────────────────────────────────────────────────────────────────────────
+        def _capture_identity(cp, per_ci):
+            # (main coroutine only) capture BOTH identity refs from clip 0's output. #1 Image A = a CLEAN
+            # early/mid talking frame (NOT the fragile last frame). #3 Image B = a later, wider / side frame.
+            nonlocal _identity_ref, _identity_ref_b
+            if _identity_ref is None:
+                _identity_ref = _frame_to_public_url(cp, min(2.0, max(0.5, (per_ci or 8) * 0.4)))
+                logger.info(f"[generate] character-lock ref {'captured' if _identity_ref else 'FAILED'} from clip 0")
+            if _identity_ref_b is None:
+                _bsec = min(max(1.0, (per_ci or 8) * 0.8), (per_ci or 8) - 0.2)
+                _identity_ref_b = _frame_to_public_url(cp, _bsec)
+                logger.info(f"[generate] Image-B angle ref "
+                            f"{'captured' if _identity_ref_b else 'FAILED — A-only'} from clip 0 @~{_bsec:.1f}s")
+
+        async def _capture_prev_last(cp, per_ci):
+            # #5 continuous: snapshot THIS clip's near-final frame so the NEXT clip extends from it (true
+            # i2v). Slightly inset from the very end (last frames are the most artefact-prone).
+            nonlocal _prev_last_ref
+            _cpd = await asyncio.to_thread(_ffprobe_duration, cp)
+            _nl = _frame_to_public_url(cp, max(0.1, (_cpd or per_ci or 6) - 0.2))
+            if _nl:
+                _prev_last_ref = _nl
+
+        try:
+            # #4 CLIP 0 FIRST, ALONE — it renders the identity frames (Image A + #3 Image B) that every
+            # other clip references, so it MUST finish before the rest launch.
+            _ci0, _cp0, _pc0 = await _render_one(0)
+            if _cp0 and os.path.exists(_cp0):
+                clip_paths.append(_cp0)
+                _capture_identity(_cp0, _pc0)
                 if _continuous_mode:
-                    _cpd = await asyncio.to_thread(_ffprobe_duration, cp)
-                    _nl = _frame_to_public_url(cp, max(0.1, (_cpd or per_ci or 6) - 0.2))
-                    if _nl:
-                        _prev_last_ref = _nl
+                    await _capture_prev_last(_cp0, _pc0)
+            _rest = list(range(1, n_clips))
+            # #4 PARALLELIZE only INDEPENDENT clips (each anchored to clip-0's frame, NOT the previous
+            # clip). Continuous/i2v clips chain off _prev_last_ref — a REAL data dependency — so they stay
+            # STRICTLY SEQUENTIAL. A lone continuation clip also stays serial (no benefit).
+            if _rest and not _continuous_mode and len(_rest) >= 2:
+                import concurrent.futures
+                logger.info(f"[generate] rendering {len(_rest)} independent clips CONCURRENTLY (max 4 workers)")
+                _loop = asyncio.get_running_loop()
+                def _render_one_sync(ci):
+                    return asyncio.run(_render_one(ci))   # each worker gets its OWN event loop (clients are per-call)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as _ex:
+                    _futs = [_loop.run_in_executor(_ex, _render_one_sync, ci) for ci in _rest]
+                    _res_list = await asyncio.gather(*_futs, return_exceptions=True)
+                # REASSEMBLE IN ORDER: _res_list follows _rest (1..N-1); append successes in that order.
+                for _off, _res in enumerate(_res_list):
+                    _ci = _rest[_off]
+                    if isinstance(_res, _AllVideoProvidersDown):
+                        logger.warning(f"[generate] clip {_ci+1}/{n_clips} hit provider outage ({_res}) — omitted from stitch")
+                        continue
+                    if isinstance(_res, BaseException):
+                        logger.warning(f"[generate] clip {_ci+1}/{n_clips} render FAILED ({_res}) — omitted from stitch")
+                        continue
+                    _, _cp, _ = _res
+                    if _cp and os.path.exists(_cp):
+                        clip_paths.append(_cp)
+            else:
+                # SEQUENTIAL path (continuous mode / single continuation) — UNCHANGED data flow: each clip
+                # captures its own last frame into _prev_last_ref for the NEXT clip.
+                for ci in _rest:
+                    _rci, _cp, _pc = await _render_one(ci)
+                    if _cp and os.path.exists(_cp):
+                        clip_paths.append(_cp)
+                        if _continuous_mode:
+                            await _capture_prev_last(_cp, _pc)
         except _AllVideoProvidersDown as _pd_exc:
             if clip_paths:
                 logger.warning(f"[generate] t2v ran out mid-stitch ({_pd_exc}) — stitching the "
