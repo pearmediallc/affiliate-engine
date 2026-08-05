@@ -6821,6 +6821,39 @@ def _partition_timeline(b_windows: list, T: float) -> list:
     return segs
 
 
+# WATERMARK VERDICT CACHE — url -> True(watermarked)/False(clean). A clip is vision-graded ONCE per
+# process, so repeated casts (and the second b-roll window) reuse the verdict at zero extra cost.
+_BROLL_WM_CACHE: dict = {}
+
+
+async def _broll_is_watermarked(url: str, local_path: str, work: str) -> bool:
+    """Best-effort: sample ONE frame of a cast b-roll clip and vision-check for a BAKED-IN stock /
+    watermark overlay ('PROTECTED', 'SAMPLE', 'PREVIEW', a tiled logo, a stock-site name/URL) — the
+    pervasive full-frame kind the caption-band scrub CANNOT remove. Returns True to DROP the clip.
+    Cached by URL (graded once per process). Fail-open (False) on ANY error — never blocks rendering,
+    only excludes a clip we are CONFIDENT is watermarked. Bounded: one frame + one vision call/clip."""
+    if url in _BROLL_WM_CACHE:
+        return _BROLL_WM_CACHE[url]
+    verdict = False
+    try:
+        _dur = await asyncio.to_thread(_ffprobe_duration, local_path)
+        frames = await asyncio.to_thread(_extract_frames, local_path, [min(1.0, (_dur or 2) * 0.4)], work)
+        if frames:
+            jr, _eng = await _cross_family_vision(frames[:1],
+                'Look at this single video frame. Is there a BAKED-IN stock-footage WATERMARK or overlay '
+                'covering the picture — the word PROTECTED, SAMPLE, PREVIEW or DEMO, a repeated/tiled '
+                'logo, or a stock-site name or URL (shutterstock, getty, istock, adobe stock, dreamstime, '
+                'pond5)? IGNORE normal signage or text that is genuinely part of the filmed scene. '
+                'Return STRICT JSON {"watermark": true|false}.')
+            if _eng != "none":
+                verdict = ((jr or {}).get("watermark") is True)
+    except Exception as e:
+        logger.warning(f"[ugc-broll] watermark check skipped for a clip ({e}) — keeping it")
+        verdict = False
+    _BROLL_WM_CACHE[url] = verdict
+    return verdict
+
+
 async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str, tag: str = "b") -> str:
     """Build ONE silent WxH/30fps b-roll track of exactly `length` seconds from a pool of clip URLs
     (mirrors recipe_broll's montage loop: download → ~4s cuts, re-window on re-use, scale/crop to
@@ -6829,7 +6862,14 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
     srcs = []
     for u in clip_urls:
         try:
-            srcs.append(await _download_to_temp(u, ".mp4"))
+            _lp = await _download_to_temp(u, ".mp4")
+            # WATERMARK GUARD (bounded, cached): drop a clip carrying a baked stock/watermark overlay —
+            # a pervasive full-frame 'PROTECTED'/stock mark survives the caption-band scrub and must
+            # never ship. Fall through to the next candidate in the pool.
+            if await _broll_is_watermarked(u, _lp, work):
+                logger.warning(f"[ugc-broll] {tag} DROPPING watermarked clip (baked stock overlay): {u[:90]}")
+                continue
+            srcs.append(_lp)
         except Exception as de:
             logger.warning(f"[ugc-broll] {tag} clip download failed: {de}")
     if not srcs:
@@ -7287,16 +7327,25 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
         except Exception as _fqe:
             logger.warning(f"[avatar-lipsync] eval gate skipped: {_fqe}")
 
-    # ── HONOR THE GATE — BLOCK a bad delivery instead of shipping it (sem already released) ──────────
-    # A confident FAIL must FAIL the job with the REAL reason (or a plain talking-head when UGC+B-Roll
-    # was requested — see _eval_gate's b-roll-presence check). Fail-open on internal error → only a
-    # genuine, high-confidence fault reaches here. The caller catches this and fires the failed callback.
-    if _eval.get("deliver") is False:
-        _gate_reasons = (_eval.get("reasons") or [])[:3]
-        _set_lipsync_status(request_id, "failed", "QA: " + "; ".join(_gate_reasons)[:250])
-        raise RuntimeError("QA gate blocked delivery: " + "; ".join(_gate_reasons))
+    # ── HONOR THE GATE — but keep the render VIEWABLE (SOFT block) ────────────────────────────────
+    # A confident FAIL no longer HIDES the video. Hard-failing left the user with a failed job and
+    # NOTHING to watch, so they could not see WHAT was wrong. Instead: still deliver the rendered file,
+    # but FLAG the variant (blocked=true / qa_failed=true + qa_reasons) so CL/ORBIT shows it with a
+    # "blocked" badge and the gate's reasons. The gate's JUDGMENT is fully preserved (it still says
+    # "not deliverable" and why) — we just don't throw the artifact away. The file always exists here
+    # (the variant was produced + persisted above), so there is always something viewable to surface.
+    # Genuinely broken cases (no render, lip-sync timeout, pre-render gender block) still hard-fail on
+    # their own paths upstream — only this FINAL deliver-gate is softened.
+    _gate_blocked = (_eval.get("deliver") is False)
+    if _gate_blocked:
+        _gate_reasons = (_eval.get("reasons") or [])[:5]
+        _set_lipsync_status(request_id, "blocked", "QA: " + "; ".join(_gate_reasons)[:250])
+        variant.update({"blocked": True, "qa_failed": True, "qa_reasons": _gate_reasons,
+                        "qa_note": "QA blocked (viewable for review): " + "; ".join(_gate_reasons)[:280]})
+        logger.warning(f"[avatar-lipsync] {request_id}: QA gate BLOCKED — surfacing the render FLAGGED "
+                       f"for review (not hidden): {_gate_reasons}")
 
-    return {"variant": variant, "eval": _eval, "broll_applied": _broll_applied,
+    return {"variant": variant, "eval": _eval, "broll_applied": _broll_applied, "blocked": _gate_blocked,
             "ugc_broll_note": _ugc_broll_note, "cap_words": _cap_words, "cap_method": _cap_method,
             "cap_err": _cap_err, "use_veed": _use_veed, "ass_path": ass_path, "seconds": seconds}
 
@@ -8046,9 +8095,11 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
           + (f" · ⚠ {_axis_note}" if _axis_note else "")
           + (f" · UGC-BROLL: {_ugc_broll_note}" if _ugc_broll_note else "")
           + (f" · ⚠ captions failed: {_cap_err}" if _cap_err else ""))
-    # A deliver=False take already RAISED above (hard-blocked), so it never reaches here. A PASS that
-    # still carries soft issues (semantic nits, spec drift) is annotated on the creative — same soft
-    # note the multi-clip path surfaces — so a shipped take honestly shows what QA saw.
+    # A deliver=False take is now SOFT-blocked (surfaced FLAGGED, not hidden) — mark it clearly on the
+    # creative so the viewer sees it is blocked-for-review, then append what QA saw. A PASS that still
+    # carries soft issues (semantic nits, spec drift) is annotated the same way the multi-clip path is.
+    if _fin.get("blocked"):
+        fb = "⛔ BLOCKED (viewable for review) · " + fb
     if _eval.get("issues"):
         fb += " ⚠ QA: " + "; ".join((_eval.get("issues") or [])[:2])
     # MODELS MANIFEST — structured, stable keys, human-readable values (surfaced by the frontend);
