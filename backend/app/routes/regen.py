@@ -5012,15 +5012,30 @@ def _burn_disclaimers(video_path: str, caption_words: list, out_path: str, timeo
         H = int(_H or 1920)
         fs = max(14, int(H * 0.016))          # small
         col = "white@0.9"; bw = max(1, int(H * 0.0015)); bc = "black@0.65"
-        # BOTH disclaimers at the VERY END — last ~4s, stacked ('rates may vary' just above 'AI
-        # GENERATED CONTENT'). (Was: 'rates may vary' during $ windows — moved per request.)
-        _t = max(0.0, dur - 4.0) if dur > 4.5 else 0.0
-        filters = [
-            f"drawtext=text='rates may vary':x=(w-text_w)/2:y=h-text_h-{int(H*0.058)}:"
-            f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='gte(t\\,{_t:.2f})'",
-            f"drawtext=text='AI GENERATED CONTENT':x=(w-text_w)/2:y=h-text_h-{int(H*0.02)}:"
-            f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='gte(t\\,{_t:.2f})'",
-        ]
+        filters = []
+        # 'rates may vary' — WHILE a $ amount is on screen (from the caption word timings), per request.
+        wins = []
+        for w in (caption_words or []):
+            if "$" in str(w.get("word") or ""):
+                s = float(w.get("start") or 0); e = float(w.get("end") or s) + 2.5
+                wins.append((s, e))
+        wins.sort(); merged = []
+        for s, e in wins:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        if merged:
+            en = "+".join(f"between(t\\,{s:.2f}\\,{e:.2f})" for s, e in merged)
+            filters.append(f"drawtext=text='rates may vary':x=(w-text_w)/2:y=h-text_h-{int(H*0.058)}:"
+                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:enable='{en}'")
+        # 'AI GENERATED CONTENT' — very bottom, LAST 3s only.
+        if dur > 3.2:
+            filters.append(f"drawtext=text='AI GENERATED CONTENT':x=(w-text_w)/2:y=h-text_h-{int(H*0.02)}:"
+                           f"fontsize={fs}:fontcolor={col}:borderw={bw}:bordercolor={bc}:"
+                           f"enable='gte(t\\,{dur - 3.0:.2f})'")
+        if not filters:
+            return False
         _ffmpeg(["-i", video_path, "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
                  "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-y", out_path], timeout=timeout)
         ok = os.path.exists(out_path) and (_ffprobe_duration(out_path) or 0) > 0
