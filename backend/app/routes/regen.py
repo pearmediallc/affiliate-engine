@@ -6493,8 +6493,9 @@ def _clean_script(s: str) -> str:
 # ONE PORTRAIT 9:16 CANVAS for every UGC deliverable — the talking head, every b-roll clip, the
 # caption burn AND the stitch all render at THIS size. Real library footage is often 16:9 landscape;
 # inheriting its aspect is exactly what shipped a 1280x720 landscape ad. Force portrait everywhere
-# (center-crop to FILL, never letterbox). 720x1280 keeps the full source height on a landscape crop.
-_V9x16 = (720, 1280)
+# (center-crop to FILL, never letterbox). 480x854 = 9:16 at the pinned 480p short-side (user decision,
+# not 720p); bump both dims here if a higher-res 9:16 is ever wanted.
+_V9x16 = (480, 854)
 
 
 async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None, kinetic=False):
