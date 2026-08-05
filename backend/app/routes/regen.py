@@ -5178,6 +5178,54 @@ async def recipe_generate(req: RunRequest) -> list:
     if not prompt:
         raise RuntimeError("generate: prompt required")
 
+    # ── PASS-THROUGH vs CURATION ────────────────────────────────────────────────────────────────
+    # A detailed user prompt (camera/scene/character direction, "same person as reference image") AND/OR
+    # a reference image is AUTHORITATIVE: route + generate, do NOT let the office compose its own visual
+    # prompt or invent a scene. The reference image anchors BOTH the character AND the scene on EVERY clip
+    # (no per-clip scene invention, no multi-setup) — analogous to the verbatim-SCRIPT rule, but for the
+    # whole visual direction. Thin briefs (no image, little detail) keep the office curation unchanged.
+    _has_ref_image = bool(image_urls)
+    # Require GENUINE camera/shot direction (words that appear in a VISUAL brief, never in spoken ad copy)
+    # so a plain spoken script never trips pass-through and gets staged as on-screen visuals.
+    _detailed_prompt = (len(prompt.split()) >= 25 and bool(re.search(
+        r"\b(locked[- ]?off|static shot|close[- ]?up|wide shot|medium shot|camera|framing|"
+        r"reference image|same (?:man|woman|person|guy|face|character) (?:as|from|in)|do not change|"
+        r"no zoom|selfie|handheld|dolly|tracking shot)\b", prompt, re.I)))
+    _passthrough = _has_ref_image or _detailed_prompt
+    _locked = _has_ref_image   # reference image locks scene+character across clips (no scene drift)
+    if _passthrough:
+        logger.info("[generate] PASS-THROUGH: "
+                    + (" + ".join([x for x in ("reference image" if _has_ref_image else "",
+                                               "detailed visual direction" if _detailed_prompt else "") if x]))
+                    + " — using the user's prompt verbatim as the visual direction, office visual curation "
+                      "bypassed" + ("; scene+character LOCKED to the reference image" if _locked else ""))
+
+    # GENDER from the user's own words drives BOTH the cast and the voice — "same man / older male voice /
+    # he / his" must never become a female avatar/voice. Fill only when the caller stated none (an explicit
+    # trait always wins). Applied before the avatar match-gate + voice cast below.
+    if not str(assets.get("gender") or "").strip():
+        _pg = ("male" if re.search(r"\b(man|male|guy|gentleman|he|him|his|father|dad|husband|grandpa|mr)\b", prompt, re.I)
+               else ("female" if re.search(r"\b(woman|female|lady|she|her|mother|mom|wife|grandma|mrs|girl)\b", prompt, re.I)
+                     else ""))
+        if _pg:
+            assets = {**assets, "gender": _pg}
+            req.assets = {**(req.assets or {}), "gender": _pg}
+            logger.info(f"[generate] gender inferred from the prompt → {_pg}")
+
+    # RULE 2 — EDIT-THEN-USE: if the user attached a reference image AND asked to CHANGE an attribute of it
+    # (e.g. "make him older/younger", "change the age") before using it, the image should be EDITED FIRST
+    # (only that attribute changes; same quality/style/type) and the edited image used as the frame-0 anchor.
+    # HOOK ONLY: no input-image (img2img) edit model is wired today — the image lane is Imagen-4
+    # text-to-image and Kie's qwen2/image-edit is not plumbed for an input image. So we DETECT the intent,
+    # log it loudly, and proceed with the ORIGINAL image (RULE 1). To complete this, call an image-edit model
+    # (qwen2/image-edit · Gemini flash-image · flux-kontext) HERE and set image_urls[0] = edited before render.
+    if _has_ref_image and re.search(
+            r"\b(make (?:him|her|them)\s+(?:look\s+)?(?:older|younger)|change (?:his|her|their|the)\s+age|"
+            r"de-?age|age (?:him|her|them)\s+(?:up|down)|(?:older|younger)\s+version)\b", prompt, re.I):
+        logger.warning("[generate] RULE 2 edit-then-use requested (attribute change on the reference image), "
+                       "but NO input-image edit model is wired — proceeding with the ORIGINAL reference image. "
+                       "TODO: wire qwen2/image-edit or Gemini flash-image here to apply the edit first.")
+
     work = tempfile.mkdtemp()
     W, H = 1080, 1920
     NO_TEXT = (" ABSOLUTELY NO on-screen text, captions, subtitles, burned-in words, logos or "
@@ -5229,7 +5277,14 @@ async def recipe_generate(req: RunRequest) -> list:
                 omit_spoken_line=True,
                 run_critic=True)
             refined = (plan.get("beats") or [{}])[0].get("prompt")
-            if refined:
+            if refined and _passthrough:
+                # PASS-THROUGH: the user gave a reference image and/or a full visual direction — that is
+                # authoritative. Do NOT replace it with the office's composed beat direction; route +
+                # generate on the user's own words. (Same principle as the verbatim-SCRIPT rule, applied
+                # to the whole visual prompt.) The office plan is still used for ROUTING + script fallback.
+                logger.info("[generate] pass-through: keeping the user's prompt as the visual direction "
+                            "(office beat composition not applied)")
+            elif refined:
                 # VISUAL vs SPOKEN separation. Keeping the whole ad script inside the VISUAL prompt
                 # made Seedance literally STAGE the ad copy — that is where the wrong/exaggerated
                 # facial expressions and off-model characters came from. When the office produced a
@@ -5305,11 +5360,20 @@ async def recipe_generate(req: RunRequest) -> list:
         if _asked_broll and _avatar_plan:
             _avatar_plan = False
             logger.info("[generate] request_type=broll → overriding talking-head plan, staying t2v")
-        if not _avatar_plan and is_talk and not video_urls and not _asked_broll and _gen_path != "scratch":
+        # REFERENCE IMAGE = the character+scene ANCHOR → this is an image-conditioned text-to-video job,
+        # NOT avatar-lipsync (which casts a RANDOM library face, ignoring the image AND its gender — the
+        # exact bug where "same man from reference image" became a random female avatar). The old reroute
+        # only checked for a reference VIDEO, never the image. An attached image keeps the job on t2v.
+        if _avatar_plan and _has_ref_image:
+            _avatar_plan = False
+            logger.info("[generate] reference image attached → image-conditioned text-to-video "
+                        "(character+scene anchor); avatar-lipsync reroute disabled")
+        if (not _avatar_plan and is_talk and not video_urls and not _has_ref_image
+                and not _asked_broll and _gen_path != "scratch"):
             _cl0 = req.assets if isinstance(req.assets, dict) else {}
             if _cl0.get("fallback_avatar_url") or _cl0.get("library_avatar_url"):
                 _avatar_plan = True
-                logger.info("[generate] talking-head UGC + castable avatar + no reference video → "
+                logger.info("[generate] talking-head UGC + castable avatar + no reference video/image → "
                             "preferring funded avatar-lipsync over text-to-video")
         # USER FORCED SCRATCH: never reuse a real library clip — text-to-video only, no matter what the
         # brain's plan routed. (The match-gate below still applies in 'auto'.)
@@ -5641,7 +5705,10 @@ async def recipe_generate(req: RunRequest) -> list:
         # #C MULTI-SETUP: a per-clip list of DISTINCT locations (parsed from "Settings: (1)… (2)…"). When
         # present, each clip renders a DIFFERENT background (same person) instead of one setting reused.
         _scene_vars = [s.strip() for s in (assets.get("scene_variations") or []) if isinstance(s, str) and s.strip()]
-        _multi_scene = len(_scene_vars) >= 2 and not _continuous_mode
+        # SCENE LOCK: a reference image fixes the setting for the WHOLE video — never invent per-clip
+        # locations (no multi-setup) when the image is the anchor. Every clip is the same person in the
+        # same reference scene.
+        _multi_scene = len(_scene_vars) >= 2 and not _continuous_mode and not _locked
         _identity_ref_b = None           # #3 SECOND identity ref: a wider / side, NON-selfie frame from
                                          # clip 0 → served as @Image2 on changed-angle continuation shots.
         # #1 PERFORMANCE DIRECTOR — map THIS beat's spoken copy to an emotion + ONE subtle micro-gesture so
@@ -5674,7 +5741,29 @@ async def recipe_generate(req: RunRequest) -> list:
                 # director baked into `prompt`), so it doesn't blend every setting into one.
                 cprompt = prompt + (f" SETTING for THIS clip: {_scene_vars[0]}. The person films selfie-style"
                                     " in this exact location.")
-            if ci > 0:
+            if ci == 0 and _locked and imgs:
+                # RULE 1 — the reference image is the LITERAL starting frame: the person, scene and framing
+                # ARE @Image1 and must not change. Kie-Seedance conditions on @Image1 as a strong reference
+                # (soft first-frame); the Veo image-to-video lane makes it the true frame-0 (see report).
+                cprompt = (prompt +
+                           " @Image1 IS the exact first frame of this video — the identical person, face,"
+                           " wardrobe, background, framing and lighting. Begin ON that exact frame and animate"
+                           " forward naturally; do NOT re-imagine, restyle or change the person or the scene.")
+            if ci > 0 and _locked:
+                # PASS-THROUGH SCENE+CHARACTER LOCK: the reference image fixes the PERSON and the SCENE for
+                # the WHOLE video. Every continuation clip re-uses the user's reference image as the @Image1
+                # anchor and the SAME visual prompt — NO camera-brain, NO angle/shot variation, NO new
+                # location. It reads as one continuous locked-off shot of the same person in the same place.
+                _anchor = (image_urls[0] if image_urls else None) or _identity_ref
+                if _anchor:
+                    imgs = [_anchor] + [u for u in imgs if u != _anchor]
+                cprompt = (prompt +
+                           " @Image1 IS the exact same person AND the exact same scene, framing and lighting —"
+                           " identical face, hair, wardrobe, background and camera as @Image1. Do NOT change"
+                           " the person, the setting or the framing in any way; keep the SAME locked-off shot,"
+                           " no new camera move, no zoom, no angle change, no new location — simply continue"
+                           " the moment forward.")
+            elif ci > 0:
                 # #1 CHARACTER LOCK. Anchor EVERY continuation clip to the SAME stable identity frame
                 # captured from clip 0 (a clean early/mid talking frame — see below). The OLD code grabbed
                 # clip 0's LAST frame ((_pd-0.05)s) and served it as the next clip's first-frame — but that
