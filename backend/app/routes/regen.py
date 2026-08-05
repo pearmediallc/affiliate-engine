@@ -5617,19 +5617,24 @@ async def recipe_generate(req: RunRequest) -> list:
                     # A reveal/number line earns a slow push-in; the CTA wants a steady locked-off medium;
                     # right after the hook, switch to a non-selfie "someone-else-filming" angle; otherwise
                     # a natural fresh handheld angle. It only changes the camera when it serves the story.
+                    # Named movements from the library (aicameramovements.com), curated to the ones that
+                    # fit a handheld UGC talking head. Price detection requires a REAL price cue ($ / dollars
+                    # / a month / percent) — not any 2+ digit number (a year or '20 minutes' won't push-in).
                     _bt = (_vo_chunks[ci] if ci < len(_vo_chunks) else "").lower()
-                    if re.search(r"\b(tap|click|link|below|enter your|check your|sign up|visit|get your|see what)\b", _bt):
-                        _sb = ("a STEADY, locked-off medium shot — phone propped or held still, calm and "
-                               "direct to camera for the call-to-action")
-                    elif re.search(r"[$%]|\b\d{2,}\b", _bt):
-                        _sb = "a slow, subtle PUSH-IN toward the face on this reveal, holding steady for emphasis"
+                    _is_cta = re.search(r"\b(tap|click|link|below|enter your|check your|sign up|visit|get your|see what)\b", _bt)
+                    _is_price = re.search(r"\$|\b\d+\s*(?:dollars?|/mo|a\s*month|per\s*month|percent)\b|\bpercent\b", _bt)
+                    if _is_cta:
+                        _sb = ("locked-off static shot, steady medium framing — phone propped or held still, "
+                               "calm and direct to camera for the call-to-action")
+                    elif _is_price:
+                        _sb = "slow dolly in / slow zoom in — a subtle PUSH-IN on the face for this number/reveal"
                     elif ci == 1:
-                        _sb = ("a NON-SELFIE angle — as if someone nearby is filming them from a few feet away, "
-                               "a natural medium UGC shot (no selfie arm)")
+                        _sb = ("follow shot / over-the-shoulder — as if someone nearby films them from a few feet "
+                               "away, a natural non-selfie medium UGC shot (no selfie arm)")
                     else:
-                        _sb = (["a slightly different natural handheld angle, easing the framing",
-                                "an over-the-shoulder or side-profile UGC angle taking in their surroundings",
-                                "a closer eye-level framing, leaning in a touch"][ci % 3])
+                        _sb = (["handheld shot, easing to a slightly different natural angle",
+                                "side tracking shot taking in their surroundings",
+                                "slow zoom in, leaning to a closer eye-level framing"][ci % 3])
                     cprompt = (prompt +
                                " @Image1 is the EXACT SAME PERSON who must appear in this clip — identical"
                                " face, hair, skin, age and wardrobe as @Image1; do NOT generate a different"
