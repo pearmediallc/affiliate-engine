@@ -4679,8 +4679,12 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     #     lighting/layout).
     #   • THEN the minimal controlled action (subtle talk, slight head glance, breathing) — locked-off,
     #     no camera move/zoom. Motion kept SUBTLE and deliberately under-prompted so nothing drifts.
-    per = 8
-    n_clips = max(1, min(6, _math.ceil(max(vo_sec, per) / per)))
+    # Seedance 2.0 renders a SINGLE clip up to ~15s (range 4-15s — the SAME cap the t2v lane uses at
+    # L6056/6074). This is ONE continuous locked-off shot, so MINIMIZE clip count to cut seams/drift/
+    # cost: fewest clips (ceil(vo/15)) with the duration DISTRIBUTED EVENLY (per = ceil(vo/n) → uniform
+    # length). So a ~40s read = 3 x ~13s (not 5 x 8s), and anything <=15s stays a SINGLE clip (no chunk).
+    n_clips = max(1, _math.ceil(vo_sec / 15))
+    per = max(4, min(15, _math.ceil(vo_sec / n_clips)))
     motion = (
         frozen["prompt"].strip() +                                              # [MIRROR THE REFERENCE]
         " The reference image (@Image1) IS frame 0 of this video — the identical person (same face, "
