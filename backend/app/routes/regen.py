@@ -4617,152 +4617,192 @@ def _refvideo_mark(request_id: str, status: str, error: str = None, provider: st
 
 
 async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
-    """THE reference-video render — KIE / SEEDANCE ONLY (no Veo). Silent i2v of the locked shot +
-    a GENDER-HARD voice reading the script VERBATIM, muxed over it. Per-clip engine order:
-      PRIMARY  fal-seedance image-to-video — the image is the TRUE frame-0 (recast-avatar lane ~2131);
-               it honors 'the image must not change'.
-      FALLBACK Kie bytedance/seedance-2 image-to-video — a SOFT @Image1 reference (re-synthesis, not a
-               frozen frame), so it is the fallback, not the primary.
-    Both lanes are silent, so the gender-locked verbatim TTS below owns the audio (guaranteed script +
-    voice). Same locked scene throughout: every clip is i2v from the SAME reference image (no new scene,
-    no beats). MEMORY: clips rendered + released one at a time."""
+    """THE reference-video render — KIE / SEEDANCE ONLY (no Veo), but now ALIVE + lip-synced, the way
+    the proven t2v lane (recipe_generate) works — only ANCHORED to the reference image and DIRECTOR-FREE.
+
+    Per clip: image-to-video with `generate_audio=True` so Seedance speaks that clip's portion of the
+    VERBATIM script with REAL lip-sync + a gender-correct voice (NATIVE audio, no detached muxed TTS).
+    The reference image is the frame-0 anchor (`reference_image_urls`) on EVERY clip so the character +
+    scene stay identical. The script is split across clips exactly like recipe_generate (chunk to ~46
+    words → size each clip to Seedance's real ~3.4 w/s pace), each clip runs through the same proven
+    vision-QA loop (_gen_beat_with_eval), clips are stitched with xfade/acrossfade TRANSITIONS, and
+    whisper+ASS CAPTIONS are burned on the final audio. Per-clip engine order:
+      PRIMARY  Kie bytedance/seedance-2 — image as Frame-0 anchor + NATIVE audio (talking + lip-sync).
+      FALLBACK fal-seedance (also true frame-0, but SILENT) — used only if the Kie lane errors; a
+               gender-locked TTS backstop then narrates the verbatim script so it's never silent.
+    The DYNAMIC prompt replaces the old 'locked-off / statue / minimal breathing' text: the same person
+    from @Image1 speaking naturally and expressively, natural head/hand motion — only the SCENE stays
+    fixed (single_shot = one continuous scene, NOT a frozen frame). MEMORY: clips rendered + released
+    one at a time."""
     from ..services import fal_video as fv
     from ..services.kieai_service import KieAIService
     from ..services import voice_studio as vs
     from ..services import creative_team_activity as act
+    from ..services import realism_prompt_engine as _rpe
     import math as _math
     ref_img = frozen["image_urls"][0]
     aspect = frozen["aspect_ratio"]
     resolution = frozen["resolution"]
-    script = frozen["script"]
+    script = (frozen["script"] or "").strip()
     gender = frozen["gender"]
     dry_run = bool(frozen.get("dry_run"))
 
-    # 1) VOICE — gender is a HARD filter (a 'man' request can NEVER get a woman's voice). TTS drives
-    #    runtime: synth first, then render exactly enough locked-shot footage to cover the voiceover.
-    #    DURATION — honor an explicit caller `seconds`; otherwise SIZE TO THE VERBATIM SCRIPT so the
-    #    locked footage spans the ENTIRE read (never a truncated/sped-up 12s default). Use the SAME
-    #    ~2.5 w/s (150 wpm) VO pace the rest of the pipeline uses — estimate_audio_seconds_from_text,
-    #    which _fit_script_to_seconds (budget=2.5*seconds) + the studio length estimate already share —
-    #    so the footage matches the gender-locked TTS that gets muxed. DRY-RUN skips TTS entirely (no
-    #    synth spend) and relies on this script-sized estimate; the non-dry-run path below refines it
-    #    with the ACTUAL synthesized-audio duration.
-    vo_path = None
+    # 1) DURATION + PER-CLIP SCRIPT SPLIT — sized to the VERBATIM SCRIPT exactly like the proven t2v
+    #    lane (recipe_generate): chunk to ~46 words, then size EACH clip to Seedance's REAL ~3.4 w/s
+    #    delivery so a clip ends when its words do (no empty tail to improvise garbage into). Minimal
+    #    clip count, even coverage; anything <=~15s stays a single clip. An explicit `seconds` is a CAP
+    #    (+25% overrun so the read finishes, then drop the tail) rather than a crammed short window.
+    _explicit_sec = None
     if frozen.get("seconds") and str(frozen.get("seconds")).lower() != "auto":
-        vo_sec = int(frozen.get("seconds"))                                     # explicit caller duration wins
-    elif script:
-        from ..services.cost_tracker import estimate_audio_seconds_from_text
-        vo_sec = int(_math.ceil(estimate_audio_seconds_from_text(script)))      # size to the verbatim script (~2.5 w/s)
-    else:
-        vo_sec = 12                                                             # no script + no seconds → minimal default
-    if script and not dry_run:
-        act.tick(req.request_id, "casting a gender-matched voice + reading the script verbatim")
-        if gender not in ("male", "female"):
-            raise RuntimeError("reference-video (fal lane): character gender unknown — refusing to guess a "
-                               "voice (a 'man' request must never ship a woman's voice)")
-        voice = vs.pick_voice(gender=gender)   # HARD gender filter; raises if the gender is unknown
-        vo_path = os.path.join(work, "refvo.mp3")
-        await asyncio.to_thread(lambda: vs.synthesize(script, voice_id=voice.get("id"), out_path=vo_path))
         try:
-            vo_sec = int(_math.ceil(await asyncio.to_thread(_ffprobe_duration, vo_path))) or vo_sec
+            _explicit_sec = int(frozen.get("seconds"))
         except Exception:
-            pass
+            _explicit_sec = None
+    def _clip_secs(_txt):
+        return max(4, min(15, _math.ceil(len((_txt or "").split()) / 3.4)))
+    chunks = _rpe.split_into_clips(script, max_words=46) if script else []
+    if chunks:
+        n_clips = max(1, min(len(chunks), 8))            # 8-clip safety ceiling against a runaway split
+        chunks = chunks[:n_clips]
+        per_list = [_clip_secs(c) for c in chunks]
+        if _explicit_sec and _explicit_sec > 0:
+            _budget = _explicit_sec * 1.25
+            _acc = _keep = 0
+            for _s in per_list:
+                if _acc + _s > _budget and _keep >= 1:
+                    break
+                _acc += _s; _keep += 1
+            chunks, per_list, n_clips = chunks[:_keep], per_list[:_keep], _keep
+    else:
+        vo_sec = _explicit_sec or 12                     # no script → single locked scene, even split
+        n_clips = max(1, _math.ceil(vo_sec / 15))
+        _p = max(4, min(15, _math.ceil(vo_sec / n_clips)))
+        chunks, per_list = [""] * n_clips, [_p] * n_clips
+    vo_sec = sum(per_list)
 
-    # 2) FOOTAGE — locked-off i2v from the SAME reference frame, enough clips to cover the VO. Every
-    #    clip is anchored to ref_img (single scene/character). Per-clip engine order: Kie bytedance/
-    #    seedance-2 (the user's platform + credits; anchors the image as Frame 0) FIRST, then fal-seedance
-    #    (also true frame-0) as the fallback. BOTH lock the input image as frame 0 — no Veo anywhere.
-    #
-    # PROMPT COMPOSITION for max fidelity = [MIRROR THE REFERENCE first] + [CONTROLLED ACTION]:
-    #   • FIRST restate what is ALREADY in the image/user prompt (character + setting) — frozen["prompt"]
-    #     IS that reference description, so it LEADS and anchors frame-0 (face/hair/wardrobe + background/
-    #     lighting/layout).
-    #   • THEN the minimal controlled action (subtle talk, slight head glance, breathing) — locked-off,
-    #     no camera move/zoom. Motion kept SUBTLE and deliberately under-prompted so nothing drifts.
-    # Seedance 2.0 renders a SINGLE clip up to ~15s (range 4-15s — the SAME cap the t2v lane uses at
-    # L6056/6074). This is ONE continuous locked-off shot, so MINIMIZE clip count to cut seams/drift/
-    # cost: fewest clips (ceil(vo/15)) with the duration DISTRIBUTED EVENLY (per = ceil(vo/n) → uniform
-    # length). So a ~40s read = 3 x ~13s (not 5 x 8s), and anything <=15s stays a SINGLE clip (no chunk).
-    n_clips = max(1, _math.ceil(vo_sec / 15))
-    per = max(4, min(15, _math.ceil(vo_sec / n_clips)))
-    motion = (
-        frozen["prompt"].strip() +                                              # [MIRROR THE REFERENCE]
-        " The reference image (@Image1) IS frame 0 of this video — the identical person (same face, "
-        "hair, wardrobe) in the identical setting (same background, lighting and layout); keep them "
-        "EXACTLY as in the reference, do NOT change, restyle or replace the person or the scene." +
-        " Minimal controlled motion only: natural talking with subtle mouth movement, calm relaxed "     # [CONTROLLED ACTION]
-        "face, a slight natural head glance toward the camera, subtle breathing. Locked-off static shot "
-        "from a fixed camera — no camera movement, no zoom, no pan, no cuts, no scene change; same "
-        "person, same scene throughout." + _REFVIDEO_NO_TEXT)[:1900]
+    # 2) DYNAMIC, ALIVE, IMAGE-ANCHORED prompt (DIRECTOR-FREE — no run_creative_team). LEAD with the
+    #    user's own reference description (mirrors face + scene → anchors frame-0), then the ALIVE
+    #    talking action (the OLD 'locked-off / statue / minimal breathing' text is GONE), then the
+    #    proven anti-slop realism layer (prompt-level realism, NEVER a post-filter) + no-on-screen-text.
+    #    Gender is prompted (older male → a male speaking voice) so the NATIVE audio matches.
+    _who = {"male": "man", "female": "woman"}.get(gender, "person")
+    _voice_lock = (f" A clear, natural {'male' if gender == 'male' else 'female'} speaking voice."
+                   if gender in ("male", "female") else "")
+    # single_shot now = ONE CONTINUOUS SCENE (person still talks + moves), NOT a frozen frame.
+    _scene_lock = (" One continuous scene — the person keeps talking and moving, but do NOT change the "
+                   "location or setup and do NOT hard-cut to a different place; same scene throughout."
+                   if frozen.get("single_shot") else "")
+    base_prompt = (
+        (frozen["prompt"].strip() + " " if frozen["prompt"].strip() else "") +
+        f"The same {_who} from @Image1 speaking naturally and expressively to camera — clear natural "
+        "mouth movement and talking, warm engaged expression, natural head movement and subtle hand "
+        "gestures, personable and alive; keep the IDENTICAL face, hair and wardrobe and the IDENTICAL "
+        "setting/background from the reference image — same person, same scene throughout. @Image1 IS "
+        "frame 0 of this video: begin on that exact person and scene and animate forward naturally; do "
+        "NOT restyle or replace the person or the scene." + _voice_lock + _scene_lock +
+        " " + _rpe.REALISM_LAYER + _REFVIDEO_NO_TEXT)
 
-    # DRY-RUN — everything above (frozen inputs, gender, verbatim script, single_shot, the EXACT
-    # mirror-then-action prompt, model/aspect/resolution/duration, frame-0 image) is now composed.
-    # STOP here: do NOT call Kie/Seedance, do NOT run TTS/lip-sync/compositing, spend nothing. Return
-    # the captured payload so recipe_reference_video can surface it via the request API.
+    def _clip_prompt(ci):
+        # THIS clip speaks ONLY its own chunk of the verbatim script, in sequence — same per-clip
+        # SPOKEN LINE contract the t2v lane uses (kills the "same opening rendered twice" bug).
+        cp = base_prompt
+        _chunk = chunks[ci] if ci < len(chunks) else ""
+        if _chunk:
+            _hook = (" The person is ALREADY speaking from the very first frame — no silent lead-in, "
+                     "no dead air in the opening." if ci == 0 else "")
+            cp = (cp + f' SPOKEN LINE FOR THIS CLIP — say ONLY this, word for word, and do NOT repeat '
+                  f'any earlier line: "{_chunk}".' + _hook)
+        return cp[:6000]
+
+    # DRY-RUN — compose the exact per-clip Seedance requests (now generate_audio:true, dynamic alive
+    # prompt, per-clip verbatim split, captions + xfade transitions) and STOP: no Kie/fal, no TTS, no
+    # spend. Surfaced by recipe_reference_video via the request API so a re-run shows the NEW payload.
     if dry_run:
-        clips_preview = [{"index": i, "prompt": motion, "duration": per,
-                          "model": "bytedance/seedance-2", "reference_image_urls": [ref_img]}
+        clips_preview = [{"index": i, "prompt": _clip_prompt(i), "duration": per_list[i],
+                          "model": "bytedance/seedance-2", "reference_image_urls": [ref_img],
+                          "generate_audio": True, "spoken_line": (chunks[i] if i < len(chunks) else "")}
                          for i in range(n_clips)]
         preview = {
             "engine": "seedance", "model": "bytedance/seedance-2",
-            "prompt": motion, "reference_image_urls": [ref_img],
-            "aspect": aspect, "resolution": resolution, "seconds": per,
+            "prompt": _clip_prompt(0), "reference_image_urls": [ref_img],
+            "aspect": aspect, "resolution": resolution, "seconds": vo_sec,
             "gender": gender or None, "script": script,
             "single_shot": bool(frozen.get("single_shot")),
-            "generate_audio": False, "n_clips": n_clips, "vo_seconds_estimate": vo_sec,
-            "clips": clips_preview,
+            "generate_audio": True, "captions": True, "transitions": "xfade",
+            "director": "bypassed", "n_clips": n_clips, "vo_seconds_estimate": vo_sec,
+            "per_clip_seconds": per_list, "clips": clips_preview,
         }
-        logger.info(f"[refvideo][dry-run] SEEDANCE PROMPT (model=bytedance/seedance-2, {n_clips} clip(s), "
-                    f"{resolution}/{aspect}/{per}s, gender={gender or 'unknown'}, image={ref_img}): "
-                    f"{motion[:1400]}")
+        logger.info(f"[refvideo][dry-run] SEEDANCE (audio+captions+xfade, {n_clips} clip(s), "
+                    f"{resolution}/{aspect}, gender={gender or 'unknown'}, image={ref_img}): "
+                    f"{_clip_prompt(0)[:1200]}")
         return {"dry_run": True, "preview": preview, "provider": "dry-run",
-                "segments": n_clips, "true_first_frame": True, "native_audio": False}
+                "segments": n_clips, "true_first_frame": True, "native_audio": True,
+                "captions_burned": True, "audio_state": "native"}
 
-    def _kie_seedance():
-        # PRIMARY — Kie bytedance/seedance-2: the reference image goes in as the Frame-0 anchor (i2v
-        # first-frame input via reference_image_urls, @Image1 in the prompt). Silent (generate_audio=
-        # False) so the gender-locked verbatim TTS owns the audio → guaranteed script + correct voice.
+    # 3) RENDER — every clip is image-anchored (ref_img as frame 0) + generate_audio:true so Seedance
+    #    SPEAKS the clip's verbatim line with REAL lip-sync (KIE/SEEDANCE ONLY — no Veo). Kie
+    #    bytedance/seedance-2 is the native-audio PRIMARY; fal-seedance (silent) the FALLBACK. Each
+    #    clip runs through the proven vision-QA loop (_gen_beat_with_eval), same as recipe_generate.
+    produced = {}
+    def _kie_seedance(_prompt, _sec):
         r = KieAIService.generate_video_seedance(
-            prompt=motion, reference_image_urls=[ref_img], duration=per, resolution=resolution,
-            aspect_ratio=aspect, generate_audio=False, model="bytedance/seedance-2")
-        return (r.get("video_path"), "kie-seedance-2", 0.0, True)   # anchors image as frame 0
-
-    def _fal_seedance():
-        # FALLBACK — fal-seedance i2v (also true frame-0), used only if the Kie lane errors.
-        v = fv.generate_video("fal-seedance", motion, image_url=ref_img,
-                              seconds=per, aspect_ratio=aspect, resolution=resolution)
-        return (v.get("local_path"), "fal-seedance", float(v.get("cost_usd") or 0), True)   # true frame-0
+            prompt=_prompt, reference_image_urls=[ref_img], duration=_sec, resolution=resolution,
+            aspect_ratio=aspect, generate_audio=True, model="bytedance/seedance-2")   # NATIVE audio → lip-sync
+        return (r.get("local_path") or r.get("video_path"), "kie-seedance-2", float(r.get("cost_usd") or 0.0))
+    def _fal_seedance(_prompt, _sec):
+        v = fv.generate_video("fal-seedance", _prompt, image_url=ref_img,
+                              seconds=_sec, aspect_ratio=aspect, resolution=resolution)   # true frame-0, SILENT
+        return (v.get("local_path"), "fal-seedance", float(v.get("cost_usd") or 0))
 
     clips, providers = [], set()
-    for i in range(n_clips):
-        await _abort_if_cancelled(req, f"seedance ref clip {i+1}/{n_clips}")
-        act.tick(req.request_id, f"Seedance image-to-video (locked shot) clip {i+1}/{n_clips}")
-        _local = _prov = None; _cost = 0.0; _tff = False
-        for _lane in (_kie_seedance, _fal_seedance):   # PRIMARY Kie seedance-2, then FALLBACK fal-seedance
-            try:
-                _lp, _prov, _cost, _tff = await asyncio.to_thread(_lane)
-                if _lp and os.path.exists(_lp):
-                    _local = _lp; break
-            except Exception as e:
-                logger.warning(f"[reference-video] {getattr(_lane, '__name__', 'seedance')} i2v failed ({e}) — next lane")
-        if not _local:
+    for ci in range(n_clips):
+        await _abort_if_cancelled(req, f"seedance ref clip {ci+1}/{n_clips}")
+        act.tick(req.request_id, f"Seedance image-anchored talking clip {ci+1}/{n_clips} · {per_list[ci]}s")
+        _per_ci = per_list[ci]
+        beat = {"i": ci, "prompt": _clip_prompt(ci), "shot_type": "talking_head",
+                "line": (chunks[ci] if ci < len(chunks) else "")}
+        _log_model_call(req.request_id, f"video/seedance-ref clip {ci+1}/{n_clips}", f"seedance-{resolution}",
+                        {"prompt": beat["prompt"], "seconds": _per_ci, "resolution": resolution,
+                         "aspect_ratio": aspect, "generate_audio": True, "reference_image": ref_img})
+        async def _attempt(bt, _per=_per_ci):
+            # Kie native-audio PRIMARY, fal silent FALLBACK. Reads bt['prompt'] each call (the eval
+            # loop mutates it on coaching). BOTH anchor ref_img as frame 0 (no Veo, no scene invention).
+            for _lane in (_kie_seedance, _fal_seedance):
+                try:
+                    _lp, _prov, _cost = await asyncio.to_thread(_lane, bt.get("prompt"), _per)
+                    if _lp and os.path.exists(_lp):
+                        produced["provider"] = _prov; produced["cost"] = _cost
+                        return _lp
+                except Exception as e:
+                    logger.warning(f"[reference-video] {getattr(_lane, '__name__', 'seedance')} i2v "
+                                   f"failed ({e}) — next lane")
+            return None
+        cp = await _gen_beat_with_eval(req.request_id, beat, work, _attempt)
+        if not (cp and os.path.exists(cp)):
             continue
-        clips.append(_local); providers.add(_prov)
+        clips.append(cp); providers.add(produced.get("provider"))
+        _prov = produced.get("provider") or "kie-seedance-2"
+        _cost = produced.get("cost") or 0.0
+        if _prov == "kie-seedance-2" and not _cost:   # Kie doesn't return a cost — bill the with-input rate
+            _cost = round(_KIE_RATE_PER_SEC.get(resolution, _KIE_RATE_PER_SEC["720p"])[0] * _per_ci, 4)
         _track_cost(req.request_id, "video", ("fal" if _prov == "fal-seedance" else "kieai"),
-                    model=_prov, units=per, unit_type="sec", cost_usd=_cost)
+                    model=_prov, units=_per_ci, unit_type="sec", cost_usd=_cost)
     if not clips:
         raise RuntimeError("reference-video: Seedance image-to-video produced no clips "
-                           "(fal-seedance AND Kie bytedance/seedance-2 both unavailable)")
+                           "(Kie bytedance/seedance-2 AND fal-seedance both unavailable)")
 
-    # 3) STITCH the locked clips (all the same scene), then mux the verbatim voiceover over them.
+    # 4) NORMALIZE (KEEP the native audio) → STITCH with xfade/acrossfade TRANSITIONS (reuse the proven
+    #    t2v stitch: crossfade at each boundary, falling back to a hard-cut concat on ANY failure — e.g.
+    #    a silent fal clip that breaks acrossfade — so transitions never block delivery). Clips released
+    #    one at a time (memory bound).
     W, H = (1080, 1920) if aspect == "9:16" else (1920, 1080)
     norm = []
     for i, sp in enumerate(clips):
         npath = os.path.join(work, f"rn{i}.mp4")
         await asyncio.to_thread(_ffmpeg,
             ["-i", sp, "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30",
-             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", npath],
-            timeout=300)
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", npath], timeout=300)
         norm.append(npath)
         try: os.remove(sp)     # release the raw clip once normalized (memory bound)
         except OSError: pass
@@ -4770,24 +4810,98 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     if len(norm) == 1:
         import shutil; shutil.copy(norm[0], stitched)
     else:
-        lst = os.path.join(work, "ref_list.txt")
-        with open(lst, "w") as f:
-            for n in norm:
-                f.write(f"file '{n}'\n")
-        await asyncio.to_thread(_ffmpeg,
-            ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
-             "-crf", "22", "-pix_fmt", "yuv420p", stitched], timeout=600)
-    if vo_path and os.path.exists(vo_path):
-        # loop/trim the locked footage to the VO length so the verbatim script is never cut off
-        await asyncio.to_thread(_mux_voice_keep_ambient, stitched, vo_path, out_path, 0.15, True)
+        def _stitch(_norm, _out):
+            try:
+                _d = 0.28
+                _durs = [(_ffprobe_duration(c) or 0) for c in _norm]
+                if any(x <= _d * 3 for x in _durs):
+                    raise RuntimeError("a clip is too short for a safe crossfade")
+                _inp = []
+                for c in _norm:
+                    _inp += ["-i", c]
+                _vf = []; _af = []; _vp = "0:v"; _ap = "0:a"; _cum = _durs[0]
+                for k in range(1, len(_norm)):
+                    _off = max(0.0, _cum - _d)
+                    _vf.append(f"[{_vp}][{k}:v]xfade=transition=fade:duration={_d}:offset={_off:.3f}[vx{k}]")
+                    _af.append(f"[{_ap}][{k}:a]acrossfade=d={_d}[ax{k}]")
+                    _vp = f"vx{k}"; _ap = f"ax{k}"; _cum = _cum + _durs[k] - _d
+                _ffmpeg([*_inp, "-filter_complex", ";".join(_vf + _af), "-map", f"[{_vp}]", "-map",
+                         f"[{_ap}]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", _out], timeout=900)
+                logger.info(f"[reference-video] stitched {len(_norm)} clips with crossfade transitions")
+                return
+            except Exception as _xe:
+                logger.warning(f"[reference-video] xfade stitch failed ({_xe}); hard-cut concat fallback")
+            _lst = os.path.join(work, "ref_list.txt")
+            with open(_lst, "w") as f:
+                for n2 in _norm:
+                    f.write(f"file '{n2}'\n")
+            _ffmpeg(["-f", "concat", "-safe", "0", "-i", _lst, "-c:v", "libx264", "-preset", "veryfast",
+                     "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", _out],
+                    timeout=900)
+        await asyncio.to_thread(_stitch, norm, stitched)
+
+    # 5) AUDIO — native Seedance audio (REAL lip-sync) is primary. Backstop: if the clips came from the
+    #    SILENT provider (fal fallback), narrate the VERBATIM script with a GENDER-LOCKED voice and mux
+    #    it (honest fallback — lips won't match, but gender + script are guaranteed, never silent).
+    import shutil as _sh
+    _sh.copy(stitched, out_path)
+    from ..services import capabilities as _caps
+    _probe = _probe_audio(out_path)                                   # True | False | None(unknown)
+    _prov_has_audio = _caps.provides_audio(produced.get("provider") or "")
+    if _probe is True or (_probe is None and _prov_has_audio):
+        _audio_state = "native"
+    elif script and gender in ("male", "female"):
+        _audio_state = "none"
+        try:
+            act.tick(req.request_id, "silent provider — narrating the verbatim script (gender-locked)")
+            voice = vs.pick_voice(gender=gender)                     # HARD gender filter (never a wrong voice)
+            _vo = os.path.join(work, "refvo.mp3")
+            await asyncio.to_thread(lambda: vs.synthesize(script, voice_id=voice.get("id"), out_path=_vo))
+            if os.path.exists(_vo):
+                _muxed = os.path.join(work, "ref_muxed.mp4")
+                await asyncio.to_thread(_mux_voice_keep_ambient, out_path, _vo, _muxed, 0.15, True)
+                _sh.move(_muxed, out_path)
+                _audio_state = "tts"
+        except Exception as _ve:
+            logger.warning(f"[reference-video] gender-locked TTS backstop failed: {_ve}")
     else:
-        import shutil; shutil.copy(stitched, out_path)
-    # BOTH lanes anchor the input image as frame 0 (Kie bytedance/seedance-2 + fal-seedance), so this
-    # is always a true-first-frame render regardless of which one produced the clips.
+        _audio_state = "none"
+
+    # 6) CAPTIONS — burn whisper+ASS captions with active-word highlight on the FINAL audio, exactly
+    #    like the t2v/UGC lanes (reuse the captions service). Glyph-only relabel on native audio (only
+    #    restores $/% on words actually said — never injects unsaid words); full relabel when we
+    #    narrated via gender-locked TTS (verbatim). One extra encode; best-effort (never blocks delivery).
+    _caps_burned = False
+    if script and _audio_state != "none":
+        try:
+            from ..services import captions as cap
+            _cap_audio = os.path.join(work, "capaudio.wav")
+            await asyncio.to_thread(_ffmpeg, ["-i", out_path, "-vn", "-ac", "1", "-ar", "16000", "-y", _cap_audio], 120)
+            _cwords, _cmethod = await asyncio.to_thread(
+                lambda: cap.align(_cap_audio, script, glyph_only=(_audio_state != "tts")))
+            if _cwords:
+                _cw, _ch = await asyncio.to_thread(_video_dims, out_path)
+                _ass = cap.build_ass(_cwords, os.path.join(work, f"cap_{req.request_id[:8]}.ass"),
+                                     play_w=_cw or W, play_h=_ch or H)
+                if _ass and os.path.exists(_ass):
+                    _fin = os.path.join(work, "ref_caps.mp4")
+                    await asyncio.to_thread(_ffmpeg,
+                        ["-i", out_path, "-vf", f"ass={_ass}", "-c:v", "libx264", "-preset", "veryfast",
+                         "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "copy", "-y", _fin], 900)
+                    _sh.move(_fin, out_path)
+                    _caps_burned = True
+                    logger.info(f"[reference-video] captions: {len(_cwords)} words aligned ({_cmethod})")
+        except Exception as _ce:
+            logger.warning(f"[reference-video] caption burn skipped: {_ce}")
+
+    # Kie bytedance/seedance-2 (native audio) is the primary; fal-seedance (silent) the fallback. Both
+    # anchor the input image as frame 0, so this is always a true-first-frame render.
     _provider = "kie-seedance-2" if providers == {"kie-seedance-2"} else (
         "fal-seedance" if providers == {"fal-seedance"} else "seedance (kie+fal)")
-    return {"provider": _provider, "segments": len(norm),
-            "true_first_frame": True, "native_audio": False}
+    return {"provider": _provider, "segments": len(norm), "true_first_frame": True,
+            "native_audio": (_audio_state == "native"), "audio_state": _audio_state,
+            "captions_burned": _caps_burned}
 
 
 async def recipe_reference_video(req: "RunRequest") -> list:
@@ -4801,13 +4915,18 @@ async def recipe_reference_video(req: "RunRequest") -> list:
     nothing.
 
     • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Both lanes anchor the input image as Frame 0.
-        PRIMARY  Kie bytedance/seedance-2 image-to-video — the user's platform + credits; the reference
-                 image goes in as the Frame-0 anchor (locks face/hair/wardrobe + background/lighting/
-                 layout). Silent, so the gender-locked verbatim TTS owns the audio.
-        FALLBACK fal-seedance image-to-video (also true frame-0), used only if the Kie lane errors.
+        PRIMARY  Kie bytedance/seedance-2 image-to-video with NATIVE audio (generate_audio:true) — the
+                 reference image is the Frame-0 anchor (locks face/hair/wardrobe + background) and
+                 Seedance itself SPEAKS the clip's verbatim line with REAL lip-sync + a gender voice.
+        FALLBACK fal-seedance image-to-video (also true frame-0, but SILENT) — used only if the Kie lane
+                 errors; a gender-locked TTS backstop then narrates the verbatim script.
       Prompt = [MIRROR THE REFERENCE first] (the user's prompt/character+setting LEADS, anchoring
-      frame-0) + [CONTROLLED ACTION] (minimal subtle talk/glance/breathing, locked-off, no camera move).
-    • VERBATIM: the prompt is the visual direction as-is; the script is spoken word-for-word (TTS).
+      frame-0) + [ALIVE ACTION] (the same person speaking naturally + expressively, natural head/hand
+      motion) — DIRECTOR-FREE and image-anchored, only the SCENE stays fixed (single_shot = one
+      continuous scene, NOT a frozen frame). Clips are stitched with xfade/acrossfade transitions and
+      whisper+ASS captions are burned on the final audio — same as the proven t2v lane.
+    • VERBATIM: the script is split across clips + spoken word-for-word (native Seedance audio); the
+      final eval/QA gate (faithfulness: transcript vs script) stays ON to catch any drift.
     • GENDER: hard override — a man/male/he request never yields a woman's voice (stated wins, else
       inferred from the words; pick_voice fails closed on an unknown gender).
     • RESILIENCE: a durable checkpoint (RefVideoJob) is persisted with the frozen inputs BEFORE the
@@ -4837,8 +4956,9 @@ async def recipe_reference_video(req: "RunRequest") -> list:
 
     work = tempfile.mkdtemp()
     try:
-        # KIE / SEEDANCE ONLY — no Veo anywhere. fal-seedance (TRUE frame-0) is the primary per-clip
-        # lane, Kie bytedance/seedance-2 (SOFT @Image1) the fallback; gender-locked verbatim TTS muxed.
+        # KIE / SEEDANCE ONLY — no Veo anywhere. Kie bytedance/seedance-2 (image frame-0 anchor +
+        # NATIVE audio → lip-sync) is the primary per-clip lane, fal-seedance (silent) the fallback;
+        # dynamic alive prompt, per-clip verbatim split, xfade transitions, whisper+ASS captions.
         _lane = await _refvideo_render_seedance(req, frozen, out_path, name, work)
         # DRY-RUN — the renderer composed the exact Seedance request and stopped. Surface the captured
         # payload as a single variant (dry_run_preview) via the callback; render/QA/persist all SKIPPED.
@@ -4848,8 +4968,9 @@ async def recipe_reference_video(req: "RunRequest") -> list:
                         f"{json.dumps(preview)[:1500]}")
             return [{"recipe": "Reference Video (dry-run)", "confidence": 0.0,
                      "dry_run_preview": preview,
-                     "whats_changed": "DRY-RUN — composed the EXACT Seedance request (mirror-then-action "
-                                      "prompt, frame-0 image, model/aspect/resolution/duration); NO video "
+                     "whats_changed": "DRY-RUN — composed the EXACT Seedance requests (dynamic alive "
+                                      "talking prompt, frame-0 image, generate_audio:true, per-clip "
+                                      "verbatim script split, captions + xfade transitions); NO video "
                                       "generated, no credits spent."}]
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
             raise RuntimeError("reference-video: no video produced by the Seedance i2v lane")
@@ -4860,7 +4981,7 @@ async def recipe_reference_video(req: "RunRequest") -> list:
         _eval = {}
         try:
             _eval = await _eval_gate(req.request_id, out_path, frozen["script"] or frozen["prompt"],
-                                     {**assets, "captions": False}, work) or {}
+                                     {**assets, "captions": _lane.get("captions_burned", False)}, work) or {}
         except Exception as _qe:
             logger.warning(f"[reference-video] eval gate skipped: {_qe}")
         _ae_persist(out_path, name)
@@ -4869,10 +4990,12 @@ async def recipe_reference_video(req: "RunRequest") -> list:
         _tff = "true first-frame" if _lane.get("true_first_frame") else "reference"
         _aud = "native lip-synced audio" if _lane.get("native_audio") else "gender-matched voiceover (verbatim script)"
         variant = {"recipe": "Reference Video", "video_url": url, "confidence": 0.72,
-                   "whats_changed": (f"Image-anchored generation from YOUR reference image ({_tff}) + your "
-                        f"exact visual direction — director/creative-team bypassed. {_lane.get('segments',1)} "
-                        f"segment(s), single continuous shot, {_aud}, "
-                        f"{frozen['gender'] or 'as-directed'} cast. Engine: {_lane.get('provider')}.")}
+                   "whats_changed": (f"Image-anchored talking generation from YOUR reference image ({_tff}) + "
+                        f"your exact visual direction — director/creative-team bypassed. {_lane.get('segments',1)} "
+                        f"segment(s), single continuous scene, {_aud}"
+                        + (" · captions" if _lane.get("captions_burned") else "")
+                        + (" · xfade transitions" if _lane.get('segments', 1) > 1 else "")
+                        + f", {frozen['gender'] or 'as-directed'} cast. Engine: {_lane.get('provider')}.")}
         if _eval.get("deliver") is False:
             _reasons = (_eval.get("reasons") or [])[:5]
             variant.update({"blocked": True, "qa_failed": True, "qa_reasons": _reasons,
