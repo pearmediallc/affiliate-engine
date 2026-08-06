@@ -75,6 +75,31 @@ class LipsyncJob(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class RefVideoJob(Base):
+    """Durable checkpoint for the REFERENCE-VIDEO (image-anchored i2v) path so a long render SURVIVES
+    an AE restart. The failed job ec2d0aaa died because a mid-render restart zeroed the job ('engine
+    restarted mid-generation, no creative to auto-resume') → produced NOTHING. We persist everything
+    needed to reproduce the SAME locked render (durable reference image + verbatim prompt/script +
+    gender + single_shot + seconds), and a startup resumer re-runs it (the reference image is durable
+    and the render is deterministic w.r.t. the frozen inputs), then delivers via the stored callback —
+    RESUMING the job instead of orphaning it. Fails LOUD (failed callback) if the resume itself errors."""
+    __tablename__ = "refvideo_jobs"
+
+    id = Column(String, primary_key=True)                    # = the regen request_id
+    provider = Column(String, nullable=True)                 # veo | fal (the lane that ran)
+    operation_name = Column(Text, nullable=True)             # latest Veo op (advisory; segments are on ephemeral disk)
+    callback_url = Column(Text, nullable=True)
+    out_name = Column(String, nullable=True)
+    script = Column(Text, nullable=True)
+    # Frozen render inputs (image_urls/prompt/gender/single_shot/seconds/aspect_ratio) so the resumer
+    # can rebuild the RunRequest and reproduce the identical locked take. Never re-parsed or re-curated.
+    assets_json = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="running", index=True)   # running | done | failed
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class CreationCost(Base):
     """Per-step provider spend for a single creation, so the UI can show exactly which AI
     provider cost what for each video/image (per request + in the Variation Studio)."""

@@ -2711,7 +2711,7 @@ async def run(req: RunRequest, background: BackgroundTasks, _auth: bool = Depend
 
 # rough per-recipe expected wall-clock (seconds) — seeds the progress bar / ETA; recipes refine it.
 _EXPECTED_SEC = {
-    "Full Ad": 300, "Create from Assets": 240, "Generate Video": 200,
+    "Full Ad": 300, "Create from Assets": 240, "Reference Video": 260, "Generate Video": 200,
     "Avatar/UGC": 180, "map + ugc": 180, "Avatar Lipsync": 220, "Script": 120, "Broll": 150, "Stock Video": 150,
     "Hook Change Only": 90, "Caption Change Only": 60, "Reclean/Minor Mod": 60,
     "Image": 120, "Image + Voiceover": 150, "Special Request": 180,
@@ -4215,6 +4215,44 @@ def _verbatim_user_script(assets: dict) -> str:
     return ""
 
 
+# Camera/shot words that only appear in a VISUAL brief (never in spoken ad copy) — a genuine visual
+# direction, so the reference-image path treats the user's prompt as authoritative instead of curating.
+_VISUAL_DIRECTION_RE = re.compile(
+    r"\b(locked[- ]?off|static shot|single[- ]?(?:continuous|shot|take)|no[- ]?cuts?|one (?:continuous |)take|"
+    r"close[- ]?up|wide shot|medium shot|camera|framing|reference image|garage|workshop|workbench|"
+    r"same (?:man|woman|person|guy|face|character|scene) (?:as|from|in)|do not change|no zoom|selfie|"
+    r"handheld|dolly|tracking shot)\b", re.I)
+
+
+def _infer_gender_from_text(text: str) -> str:
+    """male / female / '' inferred from the user's own words — the SAME rule every lane uses so a
+    'man/male/he' request never yields a woman's voice. Male checked first (a script can contain both)."""
+    t = text or ""
+    if re.search(r"\b(man|male|guy|gentleman|he|him|his|father|dad|husband|grandpa|mr|sir)\b", t, re.I):
+        return "male"
+    if re.search(r"\b(woman|female|lady|she|her|mother|mom|wife|grandma|mrs|girl|miss)\b", t, re.I):
+        return "female"
+    return ""
+
+
+def _is_reference_image_job(assets: dict) -> bool:
+    """TRUE when this is an authoritative REFERENCE-IMAGE job: the user brought a reference IMAGE
+    (the literal first frame) plus their OWN visual direction — so the director/creative-team curation
+    must be SKIPPED and the image + prompt drive the render verbatim. Fires on the explicit contract
+    flags (ref_anchor / variation_type 'Reference Video') OR on the heuristic (a reference image + a
+    genuine detailed camera/shot prompt). A plain scenic-images + script job (no visual direction) is
+    NOT a reference-image job and keeps the normal Create-from-Assets path."""
+    if not isinstance(assets, dict):
+        return False
+    has_image = bool([u for u in (assets.get("image_urls") or []) if u])
+    if not has_image:
+        return False
+    if assets.get("ref_anchor") is True:
+        return True
+    prompt = (assets.get("prompt") or "").strip()
+    return bool(len(prompt.split()) >= 12 and _VISUAL_DIRECTION_RE.search(prompt))
+
+
 async def recipe_full_ad(req: RunRequest) -> list:
     """Regeneration Composer — a full-length (~30-45s) UGC ad, composed the way editors do:
       script (enhanced loser + winner's hook angle) -> split into ONE-ACTION clips ->
@@ -4365,6 +4403,18 @@ async def recipe_from_assets(req: RunRequest) -> list:
     vertical = req.context.get("vertical", "")
     if not image_urls:
         raise RuntimeError("from_assets: no scenic images provided")
+
+    # ── REFERENCE-IMAGE REROUTE ─────────────────────────────────────────────────────────────────
+    # The failed job ec2d0aaa came in here ('Create from Assets') with a reference IMAGE of a MAN +
+    # a detailed visual prompt ("same man, garage workbench, single continuous locked-off static
+    # shot, no cuts, older male voice"). This recipe then ran the DIRECTOR, which invented a 45-55
+    # WOMAN in a LIVING ROOM with b-roll hard cuts and routed to the broken runway-gen4 i2v. When a
+    # reference image + genuine visual direction is present, the image + prompt ARE the plan — hand
+    # off to the authoritative pass-through recipe (director SKIPPED, image = literal first frame).
+    if _is_reference_image_job(assets):
+        logger.info(f"[from_assets] reference image + visual direction detected ({req.request_id}) → "
+                    f"authoritative Reference-Video pass-through (director/creative-team SKIPPED)")
+        return await recipe_reference_video(req)
     if not script:
         raise RuntimeError("from_assets: no script provided")
 
@@ -4480,6 +4530,422 @@ async def recipe_from_assets(req: RunRequest) -> list:
                     f"{'voiceover narration, ' if vo_path else ''}clean captions.")}]
     finally:
         import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
+# ── REFERENCE-VIDEO (image-anchored, director-free, true-first-frame i2v) ─────────────────────────
+_REFVIDEO_NO_TEXT = (" ABSOLUTELY NO on-screen text, captions, subtitles, burned-in words, logos or "
+                     "watermarks anywhere in the frame — clean footage only.")
+
+
+def _refvideo_frozen(assets: dict, req: "RunRequest") -> dict:
+    """The exact, curated set of inputs the reference-video render depends on — frozen so the restart
+    resumer reproduces the IDENTICAL locked take. Verbatim: nothing here is re-parsed or re-curated."""
+    image_urls = [u for u in (assets.get("image_urls") or []) if u]
+    prompt = (assets.get("prompt") or "").strip()
+    script = _verbatim_user_script(assets) or (assets.get("script") or "").strip()
+    gender = (assets.get("gender") or "").strip().lower()
+    if gender not in ("male", "female"):
+        gender = _infer_gender_from_text(prompt + " " + script)
+    single_shot = assets.get("single_shot")
+    if single_shot is None:
+        single_shot = bool(re.search(
+            r"\b(single[- ]?(?:continuous|shot|take)|locked[- ]?off|no[- ]?cuts?|one (?:continuous |)take)\b",
+            prompt, re.I))
+    return {
+        "image_urls": image_urls, "prompt": prompt, "script": script,
+        "gender": gender, "single_shot": bool(single_shot),
+        "seconds": assets.get("seconds"), "aspect_ratio": assets.get("aspect_ratio") or "9:16",
+        "resolution": (assets.get("resolution") or "480p"), "engine": (assets.get("engine") or "").lower(),
+        "vertical": (req.context.get("vertical") if isinstance(req.context, dict) else "") or "",
+    }
+
+
+def _refvideo_checkpoint(request_id: str, frozen: dict, out_name: str, callback_url: str,
+                         status: str = "running", provider: str = None, error: str = None) -> None:
+    """Upsert the durable RefVideoJob checkpoint (best-effort). Persisted BEFORE the first paid render
+    so an AE restart resumes from the frozen inputs instead of orphaning the job."""
+    try:
+        import json as _json
+        from ..database import SessionLocal
+        from ..models.creative_team import RefVideoJob
+        db = SessionLocal()
+        try:
+            row = db.query(RefVideoJob).filter(RefVideoJob.id == request_id).first()
+            if not row:
+                row = RefVideoJob(id=request_id)
+                db.add(row)
+            row.status = status
+            row.out_name = out_name
+            row.callback_url = callback_url
+            row.script = frozen.get("script")
+            row.assets_json = _json.dumps(frozen)[:200000]
+            if provider is not None:
+                row.provider = provider
+            if error is not None:
+                row.error = str(error)[:2000]
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"[reference-video] checkpoint {status} persist skipped ({request_id}): {e}")
+
+
+def _refvideo_mark(request_id: str, status: str, error: str = None, provider: str = None) -> None:
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import RefVideoJob
+        db = SessionLocal()
+        try:
+            row = db.query(RefVideoJob).filter(RefVideoJob.id == request_id).first()
+            if row:
+                row.status = status
+                if error is not None:
+                    row.error = str(error)[:2000]
+                if provider is not None:
+                    row.provider = provider
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"[reference-video] checkpoint mark {status} skipped ({request_id}): {e}")
+
+
+def _refvideo_veo_prompt(frozen: dict, chunk: str, first: bool, single_shot: bool) -> str:
+    """Compose ONE Veo i2v segment prompt: the user's visual direction VERBATIM + the first-frame lock
+    + (this segment's) verbatim spoken line + a hard gender-voice instruction + no-on-screen-text."""
+    parts = [frozen["prompt"].strip()]
+    if first:
+        parts.append("@Image1 IS the exact first frame of this video — the identical person, face, "
+                     "wardrobe, background, framing and lighting. Begin ON that exact frame and animate "
+                     "forward naturally; do NOT re-imagine, restyle or change the person or the scene.")
+    else:
+        parts.append("Continue the SAME continuous take — the identical person, scene, framing and "
+                     "lighting as before; no cut, no new camera move, no new location.")
+    if single_shot:
+        parts.append("ONE continuous locked-off static shot from a fixed camera — no cuts, no b-roll, "
+                     "no cutaways, no scene changes; the whole clip is this single unbroken take.")
+    g = (frozen.get("gender") or "").lower()
+    if chunk:
+        _who = "man" if g == "male" else ("woman" if g == "female" else "person")
+        parts.append(f"The {_who} speaks directly to the camera with natural, synced mouth movement and "
+                     f'says, word for word and nothing else: "{chunk}".')
+    if g == "male":
+        parts.append("The voice is an adult MALE voice — never a female voice.")
+    elif g == "female":
+        parts.append("The voice is an adult FEMALE voice — never a male voice.")
+    return (" ".join(parts) + _REFVIDEO_NO_TEXT)[:1900]
+
+
+async def _refvideo_render_veo(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
+    """PRIMARY LANE — Veo 3.1 image-to-video: the reference image is the TRUE frame-0 and Veo renders
+    NATIVE, lip-synced audio. single_shot longer than 8s is one genuinely continuous take built from
+    Veo's native +7s extends (never beat-split, never a new scene). MEMORY: segments are rendered and
+    downloaded ONE at a time and concatenated on disk — never all held in RAM."""
+    from ..services.video_creator import VideoCreatorService as VC
+    from ..services import creative_team_activity as act
+    from ..services import realism_prompt_engine as _rpe
+    import math as _math
+    ref_img = frozen["image_urls"][0]
+    aspect = frozen["aspect_ratio"]
+    script = frozen["script"]
+    single_shot = frozen["single_shot"]
+    _dur_raw = frozen.get("seconds")
+    _auto = (not _dur_raw or str(_dur_raw).lower() == "auto")
+    # Segment plan: base 8s + native +7s extends. Duration is script-driven (auto) or the explicit cap.
+    chunks = _rpe.split_into_clips(script, max_words=18) if script else []
+    if _auto:
+        n_seg = max(1, min(6, len(chunks) or 1))
+    else:
+        n_seg = max(1, min(6, _math.ceil((int(_dur_raw) - 8) / 7) + 1))
+    if chunks and len(chunks) < n_seg:
+        n_seg = len(chunks)
+    act.set_expected_sec(req.request_id, n_seg * 240)   # Veo ~2-4 min/segment
+
+    # Preserve the real image type so Veo gets a matching mime (generate_from_image infers it from ext).
+    _ext = ".jpg" if re.search(r"\.jpe?g(\?|$)", ref_img, re.I) else ".png"
+    imgp = await _download_to_temp(ref_img, suffix=_ext)
+    paths = []
+    prev_op = None
+    try:
+        for k in range(n_seg):
+            await _abort_if_cancelled(req, f"veo ref segment {k+1}/{n_seg}")
+            act.tick(req.request_id, f"Veo image-to-video segment {k+1}/{n_seg} · {aspect}")
+            seg_chunk = chunks[k] if k < len(chunks) else ""
+            seg_prompt = _refvideo_veo_prompt(frozen, seg_chunk, first=(k == 0), single_shot=single_shot)
+            _log_model_call(req.request_id, f"veo-i2v ref segment {k+1}/{n_seg}", "veo-3.1-i2v",
+                            {"prompt": seg_prompt, "first_frame": (k == 0), "aspect_ratio": aspect})
+            if k == 0:
+                op = await asyncio.to_thread(VC.generate_from_image, imgp, seg_prompt, aspect, 8)
+            else:
+                op = await asyncio.to_thread(VC.extend_video, prev_op, seg_prompt)
+            prev_op = op["operation_name"]
+            _refvideo_checkpoint(req.request_id, frozen, name, req.callback_url,
+                                 status="running", provider="veo")
+            st = await _veo_wait(prev_op)
+            paths.append(st["video_path"])
+        if not paths:
+            raise RuntimeError("veo produced no segments")
+        if len(paths) == 1:
+            import shutil; shutil.copy(paths[0], out_path)
+        else:
+            lst = os.path.join(work, "veo_list.txt")
+            with open(lst, "w") as f:
+                for p in paths:
+                    f.write(f"file '{p}'\n")
+            await asyncio.to_thread(_ffmpeg,
+                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
+    finally:
+        try: os.remove(imgp)
+        except OSError: pass
+        for p in paths:   # release Veo segment files as soon as they're concatenated (memory bound)
+            try: os.remove(p)
+            except OSError: pass
+    _track_cost(req.request_id, "video", "google", model="veo-3.1-i2v",
+                units=8 + 7 * (len(paths) - 1), unit_type="sec", cost_usd=0)
+    return {"provider": "veo", "segments": len(paths), "true_first_frame": True, "native_audio": True}
+
+
+async def _refvideo_render_fal(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
+    """FALLBACK LANE — fal-seedance image-to-video (the true frame-0, silent lane at recast-avatar
+    line ~2131) + a GENDER-HARD voice reading the script VERBATIM, muxed over the locked shot. Used
+    when Veo is unavailable/errors. GUARANTEES verbatim script + correct gender even when the primary
+    native-audio lane is down. Same locked scene throughout: every clip is i2v from the SAME reference
+    image (no new scene, no beats). MEMORY: clips rendered + released one at a time."""
+    from ..services import fal_video as fv
+    from ..services import voice_studio as vs
+    from ..services import creative_team_activity as act
+    import math as _math
+    ref_img = frozen["image_urls"][0]
+    aspect = frozen["aspect_ratio"]
+    resolution = frozen["resolution"]
+    script = frozen["script"]
+    gender = frozen["gender"]
+
+    # 1) VOICE — gender is a HARD filter (a 'man' request can NEVER get a woman's voice). TTS drives
+    #    runtime: synth first, then render exactly enough locked-shot footage to cover the voiceover.
+    vo_path = None
+    vo_sec = int(frozen.get("seconds")) if (frozen.get("seconds") and str(frozen.get("seconds")).lower() != "auto") else 12
+    if script:
+        act.tick(req.request_id, "casting a gender-matched voice + reading the script verbatim")
+        if gender not in ("male", "female"):
+            raise RuntimeError("reference-video (fal lane): character gender unknown — refusing to guess a "
+                               "voice (a 'man' request must never ship a woman's voice)")
+        voice = vs.pick_voice(gender=gender)   # HARD gender filter; raises if the gender is unknown
+        vo_path = os.path.join(work, "refvo.mp3")
+        await asyncio.to_thread(lambda: vs.synthesize(script, voice_id=voice.get("id"), out_path=vo_path))
+        try:
+            vo_sec = int(_math.ceil(await asyncio.to_thread(_ffprobe_duration, vo_path))) or vo_sec
+        except Exception:
+            pass
+
+    # 2) FOOTAGE — locked-off i2v from the SAME reference frame, enough clips to cover the VO. Every
+    #    clip is anchored to ref_img (single scene/character); provider fallback fal-seedance→kling→wan.
+    per = 8
+    n_clips = max(1, min(6, _math.ceil(max(vo_sec, per) / per)))
+    motion = (frozen["prompt"].strip() + " @Image1 IS the exact first frame — identical person, face, "
+              "wardrobe, background and framing; begin on it and animate forward with subtle natural "
+              "motion. ONE continuous locked-off static shot, no cuts, no scene change." + _REFVIDEO_NO_TEXT)[:1900]
+    clips = []
+    for i in range(n_clips):
+        await _abort_if_cancelled(req, f"fal ref clip {i+1}/{n_clips}")
+        act.tick(req.request_id, f"fal image-to-video (locked shot) clip {i+1}/{n_clips}")
+        vid = None
+        for _model in ("fal-seedance", "fal-kling", "fal-wan"):
+            try:
+                vid = await asyncio.to_thread(
+                    fv.generate_video, _model, motion,
+                    image_url=ref_img, seconds=per, aspect_ratio=aspect, resolution=resolution)
+                break
+            except Exception as e:
+                logger.warning(f"[reference-video] fal {_model} i2v failed ({e}) — next provider")
+        if not vid or not vid.get("local_path"):
+            continue
+        clips.append(vid["local_path"])
+        _track_cost(req.request_id, "video", "fal", model=vid.get("model") or "fal-seedance",
+                    units=per, unit_type="sec", cost_usd=vid.get("cost_usd") or 0)
+    if not clips:
+        raise RuntimeError("reference-video: fal image-to-video produced no clips (all providers down)")
+
+    # 3) STITCH the locked clips (all the same scene), then mux the verbatim voiceover over them.
+    W, H = (1080, 1920) if aspect == "9:16" else (1920, 1080)
+    norm = []
+    for i, sp in enumerate(clips):
+        npath = os.path.join(work, f"rn{i}.mp4")
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", sp, "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30",
+             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", npath],
+            timeout=300)
+        norm.append(npath)
+        try: os.remove(sp)     # release the raw clip once normalized (memory bound)
+        except OSError: pass
+    stitched = os.path.join(work, "ref_stitched.mp4")
+    if len(norm) == 1:
+        import shutil; shutil.copy(norm[0], stitched)
+    else:
+        lst = os.path.join(work, "ref_list.txt")
+        with open(lst, "w") as f:
+            for n in norm:
+                f.write(f"file '{n}'\n")
+        await asyncio.to_thread(_ffmpeg,
+            ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "22", "-pix_fmt", "yuv420p", stitched], timeout=600)
+    if vo_path and os.path.exists(vo_path):
+        # loop/trim the locked footage to the VO length so the verbatim script is never cut off
+        await asyncio.to_thread(_mux_voice_keep_ambient, stitched, vo_path, out_path, 0.15, True)
+    else:
+        import shutil; shutil.copy(stitched, out_path)
+    return {"provider": "fal-seedance", "segments": len(norm), "true_first_frame": True, "native_audio": False}
+
+
+async def recipe_reference_video(req: "RunRequest") -> list:
+    """AUTHORITATIVE REFERENCE-IMAGE PASS-THROUGH (variation_type='Reference Video' / ref_anchor:true).
+
+    The user's reference IMAGE is the literal first frame and their prompt + script ARE the plan — so
+    the DIRECTOR / creative-team curation is SKIPPED ENTIRELY (no run_creative_team, no invented
+    character/scene/beats). This is the fix for ec2d0aaa, where 'Create from Assets' ran the director,
+    which turned 'same man, garage, single locked-off shot, male voice' into a random 45-55 WOMAN in a
+    living room with b-roll hard cuts on the broken runway-gen4 i2v, then died on restart producing
+    nothing.
+
+    • ENGINE (both lanes are TRUE first-frame — the image is actually frame 0, never a soft reference):
+        PRIMARY  Veo 3.1 image-to-video — true frame-0 + NATIVE lip-synced audio; single_shot longer
+                 than one clip = one continuous take via Veo's native +7s extends (no beat-split).
+        FALLBACK fal-seedance image-to-video (silent) + a GENDER-HARD voice reading the script verbatim
+                 — used when Veo is unavailable/errors; guarantees the exact script + correct gender.
+    • VERBATIM: the prompt is the visual direction as-is; the script is spoken word-for-word.
+    • GENDER: hard override — a man/male/he request never yields a woman's voice (stated wins, else
+      inferred from the words; the fal lane's pick_voice fails closed on an unknown gender).
+    • RESILIENCE: a durable checkpoint (RefVideoJob) is persisted with the frozen inputs BEFORE the
+      first paid render, so an AE restart RESUMES (re-renders from the frozen, durable inputs and
+      delivers) instead of zeroing the job. Peak memory is bounded — segments/clips are downloaded,
+      concatenated and released ONE at a time, never all buffered in RAM."""
+    _CURRENT_RID.set(req.request_id)
+    from ..services import creative_team_activity as act
+    assets = req.assets or req.directive.get("assets", {}) or {}
+    frozen = _refvideo_frozen(assets, req)
+    if not frozen["image_urls"]:
+        raise RuntimeError("reference-video: no reference image provided (image_urls[0] is the first frame)")
+    if not frozen["prompt"]:
+        raise RuntimeError("reference-video: no visual prompt provided")
+    logger.info(f"[reference-video] {req.request_id}: director SKIPPED — image-anchored i2v "
+                f"(gender={frozen['gender'] or 'unknown'}, single_shot={frozen['single_shot']}, "
+                f"script={'yes' if frozen['script'] else 'no'})")
+
+    name, out_path, url = _out_url(req, "refvideo")
+    _refvideo_checkpoint(req.request_id, frozen, name, req.callback_url, status="running")
+    # HARD cost gate before any paid render (projects the whole take).
+    _proj_sec = int(frozen["seconds"]) if (frozen.get("seconds") and str(frozen["seconds"]).lower() != "auto") else 16
+    _gate_job_cost(req.request_id, f"reference-video i2v (~{_proj_sec}s @ {frozen['resolution']})",
+                   _t2v_projected_usd(frozen["resolution"], True, _proj_sec), assets)
+
+    work = tempfile.mkdtemp()
+    try:
+        from ..config import settings as _settings
+        _force = frozen.get("engine")
+        _lane = None
+        # PRIMARY: Veo i2v (true frame-0 + native audio) unless it's unconfigured or explicitly bypassed.
+        if _force not in ("fal", "fal-seedance", "seedance") and _settings.gemini_api_key:
+            try:
+                _lane = await _refvideo_render_veo(req, frozen, out_path, name, work)
+            except Cancelled:
+                raise
+            except Exception as e:
+                logger.warning(f"[reference-video] Veo i2v lane failed ({e}) — "
+                               f"falling back to fal-seedance i2v + gender-hard voiceover")
+        # FALLBACK: fal-seedance i2v (true frame-0, silent) + gender-hard verbatim TTS.
+        if not _lane or not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
+            _lane = await _refvideo_render_fal(req, frozen, out_path, name, work)
+        if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
+            raise RuntimeError("reference-video: no video produced by either i2v lane")
+
+        # FINAL QA GATE — grade the delivered file against the verbatim script (faithfulness, abrupt
+        # end, residual captions, cast). Never discards the render: on deliver=False the variant is
+        # FLAGGED for review with the reasons (fail loud, still viewable).
+        _eval = {}
+        try:
+            _eval = await _eval_gate(req.request_id, out_path, frozen["script"] or frozen["prompt"],
+                                     {**assets, "captions": False}, work) or {}
+        except Exception as _qe:
+            logger.warning(f"[reference-video] eval gate skipped: {_qe}")
+        _ae_persist(out_path, name)
+        _refvideo_mark(req.request_id, "done", provider=_lane.get("provider"))
+
+        _tff = "true first-frame" if _lane.get("true_first_frame") else "reference"
+        _aud = "native lip-synced audio" if _lane.get("native_audio") else "gender-matched voiceover (verbatim script)"
+        variant = {"recipe": "Reference Video", "video_url": url, "confidence": 0.72,
+                   "whats_changed": (f"Image-anchored generation from YOUR reference image ({_tff}) + your "
+                        f"exact visual direction — director/creative-team bypassed. {_lane.get('segments',1)} "
+                        f"segment(s), single continuous shot, {_aud}, "
+                        f"{frozen['gender'] or 'as-directed'} cast. Engine: {_lane.get('provider')}.")}
+        if _eval.get("deliver") is False:
+            _reasons = (_eval.get("reasons") or [])[:5]
+            variant.update({"blocked": True, "qa_failed": True, "qa_reasons": _reasons,
+                            "qa_note": "QA blocked (viewable for review): " + "; ".join(_reasons)[:280]})
+            logger.warning(f"[reference-video] {req.request_id}: QA gate BLOCKED — surfacing flagged: {_reasons}")
+        return [variant]
+    except Cancelled:
+        _refvideo_mark(req.request_id, "failed", error="cancelled")
+        raise
+    except Exception as e:
+        _refvideo_mark(req.request_id, "failed", error=str(e))
+        raise
+    finally:
+        import shutil; shutil.rmtree(work, ignore_errors=True)
+
+
+async def _resume_one_refvideo(row: dict):
+    """Re-run ONE reference-video job that was mid-render when AE last restarted, from its FROZEN,
+    durable inputs (the reference image URL is durable and the render is deterministic w.r.t. the
+    frozen prompt/script/gender), then deliver via the stored callback. Fails LOUD (failed callback)
+    if the resume itself errors — never silently orphaned."""
+    import json as _json
+    rid = row["id"]
+    try:
+        frozen = _json.loads(row.get("assets_json") or "{}")
+    except Exception:
+        frozen = {}
+    if not frozen.get("image_urls"):
+        _refvideo_mark(rid, "failed", error="resume: no frozen inputs")
+        await _callback(row.get("callback_url"), {"request_id": rid, "status": "failed",
+            "error": "reference-video interrupted by an engine restart and could not be resumed "
+                     "(no saved inputs) — please retry", "variants": []})
+        return
+    req = RunRequest(request_id=rid, context={"vertical": frozen.get("vertical", "")},
+                     variation_type="Reference Video", assets=frozen, callback_url=row.get("callback_url"))
+    try:
+        logger.info(f"[resume] reference-video {rid}: re-rendering from frozen inputs after restart")
+        variants = await recipe_reference_video(req)
+        await _callback(row.get("callback_url"), {"request_id": rid, "status": "ready", "variants": variants})
+        logger.info(f"[resume] reference-video {rid} RECOVERED + delivered")
+    except Exception as e:
+        _refvideo_mark(rid, "failed", error=str(e))
+        logger.error(f"[resume] reference-video {rid} failed: {e}")
+        await _callback(row.get("callback_url"), {"request_id": rid, "status": "failed",
+            "error": f"reference-video resume failed after restart: {str(e)[:200]}", "variants": []})
+
+
+async def resume_pending_refvideo():
+    """Startup hook: recover any reference-video render that was in-flight when AE last restarted."""
+    try:
+        from ..database import SessionLocal
+        from ..models.creative_team import RefVideoJob
+        db = SessionLocal()
+        try:
+            rows = db.query(RefVideoJob).filter(RefVideoJob.status == "running").all()
+            pending = [{"id": r.id, "callback_url": r.callback_url, "assets_json": r.assets_json} for r in rows]
+            for r in rows:   # mark BEFORE re-dispatch so a crash-loop can't re-fire the same row forever
+                r.status = "failed"; r.error = "interrupted by restart; resuming"
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"resume_pending_refvideo load failed: {e}")
+        return
+    if pending:
+        logger.info(f"[resume] recovering {len(pending)} in-flight reference-video job(s)")
+    for row in pending:
+        asyncio.create_task(_resume_one_refvideo(row))
 
 
 async def _veo_wait(op_name: str, timeout: int = 1200):
@@ -8379,6 +8845,8 @@ _RECIPES = {
     "UGC + B-Roll": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
     "UGC + B-Roll Home Insurance": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
     "Create from Assets": recipe_from_assets,
+    # Authoritative reference-IMAGE pass-through (image = literal first frame, director SKIPPED).
+    "Reference Video": recipe_reference_video,
     "Generate Video": recipe_generate_router,
     "Avatar/UGC": recipe_avatar,
     "map + ugc": recipe_avatar,

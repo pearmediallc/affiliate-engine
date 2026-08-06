@@ -81,6 +81,15 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"lip-sync resume hook failed to start: {e}")
 
+    # Recover any reference-video (image-anchored i2v) renders interrupted by a restart — the failed
+    # job ec2d0aaa died exactly this way (restart mid-render → orphaned → produced nothing).
+    try:
+        import asyncio
+        from .routes.regen import resume_pending_refvideo
+        asyncio.create_task(resume_pending_refvideo())
+    except Exception as e:
+        logger.warning(f"reference-video resume hook failed to start: {e}")
+
     # Nightly learning heartbeat — OFF unless LEARN_NIGHTLY=true. Safe to run unattended: the
     # holdout gate + admin-approval gate mean nightly tuning only ever creates PROPOSALS, never
     # changes the engine. Minimal asyncio loop (no new dependency), mirrors the resume hook above.
