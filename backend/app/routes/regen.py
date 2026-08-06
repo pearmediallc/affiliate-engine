@@ -4692,11 +4692,11 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     words → size each clip to Seedance's real ~3.4 w/s pace), each clip runs through the same proven
     vision-QA loop (_gen_beat_with_eval), clips are stitched with xfade/acrossfade TRANSITIONS, and
     whisper+ASS CAPTIONS are burned on the final audio. Per-clip engine order:
-      PRIMARY  fal-seedance TRUE-first-frame i2v — the image IS literal frame 0, so the video OPENS on
-               the exact reference look (fixes the clip-1 drift). SILENT → a gender-locked TTS backstop
-               narrates the verbatim script + whisper captions carry the words.
-      FALLBACK Kie bytedance/seedance-2 — image as (soft) Frame-0 anchor + NATIVE audio (real lip-sync);
-               used only if the fal lane errors, so native lip-sync is kept, not deleted.
+      PRIMARY  Kie bytedance/seedance-2 — image as Frame-0 anchor + NATIVE audio (talking + lip-sync);
+               the one Seedance lane giving BOTH lip-sync AND image-anchor, like the working t2v lane.
+               Clip-1 drift is held by the vision-mirror (exact wardrobe/framing) + framing de-conflict.
+      FALLBACK fal-seedance (also true frame-0, but SILENT) — used only if the Kie lane errors; a
+               gender-locked TTS backstop then narrates the verbatim script so it's never silent.
     The DYNAMIC prompt replaces the old 'locked-off / statue / minimal breathing' text: the same person
     from @Image1 speaking naturally and expressively, natural head/hand motion — only the SCENE stays
     fixed (single_shot = one continuous scene, NOT a frozen frame). MEMORY: clips rendered + released
@@ -4792,35 +4792,34 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     # spend. Surfaced by recipe_reference_video via the request API so a re-run shows the NEW payload.
     if dry_run:
         clips_preview = [{"index": i, "prompt": _clip_prompt(i), "duration": per_list[i],
-                          "model": "fal-ai/bytedance/seedance/v1/lite/image-to-video", "image_url": ref_img,
-                          "generate_audio": False, "spoken_line": (chunks[i] if i < len(chunks) else "")}
+                          "model": "bytedance/seedance-2", "reference_image_urls": [ref_img],
+                          "generate_audio": True, "spoken_line": (chunks[i] if i < len(chunks) else "")}
                          for i in range(n_clips)]
         preview = {
-            "engine": "fal-seedance true-first-frame i2v (primary) · kie bytedance/seedance-2 native-audio (fallback)",
-            "model": "fal-ai/bytedance/seedance/v1/lite/image-to-video",
-            "prompt": _clip_prompt(0), "image_url": ref_img, "frame0_lane": "fal-seedance-i2v",
+            "engine": "kie bytedance/seedance-2 native-audio (primary) · fal-seedance i2v (fallback)",
+            "model": "bytedance/seedance-2",
+            "prompt": _clip_prompt(0), "reference_image_urls": [ref_img], "frame0_lane": "kie-seedance-2",
             "aspect": aspect, "resolution": resolution, "seconds": vo_sec,
             "gender": gender or None, "script": script,
             "single_shot": bool(frozen.get("single_shot")),
             "vision_mirror": _mirror or None,
-            "generate_audio": False, "audio_backstop": "gender-locked TTS + whisper captions",
-            "captions": True, "transitions": "xfade",
+            "generate_audio": True, "captions": True, "transitions": "xfade",
             "director": "bypassed", "n_clips": n_clips, "vo_seconds_estimate": vo_sec,
             "per_clip_seconds": per_list, "clips": clips_preview,
         }
-        logger.info(f"[refvideo][dry-run] fal-seedance TRUE-first-frame i2v primary (captions+xfade, "
-                    f"{n_clips} clip(s), {resolution}/{aspect}, gender={gender or 'unknown'}, "
-                    f"image={ref_img}): {_clip_prompt(0)[:1200]}")
+        logger.info(f"[refvideo][dry-run] SEEDANCE (audio+captions+xfade, {n_clips} clip(s), "
+                    f"{resolution}/{aspect}, gender={gender or 'unknown'}, image={ref_img}): "
+                    f"{_clip_prompt(0)[:1200]}")
         return {"dry_run": True, "preview": preview, "provider": "dry-run",
-                "segments": n_clips, "true_first_frame": True, "native_audio": False,
-                "captions_burned": True, "audio_state": "tts"}
+                "segments": n_clips, "true_first_frame": True, "native_audio": True,
+                "captions_burned": True, "audio_state": "native"}
 
-    # 3) RENDER — every clip is image-anchored (ref_img as frame 0), KIE/SEEDANCE ONLY (no Veo).
-    #    PRIMARY is fal-seedance TRUE-first-frame i2v (image_url = literal frame 0), so the video OPENS
-    #    on the exact reference look (the clip-1 drift fix); it is SILENT, so the gender-locked TTS
-    #    backstop below narrates the verbatim script. FALLBACK is Kie bytedance/seedance-2 with
-    #    generate_audio:true (native lip-sync) if the fal lane errors. Each clip runs through the proven
-    #    vision-QA loop (_gen_beat_with_eval), same as recipe_generate.
+    # 3) RENDER — every clip is image-anchored (ref_img as frame 0) + generate_audio:true so Seedance
+    #    SPEAKS the clip's verbatim line with REAL lip-sync (KIE/SEEDANCE ONLY — no Veo). Kie
+    #    bytedance/seedance-2 is the native-audio + image-anchor PRIMARY (both lip-sync AND anchor, like
+    #    the working t2v lane); fal-seedance (silent) the FALLBACK. Clip-1 drift is now held by the
+    #    vision-mirror + framing de-conflict. Each clip runs through the proven vision-QA loop
+    #    (_gen_beat_with_eval), same as recipe_generate.
     produced = {}
     def _kie_seedance(_prompt, _sec):
         r = KieAIService.generate_video_seedance(
@@ -4843,11 +4842,11 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
                         {"prompt": beat["prompt"], "seconds": _per_ci, "resolution": resolution,
                          "aspect_ratio": aspect, "generate_audio": True, "reference_image": ref_img})
         async def _attempt(bt, _per=_per_ci):
-            # fal-seedance TRUE-first-frame i2v PRIMARY (image_url IS frame 0 → opens on the exact
-            # reference look), Kie native-audio seedance-2 FALLBACK (reclaims real lip-sync if fal
-            # errors). Reads bt['prompt'] each call (the eval loop mutates it on coaching). BOTH anchor
-            # ref_img as frame 0 (no Veo, no scene invention).
-            for _lane in (_fal_seedance, _kie_seedance):
+            # Kie native-audio seedance-2 PRIMARY (generate_audio:true → REAL lip-sync AND image
+            # anchor, exactly like the working t2v lane — the one Seedance lane giving BOTH), fal
+            # silent FALLBACK. Reads bt['prompt'] each call (the eval loop mutates it on coaching).
+            # BOTH anchor ref_img as frame 0 (no Veo, no scene invention).
+            for _lane in (_kie_seedance, _fal_seedance):
                 try:
                     _lp, _prov, _cost = await asyncio.to_thread(_lane, bt.get("prompt"), _per)
                     if _lp and os.path.exists(_lp):
@@ -4976,9 +4975,8 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         except Exception as _ce:
             logger.warning(f"[reference-video] caption burn skipped: {_ce}")
 
-    # fal-seedance TRUE-first-frame i2v (silent) is the primary; Kie bytedance/seedance-2 (native
-    # audio) the fallback. Both anchor the input image as frame 0, so this is always a true-first-frame
-    # render (fal pins it literally as frame 0; Kie as a soft reference).
+    # Kie bytedance/seedance-2 (native audio + image anchor) is the primary; fal-seedance (silent) the
+    # fallback. Both anchor the input image as frame 0, so this is always a true-first-frame render.
     _provider = "kie-seedance-2" if providers == {"kie-seedance-2"} else (
         "fal-seedance" if providers == {"fal-seedance"} else "seedance (kie+fal)")
     return {"provider": _provider, "segments": len(norm), "true_first_frame": True,
@@ -5000,13 +4998,12 @@ async def recipe_reference_video(req: "RunRequest") -> list:
     nothing.
 
     • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Both lanes anchor the input image as Frame 0.
-        PRIMARY  fal-seedance TRUE-first-frame i2v — the reference image is the LITERAL frame 0, so the
-                 video OPENS on the exact reference look (this is the clip-1 drift fix: Kie's
-                 reference_image_urls was only a SOFT anchor and clip 1 drifted to a different shirt +
-                 a tight selfie). SILENT → a gender-locked TTS backstop narrates the verbatim script.
-        FALLBACK Kie bytedance/seedance-2 image-to-video with NATIVE audio (generate_audio:true) — used
-                 only if the fal lane errors; Seedance then SPEAKS the verbatim line with REAL lip-sync
-                 (native lip-sync is KEPT here, not deleted).
+        PRIMARY  Kie bytedance/seedance-2 image-to-video with NATIVE audio (generate_audio:true) — the
+                 reference image is the Frame-0 anchor (locks face/hair/wardrobe + background) and
+                 Seedance itself SPEAKS the clip's verbatim line with REAL lip-sync + a gender voice —
+                 the one Seedance lane giving BOTH lip-sync AND image-anchor, like the working t2v lane.
+        FALLBACK fal-seedance image-to-video (also true frame-0, but SILENT) — used only if the Kie lane
+                 errors; a gender-locked TTS backstop then narrates the verbatim script.
       Prompt = [VISION-MIRROR THE REFERENCE first] (a vision caption of the EXACT wardrobe + appearance
       + framing/shot-type + setting is PREPENDED to every clip so all clips hold the same look from the
       first frame — the main drift fix) + [user's prompt] + [ALIVE ACTION] (the same person speaking
