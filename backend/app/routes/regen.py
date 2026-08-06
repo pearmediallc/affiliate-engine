@@ -4873,6 +4873,7 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     #    restores $/% on words actually said — never injects unsaid words); full relabel when we
     #    narrated via gender-locked TTS (verbatim). One extra encode; best-effort (never blocks delivery).
     _caps_burned = False
+    _cwords = []
     if script and _audio_state != "none":
         try:
             from ..services import captions as cap
@@ -4901,7 +4902,10 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         "fal-seedance" if providers == {"fal-seedance"} else "seedance (kie+fal)")
     return {"provider": _provider, "segments": len(norm), "true_first_frame": True,
             "native_audio": (_audio_state == "native"), "audio_state": _audio_state,
-            "captions_burned": _caps_burned}
+            "captions_burned": _caps_burned,
+            # expose the whisper+ASS caption word-timings so recipe_reference_video can burn the
+            # 'rates may vary' disclaimer during the $ mentions (same as the t2v/lipsync lanes).
+            "caption_words": (_cwords if _caps_burned else [])}
 
 
 async def recipe_reference_video(req: "RunRequest") -> list:
@@ -4984,6 +4988,17 @@ async def recipe_reference_video(req: "RunRequest") -> list:
                                      {**assets, "captions": _lane.get("captions_burned", False)}, work) or {}
         except Exception as _qe:
             logger.warning(f"[reference-video] eval gate skipped: {_qe}")
+        # COMPLIANCE OVERLAYS — 'rates may vary' (on the $ mentions, from the caption word-timings the
+        # render already aligned) + 'AI GENERATED CONTENT' (last 3s), burned AFTER the eval gate so QA
+        # doesn't flag the intentional overlay as residual captions. Same shared _burn_disclaimers the
+        # t2v/avatar-lipsync/UGC lanes use, so EVERY delivered reference-video carries them (this lane
+        # was the sole gap). Fails LOUD inside _burn_disclaimers (logger.error) if the burn is empty.
+        try:
+            _disc = os.path.join(work, "disc.mp4")
+            if await asyncio.to_thread(_burn_disclaimers, out_path, (_lane.get("caption_words") or []), _disc):
+                import shutil as _shd; _shd.move(_disc, out_path)
+        except Exception as _de:
+            logger.warning(f"[reference-video] disclaimer overlay skipped: {_de}")
         _ae_persist(out_path, name)
         _refvideo_mark(req.request_id, "done", provider=_lane.get("provider"))
 
