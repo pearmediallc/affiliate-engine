@@ -4610,109 +4610,22 @@ def _refvideo_mark(request_id: str, status: str, error: str = None, provider: st
         logger.warning(f"[reference-video] checkpoint mark {status} skipped ({request_id}): {e}")
 
 
-def _refvideo_veo_prompt(frozen: dict, chunk: str, first: bool, single_shot: bool) -> str:
-    """Compose ONE Veo i2v segment prompt: the user's visual direction VERBATIM + the first-frame lock
-    + (this segment's) verbatim spoken line + a hard gender-voice instruction + no-on-screen-text."""
-    parts = [frozen["prompt"].strip()]
-    if first:
-        parts.append("@Image1 IS the exact first frame of this video — the identical person, face, "
-                     "wardrobe, background, framing and lighting. Begin ON that exact frame and animate "
-                     "forward naturally; do NOT re-imagine, restyle or change the person or the scene.")
-    else:
-        parts.append("Continue the SAME continuous take — the identical person, scene, framing and "
-                     "lighting as before; no cut, no new camera move, no new location.")
-    if single_shot:
-        parts.append("ONE continuous locked-off static shot from a fixed camera — no cuts, no b-roll, "
-                     "no cutaways, no scene changes; the whole clip is this single unbroken take.")
-    g = (frozen.get("gender") or "").lower()
-    if chunk:
-        _who = "man" if g == "male" else ("woman" if g == "female" else "person")
-        parts.append(f"The {_who} speaks directly to the camera with natural, synced mouth movement and "
-                     f'says, word for word and nothing else: "{chunk}".')
-    if g == "male":
-        parts.append("The voice is an adult MALE voice — never a female voice.")
-    elif g == "female":
-        parts.append("The voice is an adult FEMALE voice — never a male voice.")
-    return (" ".join(parts) + _REFVIDEO_NO_TEXT)[:1900]
+# (Veo lanes intentionally REMOVED from the reference-video path — this recipe is KIE/SEEDANCE ONLY,
+# per the user's engine mandate. No VC.generate_from_image / veo-3.1 anywhere below.)
 
 
-async def _refvideo_render_veo(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
-    """PRIMARY LANE — Veo 3.1 image-to-video: the reference image is the TRUE frame-0 and Veo renders
-    NATIVE, lip-synced audio. single_shot longer than 8s is one genuinely continuous take built from
-    Veo's native +7s extends (never beat-split, never a new scene). MEMORY: segments are rendered and
-    downloaded ONE at a time and concatenated on disk — never all held in RAM."""
-    from ..services.video_creator import VideoCreatorService as VC
-    from ..services import creative_team_activity as act
-    from ..services import realism_prompt_engine as _rpe
-    import math as _math
-    ref_img = frozen["image_urls"][0]
-    aspect = frozen["aspect_ratio"]
-    script = frozen["script"]
-    single_shot = frozen["single_shot"]
-    _dur_raw = frozen.get("seconds")
-    _auto = (not _dur_raw or str(_dur_raw).lower() == "auto")
-    # Segment plan: base 8s + native +7s extends. Duration is script-driven (auto) or the explicit cap.
-    chunks = _rpe.split_into_clips(script, max_words=18) if script else []
-    if _auto:
-        n_seg = max(1, min(6, len(chunks) or 1))
-    else:
-        n_seg = max(1, min(6, _math.ceil((int(_dur_raw) - 8) / 7) + 1))
-    if chunks and len(chunks) < n_seg:
-        n_seg = len(chunks)
-    act.set_expected_sec(req.request_id, n_seg * 240)   # Veo ~2-4 min/segment
-
-    # Preserve the real image type so Veo gets a matching mime (generate_from_image infers it from ext).
-    _ext = ".jpg" if re.search(r"\.jpe?g(\?|$)", ref_img, re.I) else ".png"
-    imgp = await _download_to_temp(ref_img, suffix=_ext)
-    paths = []
-    prev_op = None
-    try:
-        for k in range(n_seg):
-            await _abort_if_cancelled(req, f"veo ref segment {k+1}/{n_seg}")
-            act.tick(req.request_id, f"Veo image-to-video segment {k+1}/{n_seg} · {aspect}")
-            seg_chunk = chunks[k] if k < len(chunks) else ""
-            seg_prompt = _refvideo_veo_prompt(frozen, seg_chunk, first=(k == 0), single_shot=single_shot)
-            _log_model_call(req.request_id, f"veo-i2v ref segment {k+1}/{n_seg}", "veo-3.1-i2v",
-                            {"prompt": seg_prompt, "first_frame": (k == 0), "aspect_ratio": aspect})
-            if k == 0:
-                op = await asyncio.to_thread(VC.generate_from_image, imgp, seg_prompt, aspect, 8)
-            else:
-                op = await asyncio.to_thread(VC.extend_video, prev_op, seg_prompt)
-            prev_op = op["operation_name"]
-            _refvideo_checkpoint(req.request_id, frozen, name, req.callback_url,
-                                 status="running", provider="veo")
-            st = await _veo_wait(prev_op)
-            paths.append(st["video_path"])
-        if not paths:
-            raise RuntimeError("veo produced no segments")
-        if len(paths) == 1:
-            import shutil; shutil.copy(paths[0], out_path)
-        else:
-            lst = os.path.join(work, "veo_list.txt")
-            with open(lst, "w") as f:
-                for p in paths:
-                    f.write(f"file '{p}'\n")
-            await asyncio.to_thread(_ffmpeg,
-                ["-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-preset", "veryfast",
-                 "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out_path], timeout=600)
-    finally:
-        try: os.remove(imgp)
-        except OSError: pass
-        for p in paths:   # release Veo segment files as soon as they're concatenated (memory bound)
-            try: os.remove(p)
-            except OSError: pass
-    _track_cost(req.request_id, "video", "google", model="veo-3.1-i2v",
-                units=8 + 7 * (len(paths) - 1), unit_type="sec", cost_usd=0)
-    return {"provider": "veo", "segments": len(paths), "true_first_frame": True, "native_audio": True}
-
-
-async def _refvideo_render_fal(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
-    """FALLBACK LANE — fal-seedance image-to-video (the true frame-0, silent lane at recast-avatar
-    line ~2131) + a GENDER-HARD voice reading the script VERBATIM, muxed over the locked shot. Used
-    when Veo is unavailable/errors. GUARANTEES verbatim script + correct gender even when the primary
-    native-audio lane is down. Same locked scene throughout: every clip is i2v from the SAME reference
-    image (no new scene, no beats). MEMORY: clips rendered + released one at a time."""
+async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
+    """THE reference-video render — KIE / SEEDANCE ONLY (no Veo). Silent i2v of the locked shot +
+    a GENDER-HARD voice reading the script VERBATIM, muxed over it. Per-clip engine order:
+      PRIMARY  fal-seedance image-to-video — the image is the TRUE frame-0 (recast-avatar lane ~2131);
+               it honors 'the image must not change'.
+      FALLBACK Kie bytedance/seedance-2 image-to-video — a SOFT @Image1 reference (re-synthesis, not a
+               frozen frame), so it is the fallback, not the primary.
+    Both lanes are silent, so the gender-locked verbatim TTS below owns the audio (guaranteed script +
+    voice). Same locked scene throughout: every clip is i2v from the SAME reference image (no new scene,
+    no beats). MEMORY: clips rendered + released one at a time."""
     from ..services import fal_video as fv
+    from ..services.kieai_service import KieAIService
     from ..services import voice_studio as vs
     from ..services import creative_team_activity as act
     import math as _math
@@ -4740,32 +4653,46 @@ async def _refvideo_render_fal(req: "RunRequest", frozen: dict, out_path: str, n
             pass
 
     # 2) FOOTAGE — locked-off i2v from the SAME reference frame, enough clips to cover the VO. Every
-    #    clip is anchored to ref_img (single scene/character); provider fallback fal-seedance→kling→wan.
+    #    clip is anchored to ref_img (single scene/character). Per-clip engine order: fal-seedance (TRUE
+    #    frame-0) FIRST, then Kie bytedance/seedance-2 (SOFT @Image1) — Seedance both ways, no Veo.
     per = 8
     n_clips = max(1, min(6, _math.ceil(max(vo_sec, per) / per)))
     motion = (frozen["prompt"].strip() + " @Image1 IS the exact first frame — identical person, face, "
               "wardrobe, background and framing; begin on it and animate forward with subtle natural "
               "motion. ONE continuous locked-off static shot, no cuts, no scene change." + _REFVIDEO_NO_TEXT)[:1900]
-    clips = []
+
+    def _fal_seedance():
+        v = fv.generate_video("fal-seedance", motion, image_url=ref_img,
+                              seconds=per, aspect_ratio=aspect, resolution=resolution)
+        return (v.get("local_path"), "fal-seedance", float(v.get("cost_usd") or 0), True)   # TRUE frame-0
+
+    def _kie_seedance():
+        # SOFT @Image1 reference; silent (generate_audio=False) so the gender-locked TTS owns the audio.
+        r = KieAIService.generate_video_seedance(
+            prompt=motion, reference_image_urls=[ref_img], duration=per, resolution=resolution,
+            aspect_ratio=aspect, generate_audio=False, model="bytedance/seedance-2")
+        return (r.get("video_path"), "kie-seedance-2", 0.0, False)   # soft reference, NOT true frame-0
+
+    clips, providers = [], set()
     for i in range(n_clips):
-        await _abort_if_cancelled(req, f"fal ref clip {i+1}/{n_clips}")
-        act.tick(req.request_id, f"fal image-to-video (locked shot) clip {i+1}/{n_clips}")
-        vid = None
-        for _model in ("fal-seedance", "fal-kling", "fal-wan"):
+        await _abort_if_cancelled(req, f"seedance ref clip {i+1}/{n_clips}")
+        act.tick(req.request_id, f"Seedance image-to-video (locked shot) clip {i+1}/{n_clips}")
+        _local = _prov = None; _cost = 0.0; _tff = False
+        for _lane in (_fal_seedance, _kie_seedance):   # PRIMARY fal-seedance, then FALLBACK Kie seedance-2
             try:
-                vid = await asyncio.to_thread(
-                    fv.generate_video, _model, motion,
-                    image_url=ref_img, seconds=per, aspect_ratio=aspect, resolution=resolution)
-                break
+                _lp, _prov, _cost, _tff = await asyncio.to_thread(_lane)
+                if _lp and os.path.exists(_lp):
+                    _local = _lp; break
             except Exception as e:
-                logger.warning(f"[reference-video] fal {_model} i2v failed ({e}) — next provider")
-        if not vid or not vid.get("local_path"):
+                logger.warning(f"[reference-video] {getattr(_lane, '__name__', 'seedance')} i2v failed ({e}) — next lane")
+        if not _local:
             continue
-        clips.append(vid["local_path"])
-        _track_cost(req.request_id, "video", "fal", model=vid.get("model") or "fal-seedance",
-                    units=per, unit_type="sec", cost_usd=vid.get("cost_usd") or 0)
+        clips.append(_local); providers.add(_prov)
+        _track_cost(req.request_id, "video", ("fal" if _prov == "fal-seedance" else "kieai"),
+                    model=_prov, units=per, unit_type="sec", cost_usd=_cost)
     if not clips:
-        raise RuntimeError("reference-video: fal image-to-video produced no clips (all providers down)")
+        raise RuntimeError("reference-video: Seedance image-to-video produced no clips "
+                           "(fal-seedance AND Kie bytedance/seedance-2 both unavailable)")
 
     # 3) STITCH the locked clips (all the same scene), then mux the verbatim voiceover over them.
     W, H = (1080, 1920) if aspect == "9:16" else (1920, 1080)
@@ -4795,7 +4722,12 @@ async def _refvideo_render_fal(req: "RunRequest", frozen: dict, out_path: str, n
         await asyncio.to_thread(_mux_voice_keep_ambient, stitched, vo_path, out_path, 0.15, True)
     else:
         import shutil; shutil.copy(stitched, out_path)
-    return {"provider": "fal-seedance", "segments": len(norm), "true_first_frame": True, "native_audio": False}
+    # true-first-frame ONLY when every clip came from the fal-seedance (frozen frame-0) lane; a Kie
+    # bytedance/seedance-2 fallback clip is a SOFT @Image1 reference, so report it honestly.
+    _provider = "fal-seedance" if providers == {"fal-seedance"} else (
+        "kie-seedance-2" if providers == {"kie-seedance-2"} else "seedance (fal+kie)")
+    return {"provider": _provider, "segments": len(norm),
+            "true_first_frame": (providers == {"fal-seedance"}), "native_audio": False}
 
 
 async def recipe_reference_video(req: "RunRequest") -> list:
@@ -4808,14 +4740,14 @@ async def recipe_reference_video(req: "RunRequest") -> list:
     living room with b-roll hard cuts on the broken runway-gen4 i2v, then died on restart producing
     nothing.
 
-    • ENGINE (both lanes are TRUE first-frame — the image is actually frame 0, never a soft reference):
-        PRIMARY  Veo 3.1 image-to-video — true frame-0 + NATIVE lip-synced audio; single_shot longer
-                 than one clip = one continuous take via Veo's native +7s extends (no beat-split).
-        FALLBACK fal-seedance image-to-video (silent) + a GENDER-HARD voice reading the script verbatim
-                 — used when Veo is unavailable/errors; guarantees the exact script + correct gender.
-    • VERBATIM: the prompt is the visual direction as-is; the script is spoken word-for-word.
+    • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Per-clip lane order:
+        PRIMARY  fal-seedance image-to-video — the image is the TRUE frame-0 (honors 'image must not
+                 change'); silent, so the gender-locked verbatim TTS below owns the audio.
+        FALLBACK Kie bytedance/seedance-2 image-to-video — a SOFT @Image1 reference (re-synthesis, not
+                 a frozen frame), so it is the fallback, not the primary; also silent + TTS.
+    • VERBATIM: the prompt is the visual direction as-is; the script is spoken word-for-word (TTS).
     • GENDER: hard override — a man/male/he request never yields a woman's voice (stated wins, else
-      inferred from the words; the fal lane's pick_voice fails closed on an unknown gender).
+      inferred from the words; pick_voice fails closed on an unknown gender).
     • RESILIENCE: a durable checkpoint (RefVideoJob) is persisted with the frozen inputs BEFORE the
       first paid render, so an AE restart RESUMES (re-renders from the frozen, durable inputs and
       delivers) instead of zeroing the job. Peak memory is bounded — segments/clips are downloaded,
@@ -4841,23 +4773,11 @@ async def recipe_reference_video(req: "RunRequest") -> list:
 
     work = tempfile.mkdtemp()
     try:
-        from ..config import settings as _settings
-        _force = frozen.get("engine")
-        _lane = None
-        # PRIMARY: Veo i2v (true frame-0 + native audio) unless it's unconfigured or explicitly bypassed.
-        if _force not in ("fal", "fal-seedance", "seedance") and _settings.gemini_api_key:
-            try:
-                _lane = await _refvideo_render_veo(req, frozen, out_path, name, work)
-            except Cancelled:
-                raise
-            except Exception as e:
-                logger.warning(f"[reference-video] Veo i2v lane failed ({e}) — "
-                               f"falling back to fal-seedance i2v + gender-hard voiceover")
-        # FALLBACK: fal-seedance i2v (true frame-0, silent) + gender-hard verbatim TTS.
-        if not _lane or not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
-            _lane = await _refvideo_render_fal(req, frozen, out_path, name, work)
+        # KIE / SEEDANCE ONLY — no Veo anywhere. fal-seedance (TRUE frame-0) is the primary per-clip
+        # lane, Kie bytedance/seedance-2 (SOFT @Image1) the fallback; gender-locked verbatim TTS muxed.
+        _lane = await _refvideo_render_seedance(req, frozen, out_path, name, work)
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
-            raise RuntimeError("reference-video: no video produced by either i2v lane")
+            raise RuntimeError("reference-video: no video produced by the Seedance i2v lane")
 
         # FINAL QA GATE — grade the delivered file against the verbatim script (faithfulness, abrupt
         # end, residual captions, cast). Never discards the render: on deliver=False the variant is
