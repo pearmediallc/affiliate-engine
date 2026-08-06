@@ -4640,9 +4640,21 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
 
     # 1) VOICE — gender is a HARD filter (a 'man' request can NEVER get a woman's voice). TTS drives
     #    runtime: synth first, then render exactly enough locked-shot footage to cover the voiceover.
-    #    DRY-RUN skips TTS entirely (no synth spend); vo_sec falls back to the requested/default duration.
+    #    DURATION — honor an explicit caller `seconds`; otherwise SIZE TO THE VERBATIM SCRIPT so the
+    #    locked footage spans the ENTIRE read (never a truncated/sped-up 12s default). Use the SAME
+    #    ~2.5 w/s (150 wpm) VO pace the rest of the pipeline uses — estimate_audio_seconds_from_text,
+    #    which _fit_script_to_seconds (budget=2.5*seconds) + the studio length estimate already share —
+    #    so the footage matches the gender-locked TTS that gets muxed. DRY-RUN skips TTS entirely (no
+    #    synth spend) and relies on this script-sized estimate; the non-dry-run path below refines it
+    #    with the ACTUAL synthesized-audio duration.
     vo_path = None
-    vo_sec = int(frozen.get("seconds")) if (frozen.get("seconds") and str(frozen.get("seconds")).lower() != "auto") else 12
+    if frozen.get("seconds") and str(frozen.get("seconds")).lower() != "auto":
+        vo_sec = int(frozen.get("seconds"))                                     # explicit caller duration wins
+    elif script:
+        from ..services.cost_tracker import estimate_audio_seconds_from_text
+        vo_sec = int(_math.ceil(estimate_audio_seconds_from_text(script)))      # size to the verbatim script (~2.5 w/s)
+    else:
+        vo_sec = 12                                                             # no script + no seconds → minimal default
     if script and not dry_run:
         act.tick(req.request_id, "casting a gender-matched voice + reading the script verbatim")
         if gender not in ("male", "female"):
