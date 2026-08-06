@@ -4557,6 +4557,8 @@ def _refvideo_frozen(assets: dict, req: "RunRequest") -> dict:
         "seconds": assets.get("seconds"), "aspect_ratio": assets.get("aspect_ratio") or "9:16",
         "resolution": (assets.get("resolution") or "480p"), "engine": (assets.get("engine") or "").lower(),
         "vertical": (req.context.get("vertical") if isinstance(req.context, dict) else "") or "",
+        # DRY-RUN: compose the exact Seedance request and STOP before any paid render (no video, no credits).
+        "dry_run": bool(assets.get("dry_run")),
     }
 
 
@@ -4634,12 +4636,14 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     resolution = frozen["resolution"]
     script = frozen["script"]
     gender = frozen["gender"]
+    dry_run = bool(frozen.get("dry_run"))
 
     # 1) VOICE — gender is a HARD filter (a 'man' request can NEVER get a woman's voice). TTS drives
     #    runtime: synth first, then render exactly enough locked-shot footage to cover the voiceover.
+    #    DRY-RUN skips TTS entirely (no synth spend); vo_sec falls back to the requested/default duration.
     vo_path = None
     vo_sec = int(frozen.get("seconds")) if (frozen.get("seconds") and str(frozen.get("seconds")).lower() != "auto") else 12
-    if script:
+    if script and not dry_run:
         act.tick(req.request_id, "casting a gender-matched voice + reading the script verbatim")
         if gender not in ("male", "female"):
             raise RuntimeError("reference-video (fal lane): character gender unknown — refusing to guess a "
@@ -4674,6 +4678,29 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         "face, a slight natural head glance toward the camera, subtle breathing. Locked-off static shot "
         "from a fixed camera — no camera movement, no zoom, no pan, no cuts, no scene change; same "
         "person, same scene throughout." + _REFVIDEO_NO_TEXT)[:1900]
+
+    # DRY-RUN — everything above (frozen inputs, gender, verbatim script, single_shot, the EXACT
+    # mirror-then-action prompt, model/aspect/resolution/duration, frame-0 image) is now composed.
+    # STOP here: do NOT call Kie/Seedance, do NOT run TTS/lip-sync/compositing, spend nothing. Return
+    # the captured payload so recipe_reference_video can surface it via the request API.
+    if dry_run:
+        clips_preview = [{"index": i, "prompt": motion, "duration": per,
+                          "model": "bytedance/seedance-2", "reference_image_urls": [ref_img]}
+                         for i in range(n_clips)]
+        preview = {
+            "engine": "seedance", "model": "bytedance/seedance-2",
+            "prompt": motion, "reference_image_urls": [ref_img],
+            "aspect": aspect, "resolution": resolution, "seconds": per,
+            "gender": gender or None, "script": script,
+            "single_shot": bool(frozen.get("single_shot")),
+            "generate_audio": False, "n_clips": n_clips, "vo_seconds_estimate": vo_sec,
+            "clips": clips_preview,
+        }
+        logger.info(f"[refvideo][dry-run] SEEDANCE PROMPT (model=bytedance/seedance-2, {n_clips} clip(s), "
+                    f"{resolution}/{aspect}/{per}s, gender={gender or 'unknown'}, image={ref_img}): "
+                    f"{motion[:1400]}")
+        return {"dry_run": True, "preview": preview, "provider": "dry-run",
+                "segments": n_clips, "true_first_frame": True, "native_audio": False}
 
     def _kie_seedance():
         # PRIMARY — Kie bytedance/seedance-2: the reference image goes in as the Frame-0 anchor (i2v
@@ -4783,18 +4810,31 @@ async def recipe_reference_video(req: "RunRequest") -> list:
                 f"(gender={frozen['gender'] or 'unknown'}, single_shot={frozen['single_shot']}, "
                 f"script={'yes' if frozen['script'] else 'no'})")
 
+    dry_run = bool(frozen.get("dry_run"))
     name, out_path, url = _out_url(req, "refvideo")
-    _refvideo_checkpoint(req.request_id, frozen, name, req.callback_url, status="running")
-    # HARD cost gate before any paid render (projects the whole take).
-    _proj_sec = int(frozen["seconds"]) if (frozen.get("seconds") and str(frozen["seconds"]).lower() != "auto") else 16
-    _gate_job_cost(req.request_id, f"reference-video i2v (~{_proj_sec}s @ {frozen['resolution']})",
-                   _t2v_projected_usd(frozen["resolution"], True, _proj_sec), assets)
+    if not dry_run:
+        _refvideo_checkpoint(req.request_id, frozen, name, req.callback_url, status="running")
+        # HARD cost gate before any paid render (projects the whole take). Skipped for a dry-run (spends nothing).
+        _proj_sec = int(frozen["seconds"]) if (frozen.get("seconds") and str(frozen["seconds"]).lower() != "auto") else 16
+        _gate_job_cost(req.request_id, f"reference-video i2v (~{_proj_sec}s @ {frozen['resolution']})",
+                       _t2v_projected_usd(frozen["resolution"], True, _proj_sec), assets)
 
     work = tempfile.mkdtemp()
     try:
         # KIE / SEEDANCE ONLY — no Veo anywhere. fal-seedance (TRUE frame-0) is the primary per-clip
         # lane, Kie bytedance/seedance-2 (SOFT @Image1) the fallback; gender-locked verbatim TTS muxed.
         _lane = await _refvideo_render_seedance(req, frozen, out_path, name, work)
+        # DRY-RUN — the renderer composed the exact Seedance request and stopped. Surface the captured
+        # payload as a single variant (dry_run_preview) via the callback; render/QA/persist all SKIPPED.
+        if dry_run or _lane.get("dry_run"):
+            preview = _lane.get("preview") or {}
+            logger.info(f"[refvideo][dry-run] captured Seedance payload for {req.request_id}: "
+                        f"{json.dumps(preview)[:1500]}")
+            return [{"recipe": "Reference Video (dry-run)", "confidence": 0.0,
+                     "dry_run_preview": preview,
+                     "whats_changed": "DRY-RUN — composed the EXACT Seedance request (mirror-then-action "
+                                      "prompt, frame-0 image, model/aspect/resolution/duration); NO video "
+                                      "generated, no credits spent."}]
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
             raise RuntimeError("reference-video: no video produced by the Seedance i2v lane")
 
