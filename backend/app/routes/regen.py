@@ -4653,32 +4653,49 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
             pass
 
     # 2) FOOTAGE — locked-off i2v from the SAME reference frame, enough clips to cover the VO. Every
-    #    clip is anchored to ref_img (single scene/character). Per-clip engine order: fal-seedance (TRUE
-    #    frame-0) FIRST, then Kie bytedance/seedance-2 (SOFT @Image1) — Seedance both ways, no Veo.
+    #    clip is anchored to ref_img (single scene/character). Per-clip engine order: Kie bytedance/
+    #    seedance-2 (the user's platform + credits; anchors the image as Frame 0) FIRST, then fal-seedance
+    #    (also true frame-0) as the fallback. BOTH lock the input image as frame 0 — no Veo anywhere.
+    #
+    # PROMPT COMPOSITION for max fidelity = [MIRROR THE REFERENCE first] + [CONTROLLED ACTION]:
+    #   • FIRST restate what is ALREADY in the image/user prompt (character + setting) — frozen["prompt"]
+    #     IS that reference description, so it LEADS and anchors frame-0 (face/hair/wardrobe + background/
+    #     lighting/layout).
+    #   • THEN the minimal controlled action (subtle talk, slight head glance, breathing) — locked-off,
+    #     no camera move/zoom. Motion kept SUBTLE and deliberately under-prompted so nothing drifts.
     per = 8
     n_clips = max(1, min(6, _math.ceil(max(vo_sec, per) / per)))
-    motion = (frozen["prompt"].strip() + " @Image1 IS the exact first frame — identical person, face, "
-              "wardrobe, background and framing; begin on it and animate forward with subtle natural "
-              "motion. ONE continuous locked-off static shot, no cuts, no scene change." + _REFVIDEO_NO_TEXT)[:1900]
-
-    def _fal_seedance():
-        v = fv.generate_video("fal-seedance", motion, image_url=ref_img,
-                              seconds=per, aspect_ratio=aspect, resolution=resolution)
-        return (v.get("local_path"), "fal-seedance", float(v.get("cost_usd") or 0), True)   # TRUE frame-0
+    motion = (
+        frozen["prompt"].strip() +                                              # [MIRROR THE REFERENCE]
+        " The reference image (@Image1) IS frame 0 of this video — the identical person (same face, "
+        "hair, wardrobe) in the identical setting (same background, lighting and layout); keep them "
+        "EXACTLY as in the reference, do NOT change, restyle or replace the person or the scene." +
+        " Minimal controlled motion only: natural talking with subtle mouth movement, calm relaxed "     # [CONTROLLED ACTION]
+        "face, a slight natural head glance toward the camera, subtle breathing. Locked-off static shot "
+        "from a fixed camera — no camera movement, no zoom, no pan, no cuts, no scene change; same "
+        "person, same scene throughout." + _REFVIDEO_NO_TEXT)[:1900]
 
     def _kie_seedance():
-        # SOFT @Image1 reference; silent (generate_audio=False) so the gender-locked TTS owns the audio.
+        # PRIMARY — Kie bytedance/seedance-2: the reference image goes in as the Frame-0 anchor (i2v
+        # first-frame input via reference_image_urls, @Image1 in the prompt). Silent (generate_audio=
+        # False) so the gender-locked verbatim TTS owns the audio → guaranteed script + correct voice.
         r = KieAIService.generate_video_seedance(
             prompt=motion, reference_image_urls=[ref_img], duration=per, resolution=resolution,
             aspect_ratio=aspect, generate_audio=False, model="bytedance/seedance-2")
-        return (r.get("video_path"), "kie-seedance-2", 0.0, False)   # soft reference, NOT true frame-0
+        return (r.get("video_path"), "kie-seedance-2", 0.0, True)   # anchors image as frame 0
+
+    def _fal_seedance():
+        # FALLBACK — fal-seedance i2v (also true frame-0), used only if the Kie lane errors.
+        v = fv.generate_video("fal-seedance", motion, image_url=ref_img,
+                              seconds=per, aspect_ratio=aspect, resolution=resolution)
+        return (v.get("local_path"), "fal-seedance", float(v.get("cost_usd") or 0), True)   # true frame-0
 
     clips, providers = [], set()
     for i in range(n_clips):
         await _abort_if_cancelled(req, f"seedance ref clip {i+1}/{n_clips}")
         act.tick(req.request_id, f"Seedance image-to-video (locked shot) clip {i+1}/{n_clips}")
         _local = _prov = None; _cost = 0.0; _tff = False
-        for _lane in (_fal_seedance, _kie_seedance):   # PRIMARY fal-seedance, then FALLBACK Kie seedance-2
+        for _lane in (_kie_seedance, _fal_seedance):   # PRIMARY Kie seedance-2, then FALLBACK fal-seedance
             try:
                 _lp, _prov, _cost, _tff = await asyncio.to_thread(_lane)
                 if _lp and os.path.exists(_lp):
@@ -4722,12 +4739,12 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         await asyncio.to_thread(_mux_voice_keep_ambient, stitched, vo_path, out_path, 0.15, True)
     else:
         import shutil; shutil.copy(stitched, out_path)
-    # true-first-frame ONLY when every clip came from the fal-seedance (frozen frame-0) lane; a Kie
-    # bytedance/seedance-2 fallback clip is a SOFT @Image1 reference, so report it honestly.
-    _provider = "fal-seedance" if providers == {"fal-seedance"} else (
-        "kie-seedance-2" if providers == {"kie-seedance-2"} else "seedance (fal+kie)")
+    # BOTH lanes anchor the input image as frame 0 (Kie bytedance/seedance-2 + fal-seedance), so this
+    # is always a true-first-frame render regardless of which one produced the clips.
+    _provider = "kie-seedance-2" if providers == {"kie-seedance-2"} else (
+        "fal-seedance" if providers == {"fal-seedance"} else "seedance (kie+fal)")
     return {"provider": _provider, "segments": len(norm),
-            "true_first_frame": (providers == {"fal-seedance"}), "native_audio": False}
+            "true_first_frame": True, "native_audio": False}
 
 
 async def recipe_reference_video(req: "RunRequest") -> list:
@@ -4740,11 +4757,13 @@ async def recipe_reference_video(req: "RunRequest") -> list:
     living room with b-roll hard cuts on the broken runway-gen4 i2v, then died on restart producing
     nothing.
 
-    • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Per-clip lane order:
-        PRIMARY  fal-seedance image-to-video — the image is the TRUE frame-0 (honors 'image must not
-                 change'); silent, so the gender-locked verbatim TTS below owns the audio.
-        FALLBACK Kie bytedance/seedance-2 image-to-video — a SOFT @Image1 reference (re-synthesis, not
-                 a frozen frame), so it is the fallback, not the primary; also silent + TTS.
+    • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Both lanes anchor the input image as Frame 0.
+        PRIMARY  Kie bytedance/seedance-2 image-to-video — the user's platform + credits; the reference
+                 image goes in as the Frame-0 anchor (locks face/hair/wardrobe + background/lighting/
+                 layout). Silent, so the gender-locked verbatim TTS owns the audio.
+        FALLBACK fal-seedance image-to-video (also true frame-0), used only if the Kie lane errors.
+      Prompt = [MIRROR THE REFERENCE first] (the user's prompt/character+setting LEADS, anchoring
+      frame-0) + [CONTROLLED ACTION] (minimal subtle talk/glance/breathing, locked-off, no camera move).
     • VERBATIM: the prompt is the visual direction as-is; the script is spoken word-for-word (TTS).
     • GENDER: hard override — a man/male/he request never yields a woman's voice (stated wins, else
       inferred from the words; pick_voice fails closed on an unknown gender).
