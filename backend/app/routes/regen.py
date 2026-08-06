@@ -4682,8 +4682,8 @@ def _refvideo_mark(request_id: str, status: str, error: str = None, provider: st
 
 
 async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
-    """THE reference-video render — KIE / SEEDANCE ONLY (no Veo), but now ALIVE + lip-synced, the way
-    the proven t2v lane (recipe_generate) works — only ANCHORED to the reference image and DIRECTOR-FREE.
+    """THE reference-video render — Kie-Seedance PRIMARY with a Veo i2v fallback, now ALIVE + lip-synced,
+    the way the proven t2v lane (recipe_generate) works — only ANCHORED to the reference image and DIRECTOR-FREE.
 
     Per clip: image-to-video with `generate_audio=True` so Seedance speaks that clip's portion of the
     VERBATIM script with REAL lip-sync + a gender-correct voice (NATIVE audio, no detached muxed TTS).
@@ -4695,7 +4695,9 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
       PRIMARY  Kie bytedance/seedance-2 — image as Frame-0 anchor + NATIVE audio (talking + lip-sync);
                the one Seedance lane giving BOTH lip-sync AND image-anchor, like the working t2v lane.
                Clip-1 drift is held by the vision-mirror (exact wardrobe/framing) + framing de-conflict.
-      FALLBACK fal-seedance (also true frame-0, but SILENT) — used only if the Kie lane errors; a
+      FALLBACK Veo 3.1 i2v (VC.generate_from_image) — image as the LITERAL first frame + NATIVE audio,
+               so a Kie failure keeps BOTH lip-sync AND the anchor. Fires only if Kie errors.
+      LAST RESORT fal-seedance (true frame-0, but SILENT) — only if Veo is unconfigured/errors; a
                gender-locked TTS backstop then narrates the verbatim script so it's never silent.
     The DYNAMIC prompt replaces the old 'locked-off / statue / minimal breathing' text: the same person
     from @Image1 speaking naturally and expressively, natural head/hand motion — only the SCENE stays
@@ -4796,8 +4798,9 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
                           "generate_audio": True, "spoken_line": (chunks[i] if i < len(chunks) else "")}
                          for i in range(n_clips)]
         preview = {
-            "engine": "kie bytedance/seedance-2 native-audio (primary) · fal-seedance i2v (fallback)",
+            "engine": "kie bytedance/seedance-2 native-audio (primary) · veo-3.1 i2v native-audio (fallback)",
             "model": "bytedance/seedance-2",
+            "fallback": "veo-3.1-i2v (native audio + image first-frame) → fal-seedance+TTS last resort",
             "prompt": _clip_prompt(0), "reference_image_urls": [ref_img], "frame0_lane": "kie-seedance-2",
             "aspect": aspect, "resolution": resolution, "seconds": vo_sec,
             "gender": gender or None, "script": script,
@@ -4815,9 +4818,10 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
                 "captions_burned": True, "audio_state": "native"}
 
     # 3) RENDER — every clip is image-anchored (ref_img as frame 0) + generate_audio:true so Seedance
-    #    SPEAKS the clip's verbatim line with REAL lip-sync (KIE/SEEDANCE ONLY — no Veo). Kie
-    #    bytedance/seedance-2 is the native-audio + image-anchor PRIMARY (both lip-sync AND anchor, like
-    #    the working t2v lane); fal-seedance (silent) the FALLBACK. Clip-1 drift is now held by the
+    #    SPEAKS the clip's verbatim line with REAL lip-sync. Kie bytedance/seedance-2 is the native-audio
+    #    + image-anchor PRIMARY (both lip-sync AND anchor, like the working t2v lane); FALLBACK is Veo
+    #    3.1 i2v (native audio + image first-frame → also keeps lip-sync + anchor); LAST RESORT is
+    #    fal-seedance (silent) + a TTS backstop if Veo is unconfigured. Clip-1 drift is held by the
     #    vision-mirror + framing de-conflict. Each clip runs through the proven vision-QA loop
     #    (_gen_beat_with_eval), same as recipe_generate.
     produced = {}
@@ -4826,6 +4830,41 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
             prompt=_prompt, reference_image_urls=[ref_img], duration=_sec, resolution=resolution,
             aspect_ratio=aspect, generate_audio=True, model="bytedance/seedance-2")   # NATIVE audio → lip-sync
         return (r.get("local_path") or r.get("video_path"), "kie-seedance-2", float(r.get("cost_usd") or 0.0))
+    def _veo_i2v(_prompt, _sec):
+        # FALLBACK: Veo 3.1 image-to-video — the reference image is the LITERAL first frame AND Veo
+        # emits NATIVE audio (lip-sync), so a Kie failure keeps BOTH lip-sync and the image anchor
+        # (fal-seedance is silent and loses lip-sync). The per-clip prompt already carries the SPOKEN
+        # LINE as dialogue + the male voice lock. Fires only if Kie errors; if Veo has no key it raises
+        # → falls through to the fal-seedance + TTS last resort. Sync (runs in the lane worker thread).
+        from ..services.video_creator import VideoCreatorService as VC
+        import time as _t
+        if not settings.gemini_api_key:
+            raise RuntimeError("Veo not configured (no GEMINI_API_KEY)")
+        _local = produced.get("_veo_img")
+        if not (_local and os.path.exists(_local)):
+            _ext = os.path.splitext((ref_img or "").split("?")[0])[1] or ".jpg"
+            _local = os.path.join(work, f"veo_ref{_ext}")
+            with httpx.Client(timeout=300, follow_redirects=True) as _c:
+                _r = _c.get(ref_img); _r.raise_for_status()
+                with open(_local, "wb") as _f:
+                    _f.write(_r.content)
+            produced["_veo_img"] = _local
+        _vd = 8 if _sec >= 7 else 6 if _sec >= 5 else 4      # Veo 3.1 i2v durations: 4/6/8s
+        _op = VC.generate_from_image(image_path=_local, prompt=_prompt, aspect_ratio=aspect, duration=_vd)
+        _name = _op.get("operation_name")
+        if not _name:
+            raise RuntimeError(f"Veo i2v: no operation name ({_op})")
+        _cost = float(_op.get("cost_usd") or 0.0)
+        _started = _t.time()
+        while _t.time() - _started < 1200:
+            _st = VC.check_status(_name)
+            if _st.get("done"):
+                _vp = _st.get("video_path")
+                if _st.get("status") == "failed" or not _vp:
+                    raise RuntimeError(f"Veo i2v failed: {_st.get('error')}")
+                return (_vp, "veo-3.1-i2v", _cost)   # native audio + image first-frame
+            _t.sleep(15)
+        raise RuntimeError("Veo i2v timed out")
     def _fal_seedance(_prompt, _sec):
         v = fv.generate_video("fal-seedance", _prompt, image_url=ref_img,
                               seconds=_sec, aspect_ratio=aspect, resolution=resolution)   # true frame-0, SILENT
@@ -4843,10 +4882,11 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
                          "aspect_ratio": aspect, "generate_audio": True, "reference_image": ref_img})
         async def _attempt(bt, _per=_per_ci):
             # Kie native-audio seedance-2 PRIMARY (generate_audio:true → REAL lip-sync AND image
-            # anchor, exactly like the working t2v lane — the one Seedance lane giving BOTH), fal
-            # silent FALLBACK. Reads bt['prompt'] each call (the eval loop mutates it on coaching).
-            # BOTH anchor ref_img as frame 0 (no Veo, no scene invention).
-            for _lane in (_kie_seedance, _fal_seedance):
+            # anchor, exactly like the working t2v lane — the one Seedance lane giving BOTH). FALLBACK
+            # Veo 3.1 i2v (native audio + image as first frame → keeps lip-sync AND anchor on a Kie
+            # error). LAST RESORT fal-seedance (silent → TTS backstop) if Veo is unconfigured/errors.
+            # Reads bt['prompt'] each call (the eval loop mutates it on coaching).
+            for _lane in (_kie_seedance, _veo_i2v, _fal_seedance):
                 try:
                     _lp, _prov, _cost = await asyncio.to_thread(_lane, bt.get("prompt"), _per)
                     if _lp and os.path.exists(_lp):
@@ -4975,10 +5015,13 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         except Exception as _ce:
             logger.warning(f"[reference-video] caption burn skipped: {_ce}")
 
-    # Kie bytedance/seedance-2 (native audio + image anchor) is the primary; fal-seedance (silent) the
-    # fallback. Both anchor the input image as frame 0, so this is always a true-first-frame render.
-    _provider = "kie-seedance-2" if providers == {"kie-seedance-2"} else (
-        "fal-seedance" if providers == {"fal-seedance"} else "seedance (kie+fal)")
+    # Kie bytedance/seedance-2 (native audio + image anchor) is the primary; Veo 3.1 i2v (native audio
+    # + image first-frame) the fallback; fal-seedance (silent) the last resort. All anchor the input
+    # image as frame 0, so this is always a true-first-frame render.
+    _provider = ("kie-seedance-2" if providers == {"kie-seedance-2"} else
+                 "fal-seedance" if providers == {"fal-seedance"} else
+                 "veo-3.1-i2v" if providers == {"veo-3.1-i2v"} else
+                 ("+".join(sorted(p for p in providers if p)) or "kie-seedance-2"))
     return {"provider": _provider, "segments": len(norm), "true_first_frame": True,
             "native_audio": (_audio_state == "native"), "audio_state": _audio_state,
             "captions_burned": _caps_burned,
@@ -4997,13 +5040,15 @@ async def recipe_reference_video(req: "RunRequest") -> list:
     living room with b-roll hard cuts on the broken runway-gen4 i2v, then died on restart producing
     nothing.
 
-    • ENGINE — KIE / SEEDANCE ONLY (no Veo anywhere). Both lanes anchor the input image as Frame 0.
+    • ENGINE — all lanes anchor the input image as Frame 0.
         PRIMARY  Kie bytedance/seedance-2 image-to-video with NATIVE audio (generate_audio:true) — the
                  reference image is the Frame-0 anchor (locks face/hair/wardrobe + background) and
                  Seedance itself SPEAKS the clip's verbatim line with REAL lip-sync + a gender voice —
                  the one Seedance lane giving BOTH lip-sync AND image-anchor, like the working t2v lane.
-        FALLBACK fal-seedance image-to-video (also true frame-0, but SILENT) — used only if the Kie lane
-                 errors; a gender-locked TTS backstop then narrates the verbatim script.
+        FALLBACK Veo 3.1 image-to-video (native audio + the reference image as the LITERAL first frame)
+                 — used only if the Kie lane errors; keeps BOTH lip-sync AND the image anchor.
+        LAST RESORT fal-seedance image-to-video (true frame-0, but SILENT) — only if Veo is
+                 unconfigured/errors; a gender-locked TTS backstop then narrates the verbatim script.
       Prompt = [VISION-MIRROR THE REFERENCE first] (a vision caption of the EXACT wardrobe + appearance
       + framing/shot-type + setting is PREPENDED to every clip so all clips hold the same look from the
       first frame — the main drift fix) + [user's prompt] + [ALIVE ACTION] (the same person speaking
