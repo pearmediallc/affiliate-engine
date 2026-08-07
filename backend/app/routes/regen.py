@@ -7711,7 +7711,9 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
     srcs = []
     for u in clip_urls:
         try:
-            _lp = await _download_to_temp(u, ".mp4")
+            # AE-GENERATED b-roll is handed in as a LOCAL file path (not a URL) — use it directly instead
+            # of an httpx fetch. Library clips are still presigned URLs and stream through _download_to_temp.
+            _lp = u if (isinstance(u, str) and os.path.exists(u)) else await _download_to_temp(u, ".mp4")
             # WATERMARK GUARD (bounded, cached): drop a clip carrying a baked stock/watermark overlay —
             # a pervasive full-frame 'PROTECTED'/stock mark survives the caption-band scrub and must
             # never ship. Fall through to the next candidate in the pool.
@@ -7852,10 +7854,110 @@ def _heavy_emotion_spans(cap_words: list, T: float) -> list:
     return out
 
 
+# Strong refs to fire-and-forget generated-b-roll → CL ingest tasks (don't let the loop GC them).
+_gen_broll_ingest_tasks: set = set()
+
+
+async def _generate_broll_clip(prompt: str, work: str, vertical: str = "", seconds: int = 5) -> Optional[str]:
+    """Generate ONE short (~4-5s), SILENT, NO-FACE b-roll clip (9:16/480p) from a script beat, using the
+    realism 'broll' profile (documentary/iPhone realism, no plastic look, no on-screen text). Returns a
+    local mp4 path or None. FAIL-OPEN: any error → None (the caller falls back to library/plain). Prefers
+    Seedance t2v when Kie is configured; MultiProviderVideoService fails over to the next b_roll provider
+    otherwise. Audio is irrelevant here — the composite always cuts b-roll in silent (-an)."""
+    from ..services import realism_prompt_engine as rpe
+    from ..services.multi_provider_video import MultiProviderVideoService as MPV
+    try:
+        p = rpe.build_prompt(model="seedance-2", request_type="broll",
+                             action=(prompt or "a realistic no-people b-roll scene relevant to the ad"),
+                             environment="authentic lived-in real-world setting; objects, hands and screens only",
+                             vertical=(vertical or ""), audio=False)
+    except Exception as e:
+        logger.warning(f"[gen-broll] prompt build failed ({e}); using raw beat")
+        p = (prompt or "")[:500]
+    # HARD no-face / no-text guard on top of the profile (belt-and-suspenders — the profile already says so).
+    p += " Absolutely NO human faces, no people in frame, no on-screen text, captions or watermarks."
+    dur = max(3, min(6, int(seconds or 5)))
+    try:
+        result = await asyncio.to_thread(
+            MPV.generate, prompt=p, shot_type="b_roll", duration=dur,
+            preferred_model="seedance-2", s3_prefix="regen-broll")
+    except Exception as e:
+        logger.warning(f"[gen-broll] generation failed ({e})")
+        return None
+    if not result:
+        return None
+    # resolve to a local mp4 (async poll for Veo-style providers; sync providers return a path/url directly)
+    if result.get("async"):
+        from ..services.video_creator import VideoCreatorService
+        op = result.get("operation_name")
+        for _ in range(45):
+            await asyncio.sleep(8)
+            st = await asyncio.to_thread(VideoCreatorService.check_status, op)
+            if st.get("done"):
+                vp = st.get("video_path")
+                if vp and os.path.exists(vp):
+                    return vp
+                du = st.get("download_url")
+                return await _download_to_temp(du) if du and du.startswith("http") else None
+        return None
+    vp = result.get("video_path")
+    if vp and os.path.exists(vp):
+        return vp
+    du = result.get("download_url") or ""
+    if du.startswith("http"):
+        return await _download_to_temp(du)
+    if du.startswith("/"):
+        return await _download_to_temp(f"{AE_PUBLIC_URL}{du}")
+    return None
+
+
+async def _ingest_broll_to_cl(local_path: str, meta: dict) -> None:
+    """Best-effort: register a freshly-GENERATED no-face b-roll clip into Creative-Library's asset_library
+    (which owns the S3 bucket + embeddings) so the NEXT matching script casts it FROM THE LIBRARY instead
+    of re-generating. Stages the clip at a fetchable URL (presigned durable-S3 → public /uploads fallback)
+    and POSTs to CL's secret-authed /ingest-broll-clip (same shared secret as /cast-assets). Non-fatal —
+    never raises, never blocks delivery."""
+    base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
+    if not base or not (local_path and os.path.exists(local_path)):
+        return
+    candidates = []
+    try:
+        from ..services.storage import StorageService
+        import uuid as _uuid
+        _key = f"regen-broll/{_uuid.uuid4().hex[:12]}.mp4"
+        if await asyncio.to_thread(StorageService.upload_file, local_path, _key):
+            _ps = await asyncio.to_thread(StorageService.presign_url, _key, 21600)   # 6h — plenty for CL to fetch
+            if _ps:
+                candidates.append(_ps)
+    except Exception as e:
+        logger.warning(f"[gen-broll] S3 stage failed ({e})")
+    try:
+        import uuid as _uuid, shutil as _sh
+        nm = f"gen_broll_{_uuid.uuid4().hex[:10]}.mp4"
+        _sh.copy(local_path, os.path.join(UPLOAD_DIR, nm))
+        candidates.append(f"{AE_PUBLIC_URL}/api/v1/uploads/{nm}")
+    except Exception as e:
+        logger.warning(f"[gen-broll] /uploads stage failed ({e})")
+    for url in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(f"{base}/api/regen/ingest-broll-clip",
+                                 headers={"x-regen-secret": CALLBACK_SECRET},
+                                 json={**meta, "url": url})
+                r.raise_for_status()
+                _b = r.json() or {}
+                logger.info(f"[gen-broll] ✅ ingested generated clip into CL library "
+                            f"(vertical={meta.get('vertical')}) → id={_b.get('data', {}).get('id')}")
+                return
+        except Exception as e:
+            logger.warning(f"[gen-broll] CL ingest via {str(url)[:60]} failed ({e}); trying next source")
+
+
 async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: dict,
                              layout: str, work: str, req: "RunRequest",
                              hook_urls: list = None, interior_urls: list = None,
-                             cap_words: list = None) -> tuple:
+                             cap_words: list = None, generate_specs: list = None,
+                             broll_mode: str = None) -> tuple:
     """Intercut satisfaction/interior b-roll over the lip-synced talking-head, keeping ONE continuous
     VO. Returns (composited_path | None, status) — status is surfaced in the variant feedback so a live
     run REVEALS exactly what happened (cast counts / bail reason) without needing server logs. The
@@ -7911,6 +8013,36 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     if not any(k == "broll" for _, _, k, _ in segs):
         return None, "skipped: no broll segment"
 
+    # 1b) GENERATED no-face b-roll (piece 3) — for each MISS slot CL flagged (broll_generate), generate a
+    #     short SILENT scenic clip and use it EXACTLY like a library clip below. CAP at 3/video. FAIL-OPEN:
+    #     any gen error → skip that slot (fall back to library/plain). 'library' mode never passes specs;
+    #     'ai'/'best' may. Each successful clip is auto-ingested into CL's library (detached, fail-open) so
+    #     the NEXT matching script casts it from the library — no re-generation.
+    gen_paths = []
+    _specs = list(generate_specs or [])[:3]
+    if _specs and str(broll_mode or "").lower() != "library":
+        for _sp in _specs:
+            if len(gen_paths) >= 3:
+                break
+            try:
+                _bp = (_sp.get("broll_prompt") or _sp.get("beat_text") or "") if isinstance(_sp, dict) else str(_sp)
+                if not str(_bp).strip():
+                    continue
+                _beat = (_sp.get("beat_text") if isinstance(_sp, dict) else "") or ""
+                _gc = await _generate_broll_clip(_bp, work, vertical=(intent.get("vertical") or ""), seconds=5)
+                if _gc and os.path.exists(_gc):
+                    gen_paths.append(_gc)
+                    _t = asyncio.create_task(_ingest_broll_to_cl(_gc, {
+                        "vertical": intent.get("vertical") or "", "kind": "broll",
+                        "scene": _beat, "source_beat": _beat}))
+                    _gen_broll_ingest_tasks.add(_t); _t.add_done_callback(_gen_broll_ingest_tasks.discard)
+            except Cancelled:
+                raise
+            except Exception as _ge:
+                logger.warning(f"[gen-broll] slot generation failed ({_ge}) — skipping (fail-open)")
+    if gen_paths:
+        logger.info(f"[ugc-broll] generated {len(gen_paths)} no-face b-roll clip(s) (mode={broll_mode})")
+
     # 2) footage pools — satisfaction 'hook' openers (cross-vertical) + same-vertical interiors.
     #    PREFER URLs the CL caller cast from asset_library (AE's own asset_tags store doesn't hold these
     #    clips); fall back to the AE-side cast only when none were passed. LIBRARY ONLY — never stock.
@@ -7922,14 +8054,19 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     random.shuffle(hooks)
     random.shuffle(interiors)
     nh, ni = len(hooks), len(interiors)
+    ng = len(gen_paths)
     _src = "cl" if (hook_urls or interior_urls) else "ae"
+    if ng:                                                    # generated clips at the FRONT → used first
+        _src = f"{_src}+gen"                                  #   (in 'ai' mode they dominate the montage)
+        hooks = list(gen_paths) + hooks
+        interiors = list(gen_paths) + interiors
     if not hooks:                                             # no satisfaction clips → reuse interiors
         hooks = interiors
     if not interiors:
         interiors = hooks
     if not hooks and not interiors:
         logger.info("[ugc-broll] library has no b-roll to cast — plain talking-head")
-        return None, f"no b-roll cast (src={_src} hooks={nh} interiors={ni})"
+        return None, f"no b-roll cast (src={_src} hooks={nh} interiors={ni} gen={ng})"
 
     # 3) render each timeline segment at WxH/30fps, silent (face cut from the lip-sync master; b-roll
     #    montage from the right pool). Keeping each face segment at its ORIGINAL time preserves the
@@ -8025,7 +8162,7 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
         logger.warning(f"[ugc-broll] compose mux failed: {me}")
         return None, "mux failed"
     if os.path.exists(out):
-        return out, f"composited {layout} · {nbroll} b-roll window(s) · src={_src} hooks={nh} interiors={ni}"
+        return out, f"composited {layout} · {nbroll} b-roll window(s) · src={_src} hooks={nh} interiors={ni} gen={ng}"
     return None, "no output file"
 
 
@@ -8096,9 +8233,12 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
                 _ub_layout = "ham" if (vidx % 2 == 1) else "rit"
                 _ub_hooks = a.get("broll_hook_urls") if isinstance(a, dict) else None
                 _ub_inter = a.get("broll_interior_urls") if isinstance(a, dict) else None
+                _ub_gen = a.get("broll_generate") if isinstance(a, dict) else None      # per-slot MISSES → generate no-face b-roll
+                _ub_mode = a.get("broll_mode") if isinstance(a, dict) else None          # library | ai | best
                 _ub, _ub_status = await _compose_ugc_broll(_fm, vo_audio, float(vo_sec), _ub_intent, _ub_layout,
                                                            _ub_work, req, hook_urls=_ub_hooks,
-                                                           interior_urls=_ub_inter, cap_words=_cap_words)
+                                                           interior_urls=_ub_inter, cap_words=_cap_words,
+                                                           generate_specs=_ub_gen, broll_mode=_ub_mode)
                 _ugc_broll_note = _ub_status or ""
                 if _ub and os.path.exists(_ub):
                     result = {"local_path": _ub}
