@@ -8426,7 +8426,8 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
                 _um_work = tempfile.mkdtemp()   # NOT cleaned here — the composite lives in it until the variant reads it
                 _state = (a.get("state") or "").strip()
                 _um, _um_status = await _compose_ugc_map(_fm, vo_audio, float(vo_sec), _state,
-                                                         _um_work, req, vertical=(vertical or ""))
+                                                         _um_work, req, vertical=(vertical or ""),
+                                                         map_asset_url=(a.get("map_asset_url") or ""))
                 _map_note = _um_status or ""
                 if _um and os.path.exists(_um):
                     result = {"local_path": _um}
@@ -8554,10 +8555,14 @@ def _reanchor_ass_top(ass_path: str) -> str:
 
 
 async def _compose_ugc_map(face_path: str, vo_audio: str, vo_sec: float, state: str,
-                           work: str, req, vertical: str = ""):
+                           work: str, req, vertical: str = "", map_asset_url: str = ""):
     """UGC + MAP: composite the lip-synced talking head as a rounded 'bust' card anchored bottom-center
-    over a FULL-FRAME animated state map (slow zoom push-in on the highlighted state). Captions are
-    burned at TOP by the variant producer (caption_place='top') so they clear the bust.
+    over a FULL-FRAME animated state map. Captions are burned at TOP by the variant producer
+    (caption_place='top') so they clear the bust.
+
+    MAP SOURCE (cost-saver): when CL casts a real per-state map clip from the asset library
+    (map_asset_url), REUSE it as the background — no from-scratch render, and our proper animated maps
+    (globe→state→pin) show. Only when there's no library map for the state do we render a flat map.
 
     NOTE (tradeoff): no rembg on the 2GB worker, so the bust is a rounded-rect INSERT, not a true
     background cutout. A real matte (birefnet/rembg via a hosted call or a heavier worker) is a
@@ -8567,24 +8572,38 @@ async def _compose_ugc_map(face_path: str, vo_audio: str, vo_sec: float, state: 
     FPS = 30
     T = max(1.0, float(vo_sec or 0))
     frames = max(1, int(round(T * FPS)))
-    # 1) MAP BACKGROUND — highlighted state, or a neutral slate gradient when no state resolves.
-    map_png = os.path.join(work, "map_bg.png")
-    ok = False
-    if state:
-        ok = await asyncio.to_thread(_render_state_map, state, W, H, map_png, 0.55)
-    if not ok:
-        g = Image.new("RGB", (W, H)); gd = ImageDraw.Draw(g)
-        for y in range(0, H, 4):
-            t = y / max(1, H - 1)
-            gd.rectangle([0, y, W, y + 4], fill=(int(226 - 26 * t), int(232 - 18 * t), int(240 - 10 * t)))
-        g.save(map_png)
-    # 2) ANIMATE — slow zoom push-in (the "zoom into the state" beat) on the map still.
     map_clip = os.path.join(work, "map_clip.mp4")
-    await asyncio.to_thread(_ffmpeg,
-        ["-loop", "1", "-t", f"{T:.2f}", "-i", map_png,
-         "-vf", (f"scale={W * 2}:{H * 2},zoompan=z='min(zoom+0.0006,1.20)':d={frames}:"
-                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={FPS},setsar=1"),
-         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-t", f"{T:.2f}", map_clip], 400)
+    map_src = "render"
+    # 1) MAP BACKGROUND — prefer OUR library map clip (reuse, no render); else render a flat map.
+    if map_asset_url:
+        try:
+            _mraw = await _download_to_temp(map_asset_url, ".mp4")
+            await asyncio.to_thread(_ffmpeg,
+                ["-stream_loop", "-1", "-t", f"{T:.2f}", "-i", _mraw,
+                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1",
+                 "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                 "-t", f"{T:.2f}", map_clip], 500)
+            if os.path.exists(map_clip):
+                map_src = "library-asset"
+        except Exception as e:
+            logger.warning(f"[ugc-map] library map asset failed ({e}) — rendering a fallback map")
+    if map_src == "render":
+        map_png = os.path.join(work, "map_bg.png")
+        ok = False
+        if state:
+            ok = await asyncio.to_thread(_render_state_map, state, W, H, map_png, 0.55)
+        if not ok:
+            g = Image.new("RGB", (W, H)); gd = ImageDraw.Draw(g)
+            for y in range(0, H, 4):
+                t = y / max(1, H - 1)
+                gd.rectangle([0, y, W, y + 4], fill=(int(226 - 26 * t), int(232 - 18 * t), int(240 - 10 * t)))
+            g.save(map_png)
+        # slow zoom push-in (the "zoom into the state" beat) on the rendered still
+        await asyncio.to_thread(_ffmpeg,
+            ["-loop", "1", "-t", f"{T:.2f}", "-i", map_png,
+             "-vf", (f"scale={W * 2}:{H * 2},zoompan=z='min(zoom+0.0006,1.20)':d={frames}:"
+                     f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={FPS},setsar=1"),
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-t", f"{T:.2f}", map_clip], 400)
     # 3) BUST CARD — rounded-rect mask; face scaled/cropped to the card; overlaid bottom-center.
     cardW = (int(W * 0.66) // 2) * 2
     cardH = (int(H * 0.40) // 2) * 2
@@ -8614,7 +8633,7 @@ async def _compose_ugc_map(face_path: str, vo_audio: str, vo_sec: float, state: 
         logger.warning(f"[ugc-map] composite ffmpeg failed: {e}")
         return None, f"error: {str(e)[:80]}"
     if os.path.exists(out):
-        return out, f"map={state or 'neutral'} · bust bottom-center · captions top ({T:.0f}s)"
+        return out, f"map={state or 'neutral'}({map_src}) · bust bottom-center · captions top ({T:.0f}s)"
     return None, "no output file"
 
 
