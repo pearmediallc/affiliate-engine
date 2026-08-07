@@ -2787,8 +2787,12 @@ async def _video_router_segregate(req: "RunRequest", vtype: str) -> str:
             locked = "UGC + B-Roll"
         elif a.get("ref_anchor") or (a.get("image_urls") and route in ("reference_image", "")):
             locked = "Reference Video"
-        elif route == "ugc":
-            locked = "Avatar Lipsync"
+        # NOTE: route == "ugc" is DELIBERATELY not mapped. A plain UGC job is dispatched by CL as
+        # "Generate Video" (recipe_generate), which does the avatar-cast handoff
+        # (character_video_url = fallback_avatar_url) before lip-syncing AND can choose t2v/Seedance.
+        # Forcing "Avatar Lipsync" here skipped that handoff → recipe_avatar_lipsync ran with no
+        # character_video_url → char_url fell back to req.active_url (a status-poll endpoint) → the
+        # lip-sync providers 403'd. So for ugc we KEEP the CL-assigned vtype and only confirm/log below.
         vert = str(a.get("vertical") or (req.context.get("vertical") if isinstance(req.context, dict) else "") or "").replace("_", " ").strip()
         if locked:
             act.finish("router", req.request_id, ts, ok=True,
@@ -2989,7 +2993,10 @@ async def recipe_avatar(req: RunRequest) -> list:
         if not url:
             raise RuntimeError("avatar render timed out/failed")
     except Exception as e:
-        char_url = (req.assets or {}).get("character_video_url") or getattr(req, "active_url", None)
+        # Degrade to the real-footage lip-sync lane ONLY when a genuine character clip exists. Never use
+        # req.active_url as a stand-in — it is the job's status-poll endpoint (returns JSON + needs a
+        # secret), so lip-sync providers 403 on it. No real clip → let the original error raise (re-dispatch).
+        char_url = (req.assets or {}).get("character_video_url")
         if char_url:
             logger.warning(f"TikTok Symphony avatar failed ({e}) — degrading to real-footage lip-sync lane")
             try:
@@ -8650,9 +8657,13 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     from ..services.storage import StorageService
 
     a = req.assets or {}
-    char_url = a.get("character_video_url") or req.active_url
+    # The lip-sync SOURCE must be a real character clip. Never fall back to req.active_url — it is the
+    # job's status-poll endpoint (JSON + secret-gated), so handing it to sync.so/veed 403s ("Error
+    # downloading file"). Missing clip → raise loudly so the job re-dispatches (and re-casts) instead.
+    char_url = a.get("character_video_url")
     if not char_url:
-        raise RuntimeError("avatar-lipsync: no character video provided")
+        raise RuntimeError("avatar-lipsync: no character video provided (refusing to use the status-poll "
+                           "endpoint as a source — re-dispatch to re-cast a real avatar clip)")
     seconds = int(a.get("seconds") or 20)
     offer_value = (a.get("offer_value") or "").strip()
     vertical = a.get("vertical") or req.context.get("vertical") or ""
