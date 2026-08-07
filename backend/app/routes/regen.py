@@ -5517,6 +5517,26 @@ async def _generate_t2v_clip(*, prompt, image_urls, video_urls, audio_urls, seco
         "all text-to-video providers unavailable — " + "; ".join(reasons or ["none configured"]))
 
 
+async def _cl_resolve_url(url_or_key: str):
+    """Ask CL (the bucket owner) to mint a FRESH presigned URL for one of ITS assets. AE cannot presign
+    the CL bucket, so a CL-owned avatar/clip URL or key — including a double-bucket-mangled one — must be
+    resolved here. Returns a fresh URL or None. Best-effort; never raises."""
+    base = (getattr(settings, "creative_library_url", "") or "").rstrip("/")
+    if not base or not url_or_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{base}/api/regen/resolve-asset",
+                             headers={"x-regen-secret": CALLBACK_SECRET},
+                             json={"url": url_or_key})
+        if r.status_code < 300:
+            return (r.json() or {}).get("url")
+        logger.warning(f"[generate] CL resolve-asset {r.status_code}: {(r.text or '')[:120]}")
+    except Exception as e:
+        logger.warning(f"[generate] CL resolve-asset failed: {e}")
+    return None
+
+
 async def _cast_library_avatar(intent: dict):
     """Scan the tagged asset library for the best clip matching the parsed intent (gender/age/scene/
     vertical). Read-only DB scan; never raises. Returns (avatar_pick_url, avatar_tags, any_pick_url,
@@ -5580,10 +5600,26 @@ async def _cast_library_avatar(intent: dict):
     # avatar. AssetTag.s3_key is the durable handle, so mint a FRESH, long-lived presigned URL per pick;
     # fall back to the stored url only when no key/presign is available.
     from ..services.storage import StorageService
-    def _fresh(key, stored):
+    _ae_bucket = (getattr(settings, "aws_s3_bucket", "") or "affiliate-engine-videos").lower()
+    def _needs_cl(key, stored):
+        # The library avatars live in CL's bucket, NOT ours — AE cannot presign them (presign_url would
+        # wrap the CL host as a KEY under OUR bucket → the double-nested unfetchable URL). Route those
+        # (and any host-bearing / creative-library key) to CL, which owns the bucket. Our OWN keys presign locally.
+        blob = f"{key or ''} {stored or ''}".lower()
+        if _ae_bucket and _ae_bucket in blob:
+            return False
+        return ("creative-library" in blob) or (".amazonaws.com/" in str(key or "").lower()) or ("/reference-assets/" in blob)
+    async def _fresh(key, stored):
+        if not key and not stored:
+            return None
+        if _needs_cl(key, stored):
+            r = await _cl_resolve_url(stored or key)   # CL mints a FRESH, valid presign (also heals an expired one)
+            if r:
+                return r
         return (StorageService.presign_url(key, expires=604800) or stored) if key else stored
-    return ((_fresh(best_lip_key, best_lip.get("url")) if best_lip else None), best_lip,
-            (_fresh(best_any_key, best_any.get("url")) if best_any else None), best_any)
+    _lip_url = (await _fresh(best_lip_key, best_lip.get("url"))) if best_lip else None
+    _any_url = (await _fresh(best_any_key, best_any.get("url"))) if best_any else None
+    return (_lip_url, best_lip, _any_url, best_any)
 
 
 async def _cl_cast_broll(vertical: str = "", scene: str = "") -> dict:
