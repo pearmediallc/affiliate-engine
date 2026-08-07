@@ -4621,6 +4621,9 @@ def _refvideo_frozen(assets: dict, req: "RunRequest") -> dict:
         "gender": gender, "single_shot": bool(single_shot),
         "seconds": assets.get("seconds"), "aspect_ratio": assets.get("aspect_ratio") or "9:16",
         "resolution": (assets.get("resolution") or "480p"), "engine": (assets.get("engine") or "").lower(),
+        # TRANSITION CHOICE (piece 3): none | blend | zoom | match_cut — how multi-clip joins are stitched.
+        # Absent → today's behavior (xfade 'fade' dissolve). Frozen so a restart resumes the same join.
+        "transition_style": (assets.get("transition_style") or "").strip().lower(),
         "vertical": (req.context.get("vertical") if isinstance(req.context, dict) else "") or "",
         # DRY-RUN: compose the exact Seedance request and STOP before any paid render (no video, no credits).
         "dry_run": bool(assets.get("dry_run")),
@@ -4681,6 +4684,24 @@ def _refvideo_mark(request_id: str, status: str, error: str = None, provider: st
 # per the user's engine mandate. No VC.generate_from_image / veo-3.1 anywhere below.)
 
 
+def _beat_performance(_txt, _idx, _n):
+    """PERFORMANCE DIRECTOR (shared by the t2v lane AND the reference-video lane) — map THIS beat's
+    spoken copy to an emotion + ONE subtle micro-gesture so the arc follows the SCRIPT (pain →
+    discovery → CTA), not a random rotation. Rendered through realism_prompt_engine._emotion_cue so it
+    lands as physical face/body cues, never the bare adjective. Promoted from a recipe_generate nested
+    def so the reference-video lane reuses the IDENTICAL director (fixes the per-clip pose-reset)."""
+    _t = (_txt or "").lower()
+    _cta  = re.search(r"\b(tap|click|link|below|visit|sign up|get your|check|enter your|see if|see what)\b", _t)
+    _pain = re.search(r"storm|damage|worried|worry|stress|overpay|expensive|denied|hassle|flood|crack|leak|broke|struggl|afford|\bold\b|bill", _t)
+    _disc = re.search(r"found|turns out|actually|surprised|only|saved|save|cover|approv|easy|fast|quick|simple|realiz", _t)
+    if _cta:  return "confident, warm", "open hand toward camera, relaxed nod"
+    if _pain: return "frustrated, concerned", "slight head shake, glancing away"
+    if _disc: return "surprised, relieved", "eyebrows lift, small nod"
+    if _idx == 0:       return "worried, concerned", "slight head shake, glancing away"
+    if _idx >= _n - 1:  return "confident, warm", "open hand toward camera, relaxed nod"
+    return "surprised, hopeful", "eyebrows lift, small nod"
+
+
 async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: str, name: str, work: str) -> dict:
     """THE reference-video render — Kie-Seedance PRIMARY with a Veo i2v fallback, now ALIVE + lip-synced,
     the way the proven t2v lane (recipe_generate) works — only ANCHORED to the reference image and DIRECTOR-FREE.
@@ -4716,6 +4737,15 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     gender = frozen["gender"]
     dry_run = bool(frozen.get("dry_run"))
 
+    # TRANSITION CHOICE (piece 3) — pick the multi-clip JOIN style; absent → today's behavior (xfade
+    # 'fade' dissolve). 'none'/'match_cut' → a clean HARD join (concat, no dissolve — match_cut reads as
+    # a cut on continued motion). 'zoom' → a subtle push-in (xfade 'zoomin'). 'blend' → the short
+    # dissolve (xfade 'fade'). An unknown value falls back to the natural default (fade). Applied in the
+    # stitch step (step 4); a single-clip take has no boundary so no transition ever runs.
+    _tx = (frozen.get("transition_style") or "").strip().lower()
+    _hard_join = _tx in ("none", "match_cut")
+    _xfade_kind = {"blend": "fade", "zoom": "zoomin"}.get(_tx, "fade")
+
     # 1) DURATION + PER-CLIP SCRIPT SPLIT — sized to the VERBATIM SCRIPT exactly like the proven t2v
     #    lane (recipe_generate): chunk to ~46 words, then size EACH clip to Seedance's REAL ~3.4 w/s
     #    delivery so a clip ends when its words do (no empty tail to improvise garbage into). Minimal
@@ -4730,6 +4760,12 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
     def _clip_secs(_txt):
         return max(4, min(15, _math.ceil(len((_txt or "").split()) / 3.4)))
     chunks = _rpe.split_into_clips(script, max_words=46) if script else []
+    # SINGLE-CLIP PREFERENCE (piece 2) — if the ENTIRE sized read fits ONE Seedance clip (<=~15s ≈ 51
+    # words at the real ~3.4 w/s pace) keep it as a SINGLE clip: no boundary, no transition, a perfect
+    # single take. Overrides a multi-sentence split that would needlessly cut a short read into pieces.
+    # Longer reads keep the minimal ~15s-cap split below (fewest boundaries).
+    if chunks and script and _math.ceil(len(script.split()) / 3.4) <= 15:
+        chunks = [script.strip()]
     if chunks:
         n_clips = max(1, min(len(chunks), 8))            # 8-clip safety ceiling against a runaway split
         chunks = chunks[:n_clips]
@@ -4777,10 +4813,37 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         "NOT restyle or replace the person or the scene." + _voice_lock + _scene_lock +
         _REFVIDEO_REALISM_TEXTURE + _REFVIDEO_NO_TEXT)
 
+    # PERFORMANCE LAYER (piece 1) — the vision-mirror + base_prompt above are the CONSISTENCY layer
+    # (identity, wardrobe, camera placement, framing, setting — IDENTICAL on every clip). The look stays
+    # locked; only the ACTION varies. This adds a DIFFERENT, forward-PROGRESSING natural beat per clip so
+    # motion FLOWS instead of every clip resetting into the same opening pose (the pose-reset/loop bug).
+    # Reuses the proven t2v performance director (_beat_performance → realism_prompt_engine._emotion_cue)
+    # for the copy-aware emotion+gesture, plus a staged progression (settle in → gesture → lean in) so the
+    # beat advances across clips.
+    _BEAT_STAGE = (
+        "settling in — a small settling breath, then glancing to camera as they begin",
+        "mid-thought and engaged — a natural hand gesture (or picking up / setting down a nearby mug) as they make the point",
+        "leaning in slightly, warm and direct, one hand opening toward camera",
+    )
+    def _clip_performance(ci):
+        if n_clips <= 1:
+            _stage = _BEAT_STAGE[1]
+        else:
+            _stage = _BEAT_STAGE[0] if ci == 0 else (_BEAT_STAGE[-1] if ci >= n_clips - 1 else _BEAT_STAGE[1])
+        _emo, _ges = _beat_performance(chunks[ci] if ci < len(chunks) else "", ci, max(1, n_clips))
+        # For every clip after the first, do NOT restart the take: the person is already mid-performance,
+        # so the motion carries forward instead of snapping back to clip 0's opening pose.
+        _flow = ("" if ci == 0 else
+                 " The person is ALREADY mid-performance, continuing the moment forward — do NOT reset to "
+                 "the opening pose and do NOT repeat the previous clip's gesture; the motion moves ON.")
+        return (" Performance for THIS clip (subtle, natural, no theatrical or exaggerated motion): "
+                f"{_stage}; {_rpe._emotion_cue(_emo, _ges)}.{_flow}")
+
     def _clip_prompt(ci):
         # THIS clip speaks ONLY its own chunk of the verbatim script, in sequence — same per-clip
-        # SPOKEN LINE contract the t2v lane uses (kills the "same opening rendered twice" bug).
-        cp = base_prompt
+        # SPOKEN LINE contract the t2v lane uses (kills the "same opening rendered twice" bug). The
+        # CONSISTENCY layer (base_prompt) is identical every clip; the PERFORMANCE layer progresses.
+        cp = base_prompt + _clip_performance(ci)
         _chunk = chunks[ci] if ci < len(chunks) else ""
         if _chunk:
             _hook = (" The person is ALREADY speaking from the very first frame — no silent lead-in, "
@@ -4806,7 +4869,9 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
             "gender": gender or None, "script": script,
             "single_shot": bool(frozen.get("single_shot")),
             "vision_mirror": _mirror or None,
-            "generate_audio": True, "captions": True, "transitions": "xfade",
+            "generate_audio": True, "captions": True,
+            # single clip → no boundary/transition; else the chosen join (default xfade 'fade').
+            "transitions": ("none" if n_clips <= 1 else (_tx or "xfade")),
             "director": "bypassed", "n_clips": n_clips, "vo_seconds_estimate": vo_sec,
             "per_clip_seconds": per_list, "clips": clips_preview,
         }
@@ -4930,7 +4995,11 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
         import shutil; shutil.copy(norm[0], stitched)
     else:
         def _stitch(_norm, _out):
-            try:
+            # TRANSITION CHOICE (piece 3): 'none'/'match_cut' → skip xfade, go straight to the clean
+            # HARD-cut concat below (a hard join on continued motion). 'zoom'/'blend'/absent → the xfade
+            # dissolve/push-in (_xfade_kind), which still degrades to concat on ANY ffmpeg error.
+            if not _hard_join:
+              try:
                 _d = 0.28
                 _durs = [(_ffprobe_duration(c) or 0) for c in _norm]
                 if any(x <= _d * 3 for x in _durs):
@@ -4941,16 +5010,18 @@ async def _refvideo_render_seedance(req: "RunRequest", frozen: dict, out_path: s
                 _vf = []; _af = []; _vp = "0:v"; _ap = "0:a"; _cum = _durs[0]
                 for k in range(1, len(_norm)):
                     _off = max(0.0, _cum - _d)
-                    _vf.append(f"[{_vp}][{k}:v]xfade=transition=fade:duration={_d}:offset={_off:.3f}[vx{k}]")
+                    _vf.append(f"[{_vp}][{k}:v]xfade=transition={_xfade_kind}:duration={_d}:offset={_off:.3f}[vx{k}]")
                     _af.append(f"[{_ap}][{k}:a]acrossfade=d={_d}[ax{k}]")
                     _vp = f"vx{k}"; _ap = f"ax{k}"; _cum = _cum + _durs[k] - _d
                 _ffmpeg([*_inp, "-filter_complex", ";".join(_vf + _af), "-map", f"[{_vp}]", "-map",
                          f"[{_ap}]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
                          "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", _out], timeout=900)
-                logger.info(f"[reference-video] stitched {len(_norm)} clips with crossfade transitions")
+                logger.info(f"[reference-video] stitched {len(_norm)} clips with {_xfade_kind} transition")
                 return
-            except Exception as _xe:
+              except Exception as _xe:
                 logger.warning(f"[reference-video] xfade stitch failed ({_xe}); hard-cut concat fallback")
+            else:
+                logger.info(f"[reference-video] transition '{_tx}' → clean hard-cut join ({len(_norm)} clips)")
             _lst = os.path.join(work, "ref_list.txt")
             with open(_lst, "w") as f:
                 for n2 in _norm:
@@ -6438,20 +6509,9 @@ async def recipe_generate(req: RunRequest) -> list:
         _multi_scene = len(_scene_vars) >= 2 and not _continuous_mode and not _locked
         _identity_ref_b = None           # #3 SECOND identity ref: a wider / side, NON-selfie frame from
                                          # clip 0 → served as @Image2 on changed-angle continuation shots.
-        # #1 PERFORMANCE DIRECTOR — map THIS beat's spoken copy to an emotion + ONE subtle micro-gesture so
-        # the arc follows the SCRIPT (pain → discovery → CTA), not a random rotation. Rendered through
-        # _emotion_cue so it lands as physical face/body cues, never the bare adjective.
-        def _beat_performance(_txt, _idx, _n):
-            _t = (_txt or "").lower()
-            _cta  = re.search(r"\b(tap|click|link|below|visit|sign up|get your|check|enter your|see if|see what)\b", _t)
-            _pain = re.search(r"storm|damage|worried|worry|stress|overpay|expensive|denied|hassle|flood|crack|leak|broke|struggl|afford|\bold\b|bill", _t)
-            _disc = re.search(r"found|turns out|actually|surprised|only|saved|save|cover|approv|easy|fast|quick|simple|realiz", _t)
-            if _cta:  return "confident, warm", "open hand toward camera, relaxed nod"
-            if _pain: return "frustrated, concerned", "slight head shake, glancing away"
-            if _disc: return "surprised, relieved", "eyebrows lift, small nod"
-            if _idx == 0:       return "worried, concerned", "slight head shake, glancing away"
-            if _idx >= _n - 1:  return "confident, warm", "open hand toward camera, relaxed nod"
-            return "surprised, hopeful", "eyebrows lift, small nod"
+        # #1 PERFORMANCE DIRECTOR — _beat_performance (now module-level, shared with the reference-video
+        # lane) maps THIS beat's spoken copy to an emotion + ONE subtle micro-gesture so the arc follows
+        # the SCRIPT (pain → discovery → CTA), rendered through _emotion_cue as physical face/body cues.
 
         async def _render_one(ci):
             """Render ONE clip end-to-end (setup → prompt → eval loop) → (ci, clip_path, per_ci). Thread-safe
