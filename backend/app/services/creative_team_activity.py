@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 ROSTER = [
     {"id": "director",   "role": "Creative Director", "seat": "head",  "emoji": "🎬",
      "desc": "The smart leader — orchestrates everyone; picks references, model per beat, and marks cuts vs lip-sync."},
+    {"id": "router",     "role": "Video Router",       "seat": "head",  "emoji": "🧭",
+     "desc": "Segregates which KIND of video the request is (reference-image / UGC / UGC+B-Roll / UGC+Map) and the vertical, then locks the lane so nothing downstream re-guesses."},
     {"id": "strategist", "role": "Strategist",        "seat": "left",  "emoji": "🧠",
      "desc": "Diagnoses the loser vs winner ROI data and decides the fix."},
     {"id": "scriptwriter","role": "Copywriter",       "seat": "left",  "emoji": "✍️",

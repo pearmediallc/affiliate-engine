@@ -2762,6 +2762,63 @@ def _budget_blocked():
     return (spent >= cap, spent, cap)
 
 
+_DEFAULT_VTYPE = "Hook Change Only"
+_ROUTE_TO_VTYPE = {"reference_image": "Reference Video", "ugc": "Avatar Lipsync",
+                   "ugc_broll": "UGC + B-Roll", "ugc_map": "UGC + Map"}
+
+
+async def _video_router_segregate(req: "RunRequest", vtype: str) -> str:
+    """VIDEO ROUTER (creative-team member 'router') — its ONLY job is to segregate WHICH kind of video
+    this request is and lock the lane so nothing downstream re-guesses. Fast path ('if required'): when
+    CL already locked a route (assets.route / ugc_map / ugc_broll / ref_anchor), just CONFIRM it. Only
+    when NO route is locked AND the variation_type is the bare fallback does it actually reason (a cheap
+    LLM classify), so an EXPLICIT recipe (hook/caption/reclean/…) is never overridden. Logs to the office
+    feed either way, so the segregation is a visible, auditable team step. Returns the (possibly refined)
+    vtype. Never raises — a router error leaves vtype untouched."""
+    from ..services import creative_team_activity as act
+    a = req.assets if isinstance(req.assets, dict) else {}
+    ts = act.start("router", req.request_id, "segregating which kind of video this is")
+    try:
+        route = str(a.get("route") or "").lower()
+        locked = None
+        if a.get("ugc_map") or route == "ugc_map":
+            locked = "UGC + Map"
+        elif a.get("ugc_broll") or route == "ugc_broll":
+            locked = "UGC + B-Roll"
+        elif a.get("ref_anchor") or (a.get("image_urls") and route in ("reference_image", "")):
+            locked = "Reference Video"
+        elif route == "ugc":
+            locked = "Avatar Lipsync"
+        vert = str(a.get("vertical") or (req.context.get("vertical") if isinstance(req.context, dict) else "") or "").replace("_", " ").strip()
+        if locked:
+            act.finish("router", req.request_id, ts, ok=True,
+                       detail=f"CONFIRMED user-locked route → {locked}" + (f" · {vert}" if vert else "") + " (no re-guess)")
+            return locked
+        # Nothing locked. Only segregate when the type is the bare default — never override an explicit recipe.
+        if vtype == _DEFAULT_VTYPE:
+            brief = str(a.get("prompt") or req.expectation or a.get("brief") or "")[:600]
+            try:
+                d = await _gemini_json(
+                    'Classify the KIND of short vertical ad video this request wants. STRICT JSON '
+                    '{"kind":"reference_image|ugc|ugc_broll|ugc_map","vertical":"auto|home|medicare|guns|"}. '
+                    'reference_image=a supplied image is the literal first frame; ugc=plain talking head; '
+                    'ugc_broll=talking head WITH b-roll cutaways; ugc_map=avatar bust over an animated state map. '
+                    f'Request: "{brief}"')
+                new_v = _ROUTE_TO_VTYPE.get(str(d.get("kind") or "").lower())
+                vert = vert or str(d.get("vertical") or "")
+                if new_v:
+                    act.finish("router", req.request_id, ts, ok=True,
+                               detail=f"segregated (no locked route) → {new_v}" + (f" · {vert}" if vert else ""))
+                    return new_v
+            except Exception as _re:
+                logger.warning(f"[router] LLM segregate failed ({_re}) — keeping {vtype}")
+        act.finish("router", req.request_id, ts, ok=True,
+                   detail=f"kept {vtype}" + (f" · {vert}" if vert else ""))
+    except Exception as e:
+        act.finish("router", req.request_id, ts, ok=False, detail=f"router error: {str(e)[:80]}")
+    return vtype
+
+
 async def _execute(req: RunRequest):
     """Pick recipe by variation_type → produce variants → POST back to callback."""
     # SINGLE chokepoint: every recipe (generate / avatar-lipsync / avatar / special / router) is
@@ -2772,8 +2829,16 @@ async def _execute(req: RunRequest):
     _CURRENT_RID.set(req.request_id)
     from ..services import creative_team_activity as act
     vtype = (req.variation_type or req.directive.get("chosen_variation_type") or "Hook Change Only")
+    # (piece 0) CONFIRMED-lane backstop: assets.ugc_map is the locked UGC+Map route from CL — honor it
+    # even if the variation_type drifted, so the bust-over-map recipe always fires (no re-guess).
+    if isinstance(req.assets, dict) and req.assets.get("ugc_map") and vtype != "UGC + Map":
+        vtype = "UGC + Map"
     label = f"{vtype} · {(req.context.get('creative_filename') or req.assets.get('prompt') or req.request_id)[:60]}"
     act.begin_job(req.request_id, label=label, expected_sec=_EXPECTED_SEC.get(vtype, 180))
+    # VIDEO ROUTER (team member) — segregate/confirm the lane FIRST, so recipe selection below is driven
+    # by the confirmed video type, never a downstream re-guess. Confirms a CL-locked route; only reasons
+    # when nothing is locked and vtype is the bare default. Logged to the office feed.
+    vtype = await _video_router_segregate(req, vtype)
     # HARD money guard: never exceed the monthly budget ceiling
     _blocked, _spent, _cap = _budget_blocked()
     if _blocked:
@@ -7409,7 +7474,7 @@ def _clean_script(s: str) -> str:
 _V9x16 = (720, 1280)
 
 
-async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None, kinetic=False):
+async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_words=None, vertical=None, kinetic=False, caption_place="bottom"):
     src = result.get("local_path")
     if not src and result.get("video_url"):
         src = await _download_to_temp(result["video_url"], ".mp4")
@@ -7479,8 +7544,11 @@ async def _produce_lipsync_variant(request_id, out_name, result, script="", cap_
             _capf = os.path.join(UPLOAD_DIR, f"cap_{request_id[:8]}.ass")
             ass_path = (cap.build_kinetic_ass(cap_words, _capf, play_w=cw, play_h=ch) if kinetic
                         else cap.build_ass(cap_words, _capf, play_w=cw, play_h=ch))
+            # UGC+Map burns captions at TOP so they clear the avatar bust that owns the bottom third.
+            if ass_path and caption_place == "top":
+                ass_path = _reanchor_ass_top(ass_path)
             logger.info(f"[captions] burning {len(cap_words)} words onto {cw}x{ch}"
-                        + (" (kinetic red-box)" if kinetic else ""))
+                        + (" (kinetic red-box)" if kinetic else "") + (" [top]" if caption_place == "top" else ""))
         except Exception as e:
             logger.error(f"[captions] build failed: {e}")
 
@@ -8277,6 +8345,7 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
     caller turns that into the failed callback so Retry/redispatch can re-run the job fully."""
     a = assets if isinstance(assets, dict) else {}
     _want_broll = bool(ugc_broll or a.get("ugc_broll"))
+    _want_map = bool(a.get("ugc_map"))          # UGC+Map: bust over an animated state map (see _compose_ugc_map)
     seconds = max(1, int(round(vo_sec)))
     async with _LIPSYNC_HEAVY_SEM:   # ONE heavy assembly at a time — stay under the 2GB box
         # 3b) CAPTIONS (optional) — aligned FIRST so the word timings also bias b-roll cutaways toward
@@ -8346,11 +8415,38 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
                 _ugc_broll_note = f"error: {str(_ube)[:80]}"
                 logger.warning(f"[ugc-broll] composite failed ({_ube}) — plain talking-head")
 
-        # 4) SAVE — normalize + persist (the subtitle is built in here, sized to the real frame)
+        # ── UGC-MAP COMPOSITE (optional) — bust over an animated state map. Mutually exclusive with the
+        # b-roll composite (a map ad IS the b-roll). Best-effort: on any shortfall `result` is untouched
+        # and we ship the plain talking-head. When it applies, captions are burned at TOP (below).
+        _map_note = ""
+        _map_applied = False
+        if _want_map and not _broll_applied:
+            try:
+                _fm = result.get("local_path") or await _download_to_temp(result["video_url"], ".mp4")
+                _um_work = tempfile.mkdtemp()   # NOT cleaned here — the composite lives in it until the variant reads it
+                _state = (a.get("state") or "").strip()
+                _um, _um_status = await _compose_ugc_map(_fm, vo_audio, float(vo_sec), _state,
+                                                         _um_work, req, vertical=(vertical or ""))
+                _map_note = _um_status or ""
+                if _um and os.path.exists(_um):
+                    result = {"local_path": _um}
+                    _map_applied = True
+                    logger.info(f"[ugc-map] {_um_status}")
+                else:
+                    logger.info(f"[ugc-map] no composite ({_um_status}) — delivering the plain talking-head")
+            except Cancelled:
+                raise
+            except Exception as _ume:
+                _map_note = f"error: {str(_ume)[:80]}"
+                logger.warning(f"[ugc-map] composite failed ({_ume}) — plain talking-head")
+
+        # 4) SAVE — normalize + persist (the subtitle is built in here, sized to the real frame).
+        # caption_place='top' for a map so the karaoke clears the avatar bust (which owns the bottom).
         variant = await _produce_lipsync_variant(request_id, out_name, result, script,
                                                  cap_words=(None if _use_veed else _cap_words),
                                                  vertical=(vertical or None),
-                                                 kinetic=_want_broll)
+                                                 kinetic=_want_broll,
+                                                 caption_place=("top" if _map_applied else "bottom"))
         ass_path = variant.get("captions_burned")
 
         # 4b) VEED styled captions (fal) — post-process the produced video, feeding our SRT for accuracy
@@ -8433,6 +8529,95 @@ async def _finalize_lipsync_delivery(request_id, result, *, out_name, script, vo
             "cap_err": _cap_err, "use_veed": _use_veed, "ass_path": ass_path, "seconds": seconds}
 
 
+def _reanchor_ass_top(ass_path: str) -> str:
+    """Force every Dialogue line to TOP-center by prefixing an {\\an8} override on the Text field.
+    Robust across caption styles (overrides the Style's Alignment). Used by the UGC+Map lane so the
+    karaoke captions sit ABOVE the avatar bust instead of behind it. Best-effort; leaves file as-is on
+    any parse issue."""
+    try:
+        with open(ass_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        out = []
+        for ln in lines:
+            if ln.startswith("Dialogue:"):
+                body = ln[len("Dialogue:"):]
+                parts = body.split(",", 9)                  # 9 fields then Text
+                if len(parts) == 10 and "\\an" not in parts[9]:
+                    parts[9] = "{\\an8}" + parts[9]
+                    ln = "Dialogue:" + ",".join(parts)
+            out.append(ln)
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+    except Exception as e:
+        logger.warning(f"[ugc-map] top-caption reanchor failed: {e}")
+    return ass_path
+
+
+async def _compose_ugc_map(face_path: str, vo_audio: str, vo_sec: float, state: str,
+                           work: str, req, vertical: str = ""):
+    """UGC + MAP: composite the lip-synced talking head as a rounded 'bust' card anchored bottom-center
+    over a FULL-FRAME animated state map (slow zoom push-in on the highlighted state). Captions are
+    burned at TOP by the variant producer (caption_place='top') so they clear the bust.
+
+    NOTE (tradeoff): no rembg on the 2GB worker, so the bust is a rounded-rect INSERT, not a true
+    background cutout. A real matte (birefnet/rembg via a hosted call or a heavier worker) is a
+    follow-up; the framed bust ships the composition cleanly today. Returns (out_path|None, note)."""
+    from PIL import Image, ImageDraw
+    W, H = _V9x16
+    FPS = 30
+    T = max(1.0, float(vo_sec or 0))
+    frames = max(1, int(round(T * FPS)))
+    # 1) MAP BACKGROUND — highlighted state, or a neutral slate gradient when no state resolves.
+    map_png = os.path.join(work, "map_bg.png")
+    ok = False
+    if state:
+        ok = await asyncio.to_thread(_render_state_map, state, W, H, map_png, 0.55)
+    if not ok:
+        g = Image.new("RGB", (W, H)); gd = ImageDraw.Draw(g)
+        for y in range(0, H, 4):
+            t = y / max(1, H - 1)
+            gd.rectangle([0, y, W, y + 4], fill=(int(226 - 26 * t), int(232 - 18 * t), int(240 - 10 * t)))
+        g.save(map_png)
+    # 2) ANIMATE — slow zoom push-in (the "zoom into the state" beat) on the map still.
+    map_clip = os.path.join(work, "map_clip.mp4")
+    await asyncio.to_thread(_ffmpeg,
+        ["-loop", "1", "-t", f"{T:.2f}", "-i", map_png,
+         "-vf", (f"scale={W * 2}:{H * 2},zoompan=z='min(zoom+0.0006,1.20)':d={frames}:"
+                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={FPS},setsar=1"),
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-t", f"{T:.2f}", map_clip], 400)
+    # 3) BUST CARD — rounded-rect mask; face scaled/cropped to the card; overlaid bottom-center.
+    cardW = (int(W * 0.66) // 2) * 2
+    cardH = (int(H * 0.40) // 2) * 2
+    mask_png = os.path.join(work, "card_mask.png")
+    m = Image.new("L", (cardW, cardH), 0)
+    ImageDraw.Draw(m).rounded_rectangle([0, 0, cardW - 1, cardH - 1],
+                                        radius=int(min(cardW, cardH) * 0.10), fill=255)
+    m.save(mask_png)
+    ox = (W - cardW) // 2
+    oy = H - cardH - int(H * 0.03)
+    out = os.path.join(work, "ugc_map.mp4")
+    fc = (
+        f"[0:v]scale={W}:{H},setsar=1[bg];"
+        f"[1:v]scale={cardW}:{cardH}:force_original_aspect_ratio=increase,crop={cardW}:{cardH},setsar=1[fc];"
+        f"[fc][2:v]alphamerge[fca];"
+        f"[bg][fca]overlay={ox}:{oy}:format=auto[v]"
+    )
+    # audio = the VO (guaranteed present) rather than the face track, mirroring the b-roll compose.
+    _a_in = vo_audio if (vo_audio and os.path.exists(vo_audio)) else face_path
+    try:
+        await asyncio.to_thread(_ffmpeg,
+            ["-i", map_clip, "-i", face_path, "-i", mask_png, "-i", _a_in,
+             "-filter_complex", fc, "-map", "[v]", "-map", "3:a:0?",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+             "-threads", "2", "-c:a", "aac", "-b:a", "192k", "-shortest", out], 600)
+    except Exception as e:
+        logger.warning(f"[ugc-map] composite ffmpeg failed: {e}")
+        return None, f"error: {str(e)[:80]}"
+    if os.path.exists(out):
+        return out, f"map={state or 'neutral'} · bust bottom-center · captions top ({T:.0f}s)"
+    return None, "no output file"
+
+
 async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> list:
     """The team's real CapCut flow, automated end-to-end: take a REAL character clip from
     our own asset library, write/adapt a natural spoken script (inserting the offer value),
@@ -8481,6 +8666,7 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     _reuse_ok = (not a.get("force_fresh")
                  and not a.get("captions")
                  and not a.get("lipsync_ab")
+                 and not a.get("ugc_map")
                  and not (ugc_broll or a.get("ugc_broll")))
     if _reuse_ok:
         try:
@@ -8601,7 +8787,10 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
         _hook_directive = f"OPENING HOOK PATTERN #{_hidx} ({_hname}) — {_hinstr}"
         logger.info(f"[hook-bank] {req.request_id} → pattern #{_hidx} '{_hname}'")
         act.tick(req.request_id, f"hook pattern: {_hname}")
-    _write_directive = " ".join(x for x in [_script_directive, _hook_directive] if x).strip()
+    # CL's per-vertical playbook (proven hooks + real b-roll vocabulary + tone, frame-verified from real
+    # winning ads) primes the Copywriter for THIS context. Absent → unchanged.
+    _vplaybook = (a.get("vertical_playbook") or "").strip()
+    _write_directive = " ".join(x for x in [_script_directive, _hook_directive, _vplaybook] if x).strip()
     script = base or brief
     offer_desc = " ".join(x for x in [
         brief,
@@ -9345,6 +9534,9 @@ _RECIPES = {
     # spine; the ugc_broll flag turns on the b-roll compositing tail. Also honored via assets.ugc_broll.
     "UGC + B-Roll": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
     "UGC + B-Roll Home Insurance": lambda r: recipe_avatar_lipsync(r, ugc_broll=True),
+    # UGC + Map = the same avatar-lipsync spine; assets.ugc_map turns on the bust-over-animated-map
+    # composite tail (recipe honors the flag in _finalize_lipsync_delivery). State = fan-out variable.
+    "UGC + Map": recipe_avatar_lipsync,
     "Create from Assets": recipe_from_assets,
     # Authoritative reference-IMAGE pass-through (image = literal first frame, director SKIPPED).
     "Reference Video": recipe_reference_video,
