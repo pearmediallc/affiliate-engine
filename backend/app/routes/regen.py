@@ -7763,12 +7763,12 @@ async def _broll_is_watermarked(url: str, local_path: str, work: str) -> bool:
     return verdict
 
 
-async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str, tag: str = "b") -> str:
+async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str, tag: str = "b", used_out: list = None) -> str:
     """Build ONE silent WxH/30fps b-roll track of exactly `length` seconds from a pool of clip URLs
     (mirrors recipe_broll's montage loop: download → ~4s cuts, re-window on re-use, scale/crop to
     fill, concat, hard-trim). Returns the track path, or None if no usable footage."""
     SEG = 4.0
-    srcs = []
+    srcs, srcs_u = [], []
     for u in clip_urls:
         try:
             # AE-GENERATED b-roll is handed in as a LOCAL file path (not a URL) — use it directly instead
@@ -7780,14 +7780,16 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
             if await _broll_is_watermarked(u, _lp, work):
                 logger.warning(f"[ugc-broll] {tag} DROPPING watermarked clip (baked stock overlay): {u[:90]}")
                 continue
-            srcs.append(_lp)
+            srcs.append(_lp); srcs_u.append(u)
         except Exception as de:
             logger.warning(f"[ugc-broll] {tag} clip download failed: {de}")
     if not srcs:
         return None
+    _consumed = set()   # original urls/paths actually cut into this track — reported via used_out for cross-window dedup
     seg_paths, total, idx, guard = [], 0.0, 0, 0
     while total < length and srcs and guard < 200:
         src = srcs[idx % len(srcs)]
+        _su = srcs_u[idx % len(srcs)]
         pass_no = idx // len(srcs); idx += 1; guard += 1
         sd = await asyncio.to_thread(_ffprobe_duration, src)
         if sd <= 0.4:
@@ -7816,7 +7818,7 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
                  "-pix_fmt", "yuv420p", "-threads", "2", seg], 300)
         except Exception as se:
             logger.warning(f"[ugc-broll] {tag} segment build failed: {se}"); continue
-        seg_paths.append(seg); total += take
+        seg_paths.append(seg); total += take; _consumed.add(_su)
     if not seg_paths:
         return None
     listf = os.path.join(work, f"{tag}_list.txt")
@@ -7831,6 +7833,8 @@ async def _broll_track(clip_urls: list, length: float, W: int, H: int, work: str
              "-pix_fmt", "yuv420p", "-threads", "2", out], 400)
     except Exception as ce:
         logger.warning(f"[ugc-broll] {tag} track concat failed: {ce}"); return None
+    if used_out is not None:
+        used_out.extend(_consumed)   # report the clips consumed so the caller can dedup the next window
     return out if os.path.exists(out) else None
 
 
@@ -8079,27 +8083,53 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     #     'ai'/'best' may. Each successful clip is auto-ingested into CL's library (detached, fail-open) so
     #     the NEXT matching script casts it from the library — no re-generation.
     gen_paths = []
+    from ..services import creative_team_activity as act
+    _rid = (getattr(req, "request_id", "") or "") if req else ""   # OFFICE job id (may be absent)
     _specs = list(generate_specs or [])[:3]
     if _specs and str(broll_mode or "").lower() != "library":
+        # Collect the slots we will actually generate (skip blanks), capped at 3.
+        _slots = []
         for _sp in _specs:
-            if len(gen_paths) >= 3:
+            if len(_slots) >= 3:
                 break
-            try:
-                _bp = (_sp.get("broll_prompt") or _sp.get("beat_text") or "") if isinstance(_sp, dict) else str(_sp)
-                if not str(_bp).strip():
+            _bp = (_sp.get("broll_prompt") or _sp.get("beat_text") or "") if isinstance(_sp, dict) else str(_sp)
+            if not str(_bp).strip():
+                continue
+            _beat = (_sp.get("beat_text") if isinstance(_sp, dict) else "") or ""
+            _slots.append((str(_bp), _beat))
+        _M = len(_slots)
+        if _M:
+            # PARALLEL generation — mirror the t2v lane's _render_one_sync: each worker asyncio.run's the
+            # clip render on its OWN event loop (video clients are per-call). Gather IN ORDER, fail-open.
+            _vert = intent.get("vertical") or ""
+            def _gen_one_sync(_p):
+                return asyncio.run(_generate_broll_clip(_p, work, vertical=_vert, seconds=5))
+            import concurrent.futures
+            _loop = asyncio.get_running_loop()
+            if _rid:
+                act.tick(_rid, f"generating {_M} b-roll clip(s) concurrently")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as _ex:
+                _gfuts = [_loop.run_in_executor(_ex, _gen_one_sync, _p) for (_p, _b) in _slots]
+                _gres = await asyncio.gather(*_gfuts, return_exceptions=True)
+            # REASSEMBLE IN ORDER + per-clip OFFICE progress + DEDUP + auto-ingest. FAIL-OPEN per slot.
+            for _i, (_res, (_p, _beat)) in enumerate(zip(_gres, _slots)):
+                if _rid:                                     # OFFICE: creative-team activity per clip
+                    act.tick(_rid, f"generating b-roll clip {_i+1}/{_M} …")
+                if isinstance(_res, Cancelled):
+                    raise _res
+                if isinstance(_res, BaseException):
+                    logger.warning(f"[gen-broll] slot {_i+1}/{_M} generation failed ({_res}) — skipping (fail-open)")
                     continue
-                _beat = (_sp.get("beat_text") if isinstance(_sp, dict) else "") or ""
-                _gc = await _generate_broll_clip(_bp, work, vertical=(intent.get("vertical") or ""), seconds=5)
-                if _gc and os.path.exists(_gc):
-                    gen_paths.append(_gc)
-                    _t = asyncio.create_task(_ingest_broll_to_cl(_gc, {
-                        "vertical": intent.get("vertical") or "", "kind": "broll",
-                        "scene": _beat, "source_beat": _beat}))
-                    _gen_broll_ingest_tasks.add(_t); _t.add_done_callback(_gen_broll_ingest_tasks.discard)
-            except Cancelled:
-                raise
-            except Exception as _ge:
-                logger.warning(f"[gen-broll] slot generation failed ({_ge}) — skipping (fail-open)")
+                _gc = _res
+                if not (_gc and os.path.exists(_gc)):
+                    continue
+                if _gc in gen_paths:                         # DEDUP: never insert the same generated clip twice
+                    continue
+                gen_paths.append(_gc)
+                _t = asyncio.create_task(_ingest_broll_to_cl(_gc, {
+                    "vertical": _vert, "kind": "broll",
+                    "scene": _beat, "source_beat": _beat}))
+                _gen_broll_ingest_tasks.add(_t); _t.add_done_callback(_gen_broll_ingest_tasks.discard)
     if gen_paths:
         logger.info(f"[ugc-broll] generated {len(gen_paths)} no-face b-roll clip(s) (mode={broll_mode})")
 
@@ -8133,6 +8163,7 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
     #    lip-sync against the continuous VO we mux back at the end.
     seg_files = []
     nbroll = 0
+    _used_broll = set()   # DEDUP within THIS video: clip paths/urls already cut in — never repeat across windows
     for si, (s, e, kind, pool) in enumerate(segs):
         L = e - s
         if L < 0.4:
@@ -8152,10 +8183,13 @@ async def _compose_ugc_broll(face_path: str, vo_audio: str, T: float, intent: di
             seg_files.append(fp)
         else:
             pool_urls = hooks if pool == "hook" else interiors
-            track = await _broll_track(pool_urls, L, W, H, work, tag=f"br{si:02d}")
+            _avail = [u for u in pool_urls if u not in _used_broll] or pool_urls   # fail-open: a repeat beats no footage
+            _consumed = []
+            track = await _broll_track(_avail, L, W, H, work, tag=f"br{si:02d}", used_out=_consumed)
             if not track:                                    # a required b-roll window failed → bail
                 logger.info(f"[ugc-broll] b-roll window {si} produced no footage — plain talking-head")
                 return None, f"b-roll window {si} no footage (cast hooks={nh} interiors={ni}; fetch failed?)"
+            _used_broll.update(_consumed)                    # reserve what this window used so the next window differs
             nbroll += 1
             seg_files.append(track)
     if len(seg_files) < 2:                                    # need at least one face + one b-roll
@@ -8747,6 +8781,12 @@ async def recipe_avatar_lipsync(req: RunRequest, ugc_broll: bool = False) -> lis
     # ("A-G-A-I-N"). Lower-case caps runs of >=4 letters for the SPOKEN text only (keep short all-caps
     # like IRS/USA as acronyms). Captions still use `script`, so the on-screen emphasis is preserved.
     _tts_text = re.sub(r"\b[A-Z][A-Z']{3,}\b", lambda m: m.group(0).lower(), script)
+    # ACRONYMS TTS SPELLS OUT — the caps-lowering above only catches 4+ letter runs, so 2-3 letter codes
+    # like "ZIP" survive and get read letter-by-letter ("Z-I-P"). Speak the word-pronounced ones as WORDS
+    # in the VO ONLY (captions still use `script`, so the on-screen text is unchanged).
+    _TTS_ACRONYMS = {"ZIP": "zip", "PIN": "pin"}
+    _tts_text = re.sub(r"\b([A-Z]{2,4})\b",
+                       lambda m: _TTS_ACRONYMS.get(m.group(1), m.group(0)), _tts_text)
     # When the register is non-neutral, lead with an expressive real voice over the clone (clone stays
     # as fallback for timbre). Neutral tone → unchanged (clone/cast voice leads).
     _emotional_delivery = any(w in (a.get("tone") or "").lower() for w in _EMOTIONAL_TONES)
